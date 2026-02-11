@@ -1,3 +1,8 @@
+# Claude Code / AI assistant files
+CLAUDE.md
+.claude/
+.cadence/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
