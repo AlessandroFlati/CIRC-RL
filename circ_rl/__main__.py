@@ -37,9 +37,17 @@ def main(cfg: DictConfig) -> None:
 
     # Build environment family
     env_cfg = cfg.environments
+    # Convert Hydra {low: X, high: Y} dicts to (low, high) tuples
+    param_dists: dict[str, tuple[float, float]] = {}
+    for name, dist in env_cfg.param_distributions.items():
+        if isinstance(dist, (list, tuple)):
+            param_dists[name] = (float(dist[0]), float(dist[1]))
+        else:
+            param_dists[name] = (float(dist.low), float(dist.high))
+
     env_family = EnvironmentFamily.from_gymnasium(
         base_env=env_cfg.base_env,
-        param_distributions=dict(env_cfg.param_distributions),
+        param_distributions=param_dists,
         n_envs=env_cfg.n_envs,
         seed=cfg.get("seed", 42),
     )

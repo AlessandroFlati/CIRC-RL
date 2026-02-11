@@ -62,7 +62,6 @@ class CausalDiscoveryStage(PipelineStage):
             n_transitions_per_env=self._n_transitions, seed=self._seed
         )
 
-        flat = dataset.to_flat_array()
         state_dim = dataset.state_dim
         action_dim = 1 if dataset.actions.ndim == 1 else dataset.actions.shape[1]
 
@@ -77,7 +76,7 @@ class CausalDiscoveryStage(PipelineStage):
 
         builder = CausalGraphBuilder()
         graph = builder.discover(
-            flat, node_names, method=self._method, alpha=self._alpha
+            dataset, node_names, method=self._method, alpha=self._alpha
         )
 
         validator = MechanismValidator(alpha=self._alpha)
