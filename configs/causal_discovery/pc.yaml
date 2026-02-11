@@ -1,0 +1,6 @@
+method: pc
+alpha: 0.05
+ci_test: fisher_z
+max_conditioning_set_size: null
+n_transitions_per_env: 5000
+mechanism_validation_alpha: 0.05

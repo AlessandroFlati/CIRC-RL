@@ -1,0 +1,11 @@
+n_iterations: 1000
+batch_size_envs: 5
+trajectories_per_env: 20
+gamma: 0.99
+learning_rate: 3.0e-4
+max_grad_norm: 0.5
+lagrange_lr: 1.0e-3
+invariance_lambda: 1.0
+variance_penalty_weight: 0.1
+worst_case_temperature: 1.0
+checkpoint_interval: 100
