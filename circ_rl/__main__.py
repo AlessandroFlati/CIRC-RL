@@ -32,7 +32,8 @@ def main(cfg: DictConfig) -> None:
     """Run the CIRC-RL pipeline."""
     seed_everything(cfg.get("seed", 42))
 
-    logger.info("Starting CIRC-RL pipeline")
+    device = cfg.get("device", "cpu")
+    logger.info("Starting CIRC-RL pipeline (device={})", device)
     logger.info("Config: {}", dict(cfg))
 
     # Build environment family
@@ -82,6 +83,7 @@ def main(cfg: DictConfig) -> None:
             env_family=env_family,
             training_config=training_config,
             n_policies=train_cfg.get("n_policies", 3),
+            device=device,
         ),
         EnsembleConstructionStage(
             env_family=env_family,

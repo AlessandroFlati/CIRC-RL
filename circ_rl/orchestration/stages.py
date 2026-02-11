@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import torch
 from loguru import logger
 
 from circ_rl.causal_discovery.builder import CausalGraphBuilder
@@ -175,6 +176,7 @@ class PolicyOptimizationStage(PipelineStage):
     :param env_family: The environment family.
     :param training_config: Training configuration.
     :param n_policies: Number of policies to train (for ensemble).
+    :param device: Torch device for training.
     """
 
     def __init__(
@@ -182,6 +184,7 @@ class PolicyOptimizationStage(PipelineStage):
         env_family: EnvironmentFamily,
         training_config: TrainingConfig,
         n_policies: int = 3,
+        device: str = "cpu",
     ) -> None:
         super().__init__(
             name="policy_optimization",
@@ -190,6 +193,7 @@ class PolicyOptimizationStage(PipelineStage):
         self._env_family = env_family
         self._config = training_config
         self._n_policies = n_policies
+        self._device = torch.device(device)
 
     def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Train policies.
@@ -220,8 +224,11 @@ class PolicyOptimizationStage(PipelineStage):
                 env_family=self._env_family,
                 config=self._config,
             )
+            trainer.to(self._device)
 
             metrics = trainer.run()
+            # Move policy back to CPU for serialization/ensemble
+            policy.to(torch.device("cpu"))
             policies.append(policy)
             all_metrics.append(metrics)
 
