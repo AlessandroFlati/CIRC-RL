@@ -1,0 +1,12 @@
+base_env: CartPole-v1
+n_envs: 10
+param_distributions:
+  gravity:
+    low: 9.0
+    high: 11.0
+  masscart:
+    low: 0.5
+    high: 2.0
+  length:
+    low: 0.3
+    high: 0.7
