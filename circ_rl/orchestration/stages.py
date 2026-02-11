@@ -204,7 +204,24 @@ class PolicyOptimizationStage(PipelineStage):
         feature_mask = fs_output["feature_mask"]
 
         state_dim = int(feature_mask.shape[0])
-        action_dim = self._env_family.action_space.n  # type: ignore[union-attr]
+
+        import gymnasium as gym
+
+        action_space = self._env_family.action_space
+        if isinstance(action_space, gym.spaces.Discrete):
+            action_dim = int(action_space.n)
+            continuous = False
+            action_low = None
+            action_high = None
+        elif isinstance(action_space, gym.spaces.Box):
+            action_dim = int(action_space.shape[0])
+            continuous = True
+            action_low = action_space.low
+            action_high = action_space.high
+        else:
+            raise TypeError(
+                f"Unsupported action space type: {type(action_space)}"
+            )
 
         policies: list[CausalPolicy] = []
         all_metrics = []
@@ -217,6 +234,9 @@ class PolicyOptimizationStage(PipelineStage):
                 action_dim=action_dim,
                 feature_mask=feature_mask,
                 hidden_dims=(256, 256),
+                continuous=continuous,
+                action_low=action_low,
+                action_high=action_high,
             )
 
             trainer = CIRCTrainer(

@@ -98,14 +98,14 @@ class EnsemblePolicy:
 
     def get_action(
         self, state: torch.Tensor, deterministic: bool = False
-    ) -> int:
+    ) -> int | np.ndarray:
         """Get an action by weighted sampling from the ensemble.
 
         With probability w_i, use policy i to select the action.
 
         :param state: State tensor.
         :param deterministic: If True, use the highest-weighted policy.
-        :returns: Integer action.
+        :returns: Integer action for discrete, numpy array for continuous.
         """
         if deterministic:
             best_idx = int(np.argmax(self._weights))

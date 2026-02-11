@@ -77,8 +77,10 @@ class RolloutWorker:
         """
         env = self._env_family.make_env(env_idx)
 
+        is_continuous = policy.continuous
+
         states_list: list[np.ndarray] = []
-        actions_list: list[int] = []
+        actions_list: list[int | np.ndarray] = []
         rewards_list: list[float] = []
         log_probs_list: list[float] = []
         values_list: list[float] = []
@@ -95,7 +97,10 @@ class RolloutWorker:
             with torch.no_grad():
                 output = policy(state_tensor)
 
-            action = int(output.action.item())
+            if is_continuous:
+                action = output.action.squeeze(0).cpu().numpy()  # (action_dim,)
+            else:
+                action = int(output.action.item())
             log_prob = float(output.log_prob.item())
             value = float(output.value.item())
 
@@ -117,9 +122,18 @@ class RolloutWorker:
 
         env.close()
 
+        if is_continuous:
+            actions_tensor = torch.from_numpy(
+                np.stack(actions_list)  # type: ignore[arg-type]
+            ).to(dtype=torch.float32, device=device)
+        else:
+            actions_tensor = torch.tensor(
+                actions_list, dtype=torch.long, device=device
+            )
+
         return Trajectory(
             states=torch.from_numpy(np.stack(states_list)).to(device),
-            actions=torch.tensor(actions_list, dtype=torch.long, device=device),
+            actions=actions_tensor,
             rewards=torch.tensor(rewards_list, dtype=torch.float32, device=device),
             log_probs=torch.tensor(log_probs_list, dtype=torch.float32, device=device),
             values=torch.tensor(values_list, dtype=torch.float32, device=device),

@@ -279,6 +279,7 @@ class CIRCTrainer:
                     output.entropy,
                     kl_divergence=output.kl_divergence,
                     log_prob=output.log_prob,
+                    discrete_actions=not self._policy.continuous,
                 )
 
                 # Constraint penalty
