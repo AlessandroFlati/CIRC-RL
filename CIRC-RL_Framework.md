@@ -67,7 +67,7 @@ The interventional distribution eliminates confounding and reveals true causal e
 
 ### 2.2 Environment Families and Invariance
 
-**Definition 2.1 (Environment Family).** An environment family $\mathcal{E}$ is a set of MDPs $\{M_e = (\mathcal{S}, \mathcal{A}, P_e, R_e, \gamma) : e \in \mathcal{E}\}$ that share the same state space, action space, and causal graph $\mathcal{G}$, but may differ in the functional forms of $f_s$ and $f_r$ or the distribution of exogenous variables.
+**Definition 2.1 (Environment Family).** An environment family $\mathcal{E}$ is a set of MDPs $\lbrace M_e = (\mathcal{S}, \mathcal{A}, P_e, R_e, \gamma) : e \in \mathcal{E}\rbrace$ that share the same state space, action space, and causal graph $\mathcal{G}$, but may differ in the functional forms of $f_s$ and $f_r$ or the distribution of exogenous variables.
 
 **Definition 2.2 (Causal Invariance).** A mechanism $m: \mathcal{X} \to \mathcal{Y}$ is causally invariant across environment family $\mathcal{E}$ if:
 
@@ -109,7 +109,7 @@ for some threshold $\delta_i \in \mathbb{R}$.
 
 Constraints encode domain knowledge about unacceptable behaviors (e.g., collision probability, energy consumption, regulatory violations).
 
-**Assumption 2.3 (Constraint Completeness).** The specified constraints $\{C_i\}$ adequately capture safety requirements for the domain. This assumption is pragmatic: we cannot formalize unknown unknowns, but we can formalize known risks.
+**Assumption 2.3 (Constraint Completeness).** The specified constraints $\lbrace C_i\rbrace$ adequately capture safety requirements for the domain. This assumption is pragmatic: we cannot formalize unknown unknowns, but we can formalize known risks.
 
 ---
 
@@ -216,15 +216,15 @@ where $p(z) = \mathcal{N}(0, I)$ is a simple prior.
 **Formalization.** Solve the constrained MDP:
 
 $$
-\begin{align}
+\begin{aligned}
 \max_\pi \quad & \mathbb{E}_{\tau \sim \rho_\pi}[R(\tau)] \\
-\text{subject to} \quad & \mathbb{E}_{\tau \sim \rho_\pi}[C_i(\tau)] \leq \delta_i, \quad \forall i \in \{1, \ldots, m\}
-\end{align}
+\text{subject to} \quad & \mathbb{E}_{\tau \sim \rho_\pi}[C_i(\tau)] \leq \delta_i, \quad \forall i \in \lbrace 1, \ldots, m\rbrace
+\end{aligned}
 $$
 
 **Lagrangian Approach.** Introduce Lagrange multipliers $\lambda_i \geq 0$ and optimize:
 
-$$\mathcal{L}(\pi, \{\lambda_i\}) = \mathbb{E}_{\tau \sim \rho_\pi}\left[R(\tau) - \sum_{i=1}^m \lambda_i C_i(\tau)\right]$$
+$$\mathcal{L}(\pi, \lbrace\lambda_i\rbrace) = \mathbb{E}_{\tau \sim \rho_\pi}\left[R(\tau) - \sum_{i=1}^m \lambda_i C_i(\tau)\right]$$
 
 with dual updates:
 
@@ -234,7 +234,7 @@ $$\lambda_i \leftarrow \max\left(0, \lambda_i + \eta \left(\mathbb{E}[C_i(\tau)]
 
 $$\pi_{t+1} = \text{Proj}_{\mathcal{C}}\left(\pi_t + \alpha \nabla_\pi \mathbb{E}[R(\tau)]\right)$$
 
-where $\mathcal{C} = \{\pi : \mathbb{E}[C_i(\tau)] \leq \delta_i, \forall i\}$ is the feasible set.
+where $\mathcal{C} = \lbrace\pi : \mathbb{E}[C_i(\tau)] \leq \delta_i, \forall i\rbrace$ is the feasible set.
 
 ### 3.6 Integrated Algorithm Structure
 
@@ -249,13 +249,13 @@ The complete CIRC-RL framework proceeds in phases:
 **Phase 2: Feature Selection via Causal Invariance**
 1. For each feature $f \in \mathcal{F}$, test whether $f \in \text{Anc}_{\mathcal{G}}(R)$ (ancestors of reward in causal graph)
 2. Test stability of $P(R | do(f))$ across environments
-3. Retain only features with stable causal effects: $\mathcal{F}_{\text{robust}} = \{f : \text{Var}_e[P_e(R|do(f))] < \epsilon\}$
+3. Retain only features with stable causal effects: $\mathcal{F}_{\text{robust}} = \lbrace f : \text{Var}_e[P_e(R|do(f))] < \epsilon\rbrace$
 
 **Phase 3: Policy Optimization**
-1. Initialize policy $\pi_0$ and Lagrange multipliers $\{\lambda_i^0\}$
+1. Initialize policy $\pi_0$ and Lagrange multipliers $\lbrace\lambda_i^0\rbrace$
 2. For iteration $t = 1, \ldots, T$:
-   - Sample environments $\{e_j\}_{j=1}^B$ from $\mathcal{E}$
-   - Collect trajectories $\{\tau_j^e\}$ under $\pi_t$ in each environment $e_j$
+   - Sample environments $\lbrace e_j\rbrace_{j=1}^B$ from $\mathcal{E}$
+   - Collect trajectories $\lbrace\tau_j^e\rbrace$ under $\pi_t$ in each environment $e_j$
    - Estimate causal effects via counterfactuals or IV
    - Compute gradients with respect to:
      - Worst-case return: $\nabla_\pi \min_e R^e(\pi)$
@@ -267,7 +267,7 @@ The complete CIRC-RL framework proceeds in phases:
 3. Return ensemble of top-$k$ policies weighted by inverse complexity
 
 **Phase 4: Ensemble Construction**
-1. Evaluate all policies $\{\pi_i\}$ satisfying hard constraints
+1. Evaluate all policies $\lbrace\pi_i\rbrace$ satisfying hard constraints
 2. Compute MDL scores: $\text{MDL}(\pi_i) = -\log P(D|\pi_i) + C(\pi_i)$
 3. Construct ensemble with weights: $w_i \propto \exp(-\text{MDL}(\pi_i))$
 4. Deploy ensemble policy: $\pi_{\text{ens}}(a|s) = \sum_i w_i \pi_i(a|s)$
@@ -293,7 +293,7 @@ where $\epsilon$ depends on the magnitude of environment shift and $\delta$ on t
 
 ### 4.2 Sample Complexity with MDL Regularization
 
-**Theorem 4.2 (MDL Bound).** Let $\Pi_K = \{\pi : C(\pi) \leq K\}$ be the class of policies with complexity at most $K$. Then the sample complexity required to find a near-optimal policy in $\Pi_K$ is:
+**Theorem 4.2 (MDL Bound).** Let $\Pi_K = \lbrace\pi : C(\pi) \leq K\rbrace$ be the class of policies with complexity at most $K$. Then the sample complexity required to find a near-optimal policy in $\Pi_K$ is:
 
 $$n = O\left(\frac{K + \log(1/\delta)}{\epsilon^2}\right)$$
 
@@ -305,7 +305,7 @@ where $\epsilon$ is the suboptimality gap and $\delta$ is the failure probabilit
 
 ### 4.3 Constraint Satisfaction Guarantees
 
-**Theorem 4.3 (PAC-Safe RL).** If constraints $\{C_i\}$ are satisfied during training with empirical violation probability $\hat{p}_i \leq \delta_i - \epsilon$, then with probability at least $1 - \delta$ over deployment:
+**Theorem 4.3 (PAC-Safe RL).** If constraints $\lbrace C_i\rbrace$ are satisfied during training with empirical violation probability $\hat{p}_i \leq \delta_i - \epsilon$, then with probability at least $1 - \delta$ over deployment:
 
 $$P_{\text{deploy}}\left(C_i(\tau) > \delta_i\right) \leq \delta_i + O\left(\sqrt{\frac{\log(m/\delta)}{n}}\right)$$
 
@@ -317,7 +317,7 @@ where $n$ is the number of training trajectories and $m$ is the number of constr
 
 ### 4.4 Ensemble Robustness
 
-**Theorem 4.4 (Ensemble Stability).** Let $\{\pi_i\}_{i=1}^k$ be policies with MDL weights $w_i \propto \exp(-\text{MDL}(\pi_i))$. The ensemble policy $\pi_{\text{ens}} = \sum_i w_i \pi_i$ satisfies:
+**Theorem 4.4 (Ensemble Stability).** Let $\lbrace\pi_i\rbrace_{i=1}^k$ be policies with MDL weights $w_i \propto \exp(-\text{MDL}(\pi_i))$. The ensemble policy $\pi_{\text{ens}} = \sum_i w_i \pi_i$ satisfies:
 
 $$\text{Var}_{e \in \mathcal{E}}[R^e(\pi_{\text{ens}})] \leq \min_i \text{Var}_{e \in \mathcal{E}}[R^e(\pi_i)]$$
 
