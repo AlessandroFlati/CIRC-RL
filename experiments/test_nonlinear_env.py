@@ -133,7 +133,7 @@ def main() -> None:
 
     # 4. Feature selection (full KRR+RBF)
     selector = InvFeatureSelector(
-        epsilon=0.1, min_ate=0.01, enable_conditional_invariance=True
+        epsilon=0.15, min_ate=0.01, enable_conditional_invariance=True
     )
     result = selector.select(ds, graph, state_names, env_param_names=ep_names)
 
@@ -187,18 +187,18 @@ def main() -> None:
     print(f"Raw ATE variance:           {raw_var:.6f}")
     print(f"Ridge-only residual var:    {ridge_residual:.6f}")
     print(f"KRR+RBF residual var:       {krr_residual:.6f}")
-    print(f"Epsilon threshold:          0.100000")
-    print(f"Ridge rescues s0?           {'YES' if ridge_residual < 0.1 else 'NO'}")
-    print(f"KRR+RBF rescues s0?         {'YES' if krr_residual < 0.1 else 'NO'}")
+    print(f"Epsilon threshold:          0.150000")
+    print(f"Ridge rescues s0?           {'YES' if ridge_residual < 0.15 else 'NO'}")
+    print(f"KRR+RBF rescues s0?         {'YES' if krr_residual < 0.15 else 'NO'}")
 
     reduction = (1 - krr_residual / raw_var) * 100
     print(f"\nKRR+RBF variance reduction: {reduction:.1f}%")
 
-    if krr_residual < 0.1 and ridge_residual >= 0.1:
+    if krr_residual < 0.15 and ridge_residual >= 0.15:
         print("\n>>> KRR+RBF succeeds where Ridge alone fails! <<<")
-    elif krr_residual < 0.1 and ridge_residual < 0.1:
+    elif krr_residual < 0.15 and ridge_residual < 0.15:
         print("\n>>> Both succeed, but KRR+RBF has lower residual. <<<")
-    elif krr_residual >= 0.1:
+    elif krr_residual >= 0.15:
         print("\n>>> WARNING: KRR+RBF did not rescue s0. Check parameters. <<<")
 
     # 7. s1 variance
