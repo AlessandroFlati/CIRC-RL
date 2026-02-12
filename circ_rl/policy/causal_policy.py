@@ -147,13 +147,30 @@ class CausalPolicy(nn.Module):
             # Output logits for Categorical distribution
             self._policy_head = nn.Linear(in_dim, action_dim)
 
-        # Value head
-        self._value_head = nn.Linear(in_dim, 1)
+        # Value head (separate MLP since trunk features are detached)
+        self._value_head = nn.Sequential(
+            nn.Linear(in_dim, in_dim),
+            activation(),
+            nn.Linear(in_dim, 1),
+        )
 
     @property
     def continuous(self) -> bool:
         """Whether this policy uses continuous actions."""
         return self._continuous
+
+    @property
+    def policy_parameters(self) -> list[torch.nn.Parameter]:
+        """Parameters for the policy (trunk + policy head + optional encoder)."""
+        params = list(self._trunk.parameters()) + list(self._policy_head.parameters())
+        if self._encoder is not None:
+            params.extend(self._encoder.parameters())
+        return params
+
+    @property
+    def value_parameters(self) -> list[torch.nn.Parameter]:
+        """Parameters for the value function head."""
+        return list(self._value_head.parameters())
 
     @property
     def context_dim(self) -> int:
@@ -187,7 +204,10 @@ class CausalPolicy(nn.Module):
             trunk_input = torch.cat([trunk_input, context], dim=-1)
 
         features = self._trunk(trunk_input)
-        value = self._value_head(features).squeeze(-1)
+        # Detach trunk features for the value head: this prevents the
+        # (typically much larger) value loss from dominating trunk gradients
+        # and corrupting the policy representation.
+        value = self._value_head(features.detach()).squeeze(-1)
         return features, value, kl
 
     def _continuous_distribution(

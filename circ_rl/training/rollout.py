@@ -28,6 +28,7 @@ class RolloutWorker:
 
     :param env_family: The environment family to collect from.
     :param n_steps_per_env: Number of steps to collect per environment per rollout.
+    :param gamma: Discount factor, used to bootstrap truncated episode rewards.
     :param env_param_names: When set, include these environment parameter values
         in each trajectory for context-conditional policies.
     """
@@ -36,10 +37,12 @@ class RolloutWorker:
         self,
         env_family: EnvironmentFamily,
         n_steps_per_env: int = 200,
+        gamma: float = 0.99,
         env_param_names: list[str] | None = None,
     ) -> None:
         self._env_family = env_family
         self._n_steps = n_steps_per_env
+        self._gamma = gamma
         self._env_param_names = env_param_names
 
     def collect(
@@ -90,6 +93,9 @@ class RolloutWorker:
         values_list: list[float] = []
         next_states_list: list[np.ndarray] = []
         dones_list: list[bool] = []
+        # Track original (unadjusted) episode returns for metrics
+        episode_returns: list[float] = []
+        current_episode_return = 0.0
 
         # Build context tensor once for this env (constant per environment)
         context_tensor: torch.Tensor | None = None
@@ -120,20 +126,47 @@ class RolloutWorker:
             next_obs, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
 
+            adjusted_reward = float(reward)
+            current_episode_return += float(reward)
+
+            # Bootstrap truncated episodes: add gamma * V(s') to reward
+            # so that GAE correctly accounts for future returns beyond
+            # the truncation boundary.
+            if truncated and not terminated:
+                next_state_tensor = torch.from_numpy(
+                    np.asarray(next_obs, dtype=np.float32)
+                ).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    next_output = policy(next_state_tensor, context=context_tensor)
+                bootstrap_v = float(next_output.value.item())
+                adjusted_reward += self._gamma * bootstrap_v
+
             states_list.append(np.asarray(obs, dtype=np.float32))
             actions_list.append(action)
-            rewards_list.append(float(reward))
+            rewards_list.append(adjusted_reward)
             log_probs_list.append(log_prob)
             values_list.append(value)
             next_states_list.append(np.asarray(next_obs, dtype=np.float32))
             dones_list.append(done)
 
             if done:
+                episode_returns.append(current_episode_return)
+                current_episode_return = 0.0
                 obs, _ = env.reset()
             else:
                 obs = next_obs
 
         env.close()
+
+        # Compute bootstrap value for last step if trajectory ends mid-episode
+        last_bootstrap_value = 0.0
+        if not dones_list[-1]:
+            last_state_tensor = torch.from_numpy(
+                np.asarray(obs, dtype=np.float32)
+            ).unsqueeze(0).to(device)
+            with torch.no_grad():
+                last_output = policy(last_state_tensor, context=context_tensor)
+            last_bootstrap_value = float(last_output.value.item())
 
         if is_continuous:
             actions_tensor = torch.from_numpy(
@@ -166,4 +199,6 @@ class RolloutWorker:
             dones=torch.tensor(dones_list, dtype=torch.float32, device=device),
             env_id=env_idx,
             env_params=env_params_tensor,
+            last_bootstrap_value=last_bootstrap_value,
+            episode_returns=episode_returns,
         )

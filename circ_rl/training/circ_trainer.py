@@ -41,6 +41,7 @@ class TrainingConfig:
     :param irm_weight: Weight for the IRM penalty.
     :param worst_case_temperature: Temperature for soft-min worst-case.
     :param worst_case_variance_weight: Weight for variance penalty.
+    :param entropy_coef: Entropy bonus coefficient for exploration.
     :param lagrange_lr: Learning rate for Lagrange multiplier updates.
     """
 
@@ -55,6 +56,7 @@ class TrainingConfig:
     irm_weight: float = 1.0
     worst_case_temperature: float = 1.0
     worst_case_variance_weight: float = 0.1
+    entropy_coef: float = 0.0
     lagrange_lr: float = 0.01
 
 
@@ -118,9 +120,15 @@ class CIRCTrainer:
         self._config = config
         self._logger = metrics_logger
 
-        # Components
-        self._optimizer = torch.optim.Adam(
-            policy.parameters(), lr=config.learning_rate
+        # Separate optimizers: the value head uses detached trunk features,
+        # so its gradients must not be clipped together with the policy's
+        # (otherwise the huge value loss gradient norm clips policy gradients
+        # to essentially zero).
+        self._policy_optimizer = torch.optim.Adam(
+            policy.policy_parameters, lr=config.learning_rate
+        )
+        self._value_optimizer = torch.optim.Adam(
+            policy.value_parameters, lr=config.learning_rate
         )
         self._irm = IRMPenalty(lambda_irm=config.irm_weight)
         self._worst_case = WorstCaseOptimizer(
@@ -129,7 +137,9 @@ class CIRCTrainer:
         )
         self._regularizer = CompositeRegularizer()
         self._rollout_worker = RolloutWorker(
-            env_family, n_steps_per_env=config.n_steps_per_env
+            env_family,
+            n_steps_per_env=config.n_steps_per_env,
+            gamma=config.gamma,
         )
 
         # Constraints
@@ -214,10 +224,13 @@ class CIRCTrainer:
         worst_return = float(np.min(env_returns))
 
         # Step 3: PPO updates
-        flat = buffer.get_all_flat()
-        returns = flat.compute_returns(self._config.gamma)
-        advantages = flat.compute_advantages(self._config.gamma, self._config.gae_lambda)
+        # Compute advantages per-trajectory to avoid cross-env GAE leakage
+        returns = buffer.compute_all_returns(self._config.gamma)
+        advantages = buffer.compute_all_advantages(
+            self._config.gamma, self._config.gae_lambda
+        )
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        flat = buffer.get_all_flat()
 
         # Accumulate losses across PPO epochs
         total_policy_loss = 0.0
@@ -264,24 +277,26 @@ class CIRCTrainer:
                 # Value loss
                 value_loss = nn.functional.mse_loss(output.value, mb_returns)
 
-                # IRM penalty
-                env_loss_tensors = []
-                for env_id in buffer.env_ids:
-                    env_trajs = buffer.get_env_trajectories(env_id)
-                    if env_trajs:
-                        env_states = torch.cat([t.states for t in env_trajs])
-                        env_actions = torch.cat([t.actions for t in env_trajs])
-                        env_context = (
-                            torch.cat([t.env_params for t in env_trajs])
-                            if env_trajs[0].env_params is not None
-                            else None
-                        )
-                        env_out = self._policy.evaluate_actions(
-                            env_states, env_actions, context=env_context
-                        )
-                        env_loss_tensors.append(-env_out.log_prob.mean())
-
-                irm_penalty = self._irm(env_loss_tensors)
+                # IRM penalty (skip expensive per-env evaluation when weight is 0)
+                if self._config.irm_weight > 0:
+                    env_loss_tensors = []
+                    for env_id in buffer.env_ids:
+                        env_trajs = buffer.get_env_trajectories(env_id)
+                        if env_trajs:
+                            env_states = torch.cat([t.states for t in env_trajs])
+                            env_actions = torch.cat([t.actions for t in env_trajs])
+                            env_context = (
+                                torch.cat([t.env_params for t in env_trajs])
+                                if env_trajs[0].env_params is not None
+                                else None
+                            )
+                            env_out = self._policy.evaluate_actions(
+                                env_states, env_actions, context=env_context
+                            )
+                            env_loss_tensors.append(-env_out.log_prob.mean())
+                    irm_penalty = self._irm(env_loss_tensors)
+                else:
+                    irm_penalty = torch.tensor(0.0, device=self._device)
 
                 # Worst-case loss
                 env_returns_tensor = torch.tensor(
@@ -309,20 +324,40 @@ class CIRCTrainer:
                     )
                     constraint_penalty = self._lagrange.compute_lagrangian_penalty(costs)
 
-                # Composite loss
-                loss = (
+                # Entropy bonus for exploration
+                entropy_loss = -self._config.entropy_coef * output.entropy.mean()
+
+                # Policy loss (everything except value)
+                policy_total_loss = (
                     policy_loss
-                    + 0.5 * value_loss
+                    + entropy_loss
                     + irm_penalty
                     + 0.1 * wc_loss
                     + reg_loss
                     + constraint_penalty
                 )
 
-                self._optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(self._policy.parameters(), max_norm=0.5)
-                self._optimizer.step()
+                # Value loss (separate to avoid gradient scale mismatch)
+                value_total_loss = 0.5 * value_loss
+
+                # Update policy (trunk + policy head)
+                self._policy_optimizer.zero_grad()
+                policy_total_loss.backward(retain_graph=True)
+                nn.utils.clip_grad_norm_(
+                    self._policy.policy_parameters, max_norm=0.5
+                )
+                self._policy_optimizer.step()
+
+                # Update value head
+                self._value_optimizer.zero_grad()
+                value_total_loss.backward()
+                nn.utils.clip_grad_norm_(
+                    self._policy.value_parameters, max_norm=0.5
+                )
+                self._value_optimizer.step()
+
+                # Combined loss for metrics
+                loss = policy_total_loss + value_total_loss
 
                 total_policy_loss += float(policy_loss.item())
                 total_value_loss += float(value_loss.item())
@@ -359,14 +394,24 @@ class CIRCTrainer:
     ) -> list[float]:
         """Compute mean episode return per environment.
 
+        Uses unadjusted episode returns (not the bootstrap-adjusted rewards
+        used for GAE) so that logged metrics reflect actual performance.
+
         :param buffer: Trajectory buffer from rollout.
         :returns: List of per-environment mean returns.
         """
         env_returns = []
         for env_id in sorted(buffer.env_ids):
             trajs = buffer.get_env_trajectories(env_id)
-            total_reward = sum(float(t.rewards.sum()) for t in trajs)
-            env_returns.append(total_reward / max(len(trajs), 1))
+            all_ep_returns: list[float] = []
+            for t in trajs:
+                all_ep_returns.extend(t.episode_returns)
+            if all_ep_returns:
+                env_returns.append(float(np.mean(all_ep_returns)))
+            else:
+                # Fallback: use raw reward sum if no completed episodes
+                total_reward = sum(float(t.rewards.sum()) for t in trajs)
+                env_returns.append(total_reward / max(len(trajs), 1))
         return env_returns
 
     def _log_metrics(self, metrics: IterationMetrics) -> None:

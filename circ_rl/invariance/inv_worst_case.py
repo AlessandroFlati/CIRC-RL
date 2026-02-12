@@ -65,7 +65,8 @@ class WorstCaseOptimizer(nn.Module):
         :returns: Scalar loss.
         """
         soft_min_val = self.soft_min(env_returns)
-        variance = env_returns.var()
+        # var() on a single element gives NaN (0/0 with Bessel correction)
+        variance = env_returns.var() if env_returns.numel() > 1 else torch.tensor(0.0, device=env_returns.device)
 
         # Negate soft-min because optimizer minimizes, and we want max worst-case
         return -soft_min_val + self._variance_weight * variance

@@ -26,6 +26,10 @@ class Trajectory:
     :param env_params: Environment parameters, shape ``(T, n_env_params)``.
         Each row is the same (constant per environment). None when
         env-param context is not used.
+    :param last_bootstrap_value: V(s') for the last step when the trajectory
+        ends mid-episode (not done). Used to bootstrap GAE correctly.
+    :param episode_returns: Undiscounted sum of original rewards per completed
+        episode in this trajectory. Used for metrics (not training).
     """
 
     states: torch.Tensor
@@ -37,6 +41,8 @@ class Trajectory:
     dones: torch.Tensor
     env_id: int
     env_params: torch.Tensor | None = None
+    last_bootstrap_value: float = 0.0
+    episode_returns: list[float] = field(default_factory=list)
 
     @property
     def length(self) -> int:
@@ -46,11 +52,17 @@ class Trajectory:
     def compute_returns(self, gamma: float = 0.99) -> torch.Tensor:
         """Compute discounted returns.
 
+        Bootstraps with ``last_bootstrap_value`` when the trajectory ends
+        mid-episode (last step not done). Truncated episodes within the
+        trajectory are handled by the rollout worker adjusting the reward
+        at truncation points (adding ``gamma * V(s')``).
+
         :param gamma: Discount factor.
         :returns: Returns of shape ``(T,)``.
         """
         returns = torch.zeros_like(self.rewards)
-        running_return = 0.0
+        # Bootstrap with V(s') if the trajectory ends mid-episode
+        running_return = self.last_bootstrap_value
         for t in reversed(range(self.length)):
             if self.dones[t]:
                 running_return = 0.0
@@ -63,6 +75,11 @@ class Trajectory:
     ) -> torch.Tensor:
         """Compute Generalized Advantage Estimation (GAE).
 
+        Bootstraps with ``last_bootstrap_value`` when the trajectory ends
+        mid-episode (last step not done). Truncated episodes within the
+        trajectory are handled by the rollout worker adjusting the reward
+        at truncation points (adding ``gamma * V(s')``).
+
         :param gamma: Discount factor.
         :param gae_lambda: GAE lambda for bias-variance trade-off.
         :returns: Advantages of shape ``(T,)``.
@@ -71,15 +88,17 @@ class Trajectory:
         gae = 0.0
         for t in reversed(range(self.length)):
             if t == self.length - 1:
-                next_value = 0.0
+                # Bootstrap with V(s') if trajectory ends mid-episode
+                next_value = self.last_bootstrap_value
             else:
                 next_value = float(self.values[t + 1])
 
             if self.dones[t]:
                 next_value = 0.0
+                gae = 0.0
 
             delta = float(self.rewards[t]) + gamma * next_value - float(self.values[t])
-            gae = delta + gamma * gae_lambda * (1.0 - float(self.dones[t])) * gae
+            gae = delta + gamma * gae_lambda * gae
             advantages[t] = gae
 
         return advantages
@@ -146,6 +165,39 @@ class MultiEnvTrajectoryBuffer:
             env_id=-1,
             env_params=env_params,
         )
+
+    def compute_all_advantages(
+        self, gamma: float = 0.99, gae_lambda: float = 0.95
+    ) -> torch.Tensor:
+        """Compute GAE per-trajectory and concatenate.
+
+        This avoids cross-trajectory GAE leakage that would occur if
+        advantages were computed on the flattened buffer.
+
+        :param gamma: Discount factor.
+        :param gae_lambda: GAE lambda.
+        :returns: Advantages of shape ``(total_transitions,)``.
+        :raises ValueError: If the buffer is empty.
+        """
+        if not self._trajectories:
+            raise ValueError("Buffer is empty")
+        return torch.cat([
+            t.compute_advantages(gamma, gae_lambda)
+            for t in self._trajectories
+        ])
+
+    def compute_all_returns(self, gamma: float = 0.99) -> torch.Tensor:
+        """Compute returns per-trajectory and concatenate.
+
+        :param gamma: Discount factor.
+        :returns: Returns of shape ``(total_transitions,)``.
+        :raises ValueError: If the buffer is empty.
+        """
+        if not self._trajectories:
+            raise ValueError("Buffer is empty")
+        return torch.cat([
+            t.compute_returns(gamma) for t in self._trajectories
+        ])
 
     def total_transitions(self) -> int:
         """Total number of transitions across all trajectories."""

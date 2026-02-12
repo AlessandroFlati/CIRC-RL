@@ -215,10 +215,13 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # -- Configuration --
+    # Use 2048 steps per env (spanning ~10 episodes) for enough PPO data.
+    # Truncation bootstrapping in the rollout worker handles episode
+    # boundaries correctly.
     n_envs = 6
     n_transitions_discovery = 2000
-    n_train_iterations = 150
-    n_steps_per_env = 300
+    n_train_iterations = 200
+    n_steps_per_env = 1024
     video_envs = [0, 1, 2, 3, 4, 5]  # Record all 6
     output_dir = "experiments/outputs"
     os.makedirs(output_dir, exist_ok=True)
@@ -301,10 +304,11 @@ def main() -> None:
         clip_epsilon=0.2,
         n_steps_per_env=n_steps_per_env,
         n_ppo_epochs=10,
-        mini_batch_size=128,
-        irm_weight=0.5,
+        mini_batch_size=64,
+        irm_weight=0.0,
         worst_case_temperature=1.0,
-        worst_case_variance_weight=0.1,
+        worst_case_variance_weight=0.0,
+        entropy_coef=0.01,
     )
 
     trainer = CIRCTrainer(
@@ -326,6 +330,11 @@ def main() -> None:
         print(f"  Last:  mean_return={last.mean_return:.1f}, "
               f"worst={last.worst_env_return:.1f}")
 
+    # Save checkpoint for re-recording without retraining
+    ckpt_path = os.path.join(output_dir, "pendulum_policy.pt")
+    torch.save(policy.state_dict(), ckpt_path)
+    print(f"  Checkpoint saved to {ckpt_path}")
+
     # -- 5. Record videos --
     print("\n--- Phase 4: Video Recording ---")
     policy.eval()
@@ -344,7 +353,7 @@ def main() -> None:
 
         frames, total_reward = _record_episode(
             env_family, env_idx, policy,
-            max_steps=200, device=torch.device("cpu"),
+            max_steps=500, device=torch.device("cpu"),
         )
         print(f"R={total_reward:.1f} ({len(frames)} frames)")
 
@@ -352,9 +361,9 @@ def main() -> None:
         labels.append(f"{label} R={total_reward:.0f}")
         all_frames.append(frames)
 
-    # Save grid video
+    # Save grid video (20fps for comfortable viewing -- 500 frames = 25s)
     video_path = os.path.join(output_dir, "pendulum_circ_rl.mp4")
-    _make_grid_video(all_frames, labels, video_path, fps=30)
+    _make_grid_video(all_frames, labels, video_path, fps=20)
 
     # Also save individual videos
     for i, env_idx in enumerate(video_envs):
@@ -366,7 +375,7 @@ def main() -> None:
         iio.imwrite(
             individual_path,
             np.stack(all_frames[i]),
-            fps=30,
+            fps=20,
             codec="libx264",
         )
 
