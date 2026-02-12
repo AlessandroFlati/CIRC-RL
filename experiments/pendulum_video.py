@@ -49,7 +49,11 @@ def _record_episode(
         device = torch.device("cpu")
 
     params = env_family.get_env_params(env_idx)
-    env = gym.make("Pendulum-v1", render_mode="rgb_array")
+    env = gym.make(
+        "Pendulum-v1",
+        render_mode="rgb_array",
+        max_episode_steps=max_steps,
+    )
     unwrapped = env.unwrapped
     for attr, value in params.items():
         setattr(unwrapped, attr, value)
@@ -73,7 +77,7 @@ def _record_episode(
         obs, reward, terminated, truncated, _ = env.step(action_np)
         total_reward += float(reward)
 
-        if terminated or truncated:
+        if terminated:
             break
 
     env.close()
