@@ -55,6 +55,9 @@ class CausalPolicy(nn.Module):
     :param continuous: If True, use Normal distribution with tanh squashing.
     :param action_low: Lower bounds for continuous actions, shape ``(action_dim,)``.
     :param action_high: Upper bounds for continuous actions, shape ``(action_dim,)``.
+    :param context_dim: Number of context dimensions (environment parameters).
+        When > 0, the policy expects a context tensor to be concatenated with
+        the causal features before the trunk. Set to 0 (default) to disable.
     """
 
     _LOG_STD_MIN = -20.0
@@ -72,6 +75,7 @@ class CausalPolicy(nn.Module):
         continuous: bool = False,
         action_low: np.ndarray | None = None,
         action_high: np.ndarray | None = None,
+        context_dim: int = 0,
     ) -> None:
         super().__init__()
 
@@ -110,6 +114,7 @@ class CausalPolicy(nn.Module):
                 torch.from_numpy(action_high.astype(np.float32)),
             )
 
+        self._context_dim = context_dim
         self._use_ib = use_info_bottleneck
         self._encoder: InformationBottleneckEncoder | None = None
 
@@ -120,9 +125,9 @@ class CausalPolicy(nn.Module):
                 hidden_dims=hidden_dims[:1] if hidden_dims else (64,),
                 activation=activation,
             )
-            trunk_input_dim = latent_dim
+            trunk_input_dim = latent_dim + context_dim
         else:
-            trunk_input_dim = causal_dim
+            trunk_input_dim = causal_dim + context_dim
 
         # Shared trunk
         trunk_layers: list[nn.Module] = []
@@ -150,22 +155,36 @@ class CausalPolicy(nn.Module):
         """Whether this policy uses continuous actions."""
         return self._continuous
 
-    def _compute_trunk_features(
-        self, state: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Shared computation: mask -> encoder -> trunk -> features + value + kl.
+    @property
+    def context_dim(self) -> int:
+        """Number of context dimensions (0 if context not used)."""
+        return self._context_dim
 
+    def _compute_trunk_features(
+        self,
+        state: torch.Tensor,
+        context: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Shared computation: mask -> [context concat] -> encoder -> trunk.
+
+        :param state: Full state tensor, shape ``(batch, full_state_dim)``.
+        :param context: Optional context tensor (env params), shape
+            ``(batch, context_dim)``. Ignored when ``context_dim == 0``.
         :returns: (features, value, kl) tuple.
         """
-        causal_features = state[:, self._feature_mask]
+        causal_features = state[:, self._feature_mask]  # (batch, causal_dim)
         kl = torch.zeros(state.shape[0], device=state.device)
 
         if self._use_ib and self._encoder is not None:
             z, mu, logvar = self._encoder(causal_features)
             kl = InformationBottleneckEncoder.kl_divergence(mu, logvar)
-            trunk_input = z
+            trunk_input = z  # (batch, latent_dim)
         else:
-            trunk_input = causal_features
+            trunk_input = causal_features  # (batch, causal_dim)
+
+        # Concatenate context (env params) if provided
+        if self._context_dim > 0 and context is not None:
+            trunk_input = torch.cat([trunk_input, context], dim=-1)
 
         features = self._trunk(trunk_input)
         value = self._value_head(features).squeeze(-1)
@@ -219,13 +238,19 @@ class CausalPolicy(nn.Module):
         normalized = normalized.clamp(-0.999999, 0.999999)
         return torch.atanh(normalized)
 
-    def forward(self, state: torch.Tensor) -> PolicyOutput:
+    def forward(
+        self,
+        state: torch.Tensor,
+        context: torch.Tensor | None = None,
+    ) -> PolicyOutput:
         """Sample an action and compute value, log_prob, entropy, and KL.
 
         :param state: Full state tensor of shape ``(batch, full_state_dim)``.
+        :param context: Optional context tensor (env params), shape
+            ``(batch, context_dim)``. Ignored when ``context_dim == 0``.
         :returns: PolicyOutput with all training signals.
         """
-        features, value, kl = self._compute_trunk_features(state)
+        features, value, kl = self._compute_trunk_features(state, context)
 
         if self._continuous:
             dist, _mean = self._continuous_distribution(features)
@@ -250,16 +275,21 @@ class CausalPolicy(nn.Module):
         )
 
     def evaluate_actions(
-        self, state: torch.Tensor, action: torch.Tensor
+        self,
+        state: torch.Tensor,
+        action: torch.Tensor,
+        context: torch.Tensor | None = None,
     ) -> PolicyOutput:
         """Evaluate log_prob and value for given state-action pairs.
 
         :param state: Full state tensor of shape ``(batch, full_state_dim)``.
         :param action: Action tensor. Shape ``(batch,)`` for discrete,
             ``(batch, action_dim)`` for continuous.
+        :param context: Optional context tensor (env params), shape
+            ``(batch, context_dim)``. Ignored when ``context_dim == 0``.
         :returns: PolicyOutput with log_prob and value for the given actions.
         """
-        features, value, kl = self._compute_trunk_features(state)
+        features, value, kl = self._compute_trunk_features(state, context)
 
         if self._continuous:
             dist, _mean = self._continuous_distribution(features)
@@ -282,16 +312,23 @@ class CausalPolicy(nn.Module):
         )
 
     def get_action(
-        self, state: torch.Tensor, deterministic: bool = False
+        self,
+        state: torch.Tensor,
+        deterministic: bool = False,
+        context: torch.Tensor | None = None,
     ) -> int | np.ndarray:
         """Get a single action for inference.
 
         :param state: Single state tensor of shape ``(state_dim,)`` or ``(1, state_dim)``.
         :param deterministic: If True, use mean (continuous) or argmax (discrete).
+        :param context: Optional context tensor (env params), shape
+            ``(context_dim,)`` or ``(1, context_dim)``.
         :returns: Integer action for discrete, numpy array for continuous.
         """
         if state.dim() == 1:
             state = state.unsqueeze(0)
+        if context is not None and context.dim() == 1:
+            context = context.unsqueeze(0)
 
         with torch.no_grad():
             causal_features = state[:, self._feature_mask]
@@ -300,6 +337,10 @@ class CausalPolicy(nn.Module):
                 trunk_input = self._encoder.encode_deterministic(causal_features)
             else:
                 trunk_input = causal_features
+
+            # Concatenate context if provided
+            if self._context_dim > 0 and context is not None:
+                trunk_input = torch.cat([trunk_input, context], dim=-1)
 
             features = self._trunk(trunk_input)
 

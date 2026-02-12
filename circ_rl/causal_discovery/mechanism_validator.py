@@ -69,7 +69,12 @@ class MechanismValidator:
         :param target_node: Node whose incoming mechanisms to validate.
         :returns: MechanismValidationResult.
         """
-        data = dataset.to_flat_array()  # (N, n_vars)
+        # Use augmented data when env params are present so column indices
+        # match node_names that include ep_ nodes.
+        if dataset.env_params is not None:
+            data = dataset.to_flat_array_with_env_params()  # (N, n_vars + n_ep)
+        else:
+            data = dataset.to_flat_array()  # (N, n_vars)
         name_to_idx = {name: i for i, name in enumerate(node_names)}
         env_ids = dataset.env_ids
         unique_envs = sorted(set(env_ids.tolist()))
@@ -86,7 +91,12 @@ class MechanismValidator:
                 unstable_mechanisms=[],
             )
 
-        parents = graph.parents(target_node)
+        # Exclude env-param parents: they are exogenous (constant within each
+        # env) so testing mechanism invariance for them is not meaningful.
+        all_parents = graph.parents(target_node)
+        parents = frozenset(
+            p for p in all_parents if not graph.is_env_param_node(p)
+        )
         if not parents:
             logger.info("Target '{}' has no parents; nothing to validate", target_node)
             return MechanismValidationResult(
@@ -103,8 +113,9 @@ class MechanismValidator:
         for parent in sorted(parents):
             parent_idx = name_to_idx[parent]
 
-            # Get all parent indices for regression
-            all_parent_idxs = [name_to_idx[p] for p in sorted(parents)]
+            # Get all parent indices for regression (include ep parents
+            # as covariates but only iterate over non-ep parents above)
+            all_parent_idxs = [name_to_idx[p] for p in sorted(all_parents)]
 
             min_p = 1.0
 

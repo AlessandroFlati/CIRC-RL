@@ -22,6 +22,7 @@ from circ_rl.orchestration.stages import (
     EnsembleConstructionStage,
     FeatureSelectionStage,
     PolicyOptimizationStage,
+    ValidationFeedbackStage,
 )
 from circ_rl.training.circ_trainer import TrainingConfig
 from circ_rl.utils.seeding import seed_everything
@@ -65,6 +66,19 @@ def main(cfg: DictConfig) -> None:
         irm_weight=train_cfg.get("irm_weight", 1.0),
     )
 
+    # Env-param discovery config
+    ep_cfg = cfg.get("env_param_discovery", {})
+    include_env_params = bool(ep_cfg.get("enabled", False))
+    conditional_invariance = bool(ep_cfg.get("conditional_invariance", True))
+
+    ep_correlation_threshold = float(ep_cfg.get("ep_correlation_threshold", 0.05))
+
+    if include_env_params:
+        logger.info(
+            "Env-param causal discovery enabled (conditional_invariance={})",
+            conditional_invariance,
+        )
+
     # Build pipeline stages
     cd_cfg = cfg.causal_discovery
     stages = [
@@ -74,10 +88,13 @@ def main(cfg: DictConfig) -> None:
             discovery_method=cd_cfg.method,
             alpha=cd_cfg.alpha,
             seed=cfg.get("seed", 42),
+            include_env_params=include_env_params,
+            ep_correlation_threshold=ep_correlation_threshold,
         ),
         FeatureSelectionStage(
             epsilon=cfg.get("feature_selection", {}).get("epsilon", 0.1),
             min_ate=cfg.get("feature_selection", {}).get("min_ate", 0.01),
+            enable_conditional_invariance=conditional_invariance and include_env_params,
         ),
         PolicyOptimizationStage(
             env_family=env_family,
@@ -90,6 +107,16 @@ def main(cfg: DictConfig) -> None:
         ),
     ]
 
+    # Add validation feedback stage when env-param discovery is enabled
+    if include_env_params:
+        validation_alpha = float(ep_cfg.get("validation_alpha", 0.05))
+        stages.append(
+            ValidationFeedbackStage(
+                env_family=env_family,
+                correlation_alpha=validation_alpha,
+            )
+        )
+
     pipeline = CIRCPipeline(stages, cache_dir=cfg.get("cache_dir", ".circ_cache"))
     results = pipeline.run(force_from=cfg.get("force_from", None))
 
@@ -98,6 +125,16 @@ def main(cfg: DictConfig) -> None:
         "Pipeline complete. Ensemble has {} policies.",
         ensemble.n_policies,
     )
+
+    # Log validation feedback if available
+    if "validation_feedback" in results:
+        vf = results["validation_feedback"]
+        suggested = vf.get("suggested_context_params", [])
+        if suggested:
+            logger.warning(
+                "Validation feedback suggests additional context params: {}",
+                suggested,
+            )
 
 
 if __name__ == "__main__":

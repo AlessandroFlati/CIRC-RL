@@ -28,15 +28,19 @@ class RolloutWorker:
 
     :param env_family: The environment family to collect from.
     :param n_steps_per_env: Number of steps to collect per environment per rollout.
+    :param env_param_names: When set, include these environment parameter values
+        in each trajectory for context-conditional policies.
     """
 
     def __init__(
         self,
         env_family: EnvironmentFamily,
         n_steps_per_env: int = 200,
+        env_param_names: list[str] | None = None,
     ) -> None:
         self._env_family = env_family
         self._n_steps = n_steps_per_env
+        self._env_param_names = env_param_names
 
     def collect(
         self,
@@ -87,6 +91,15 @@ class RolloutWorker:
         next_states_list: list[np.ndarray] = []
         dones_list: list[bool] = []
 
+        # Build context tensor once for this env (constant per environment)
+        context_tensor: torch.Tensor | None = None
+        if self._env_param_names:
+            params = self._env_family.get_env_params(env_idx)
+            context_tensor = torch.tensor(
+                [params[name] for name in self._env_param_names],
+                dtype=torch.float32,
+            ).unsqueeze(0).to(device)  # (1, n_env_params)
+
         obs, _ = env.reset()
 
         for _ in range(self._n_steps):
@@ -95,7 +108,7 @@ class RolloutWorker:
             ).unsqueeze(0).to(device)
 
             with torch.no_grad():
-                output = policy(state_tensor)
+                output = policy(state_tensor, context=context_tensor)
 
             if is_continuous:
                 action = output.action.squeeze(0).cpu().numpy()  # (action_dim,)
@@ -131,6 +144,18 @@ class RolloutWorker:
                 actions_list, dtype=torch.long, device=device
             )
 
+        # Build env_params tensor if needed
+        env_params_tensor: torch.Tensor | None = None
+        if self._env_param_names:
+            params = self._env_family.get_env_params(env_idx)
+            param_vec = torch.tensor(
+                [params[name] for name in self._env_param_names],
+                dtype=torch.float32,
+            )  # (n_env_params,)
+            env_params_tensor = param_vec.unsqueeze(0).expand(
+                self._n_steps, -1
+            ).to(device)  # (T, n_env_params)
+
         return Trajectory(
             states=torch.from_numpy(np.stack(states_list)).to(device),
             actions=actions_tensor,
@@ -140,4 +165,5 @@ class RolloutWorker:
             next_states=torch.from_numpy(np.stack(next_states_list)).to(device),
             dones=torch.tensor(dones_list, dtype=torch.float32, device=device),
             env_id=env_idx,
+            env_params=env_params_tensor,
         )

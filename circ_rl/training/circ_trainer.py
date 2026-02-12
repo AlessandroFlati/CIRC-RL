@@ -72,6 +72,7 @@ class IterationMetrics:
     :param total_loss: Sum of all loss components.
     :param mean_return: Mean return across environments.
     :param worst_env_return: Worst per-environment return.
+    :param per_env_returns: Per-environment mean returns (one per env).
     """
 
     iteration: int
@@ -84,6 +85,7 @@ class IterationMetrics:
     total_loss: float
     mean_return: float
     worst_env_return: float
+    per_env_returns: list[float] | None = None
 
 
 class CIRCTrainer:
@@ -238,9 +240,16 @@ class CIRCTrainer:
                 mb_old_log_probs = flat.log_probs[mb_idx]
                 mb_advantages = advantages[mb_idx]
                 mb_returns = returns[mb_idx]
+                mb_context = (
+                    flat.env_params[mb_idx]
+                    if flat.env_params is not None
+                    else None
+                )
 
                 # Forward pass
-                output = self._policy.evaluate_actions(mb_states, mb_actions)
+                output = self._policy.evaluate_actions(
+                    mb_states, mb_actions, context=mb_context
+                )
 
                 # PPO clipped objective
                 ratio = (output.log_prob - mb_old_log_probs).exp()
@@ -262,7 +271,14 @@ class CIRCTrainer:
                     if env_trajs:
                         env_states = torch.cat([t.states for t in env_trajs])
                         env_actions = torch.cat([t.actions for t in env_trajs])
-                        env_out = self._policy.evaluate_actions(env_states, env_actions)
+                        env_context = (
+                            torch.cat([t.env_params for t in env_trajs])
+                            if env_trajs[0].env_params is not None
+                            else None
+                        )
+                        env_out = self._policy.evaluate_actions(
+                            env_states, env_actions, context=env_context
+                        )
                         env_loss_tensors.append(-env_out.log_prob.mean())
 
                 irm_penalty = self._irm(env_loss_tensors)
@@ -335,6 +351,7 @@ class CIRCTrainer:
             total_loss=total_loss_val / n,
             mean_return=mean_return,
             worst_env_return=worst_return,
+            per_env_returns=env_returns,
         )
 
     def _compute_env_returns(

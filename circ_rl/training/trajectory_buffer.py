@@ -23,6 +23,9 @@ class Trajectory:
     :param next_states: Next states, shape ``(T, state_dim)``.
     :param dones: Done flags, shape ``(T,)``.
     :param env_id: Which environment this trajectory came from.
+    :param env_params: Environment parameters, shape ``(T, n_env_params)``.
+        Each row is the same (constant per environment). None when
+        env-param context is not used.
     """
 
     states: torch.Tensor
@@ -33,6 +36,7 @@ class Trajectory:
     next_states: torch.Tensor
     dones: torch.Tensor
     env_id: int
+    env_params: torch.Tensor | None = None
 
     @property
     def length(self) -> int:
@@ -127,6 +131,10 @@ class MultiEnvTrajectoryBuffer:
         if not self._trajectories:
             raise ValueError("Buffer is empty")
 
+        env_params: torch.Tensor | None = None
+        if self._trajectories[0].env_params is not None:
+            env_params = torch.cat([t.env_params for t in self._trajectories])  # type: ignore[misc]
+
         return Trajectory(
             states=torch.cat([t.states for t in self._trajectories]),
             actions=torch.cat([t.actions for t in self._trajectories]),
@@ -136,6 +144,7 @@ class MultiEnvTrajectoryBuffer:
             next_states=torch.cat([t.next_states for t in self._trajectories]),
             dones=torch.cat([t.dones for t in self._trajectories]),
             env_id=-1,
+            env_params=env_params,
         )
 
     def total_transitions(self) -> int:

@@ -36,6 +36,10 @@ class CausalDiscoveryStage(PipelineStage):
     :param discovery_method: Algorithm for causal discovery (pc, ges, fci).
     :param alpha: Significance level for CI tests.
     :param seed: Random seed for data collection.
+    :param include_env_params: If True, augment the causal graph with
+        environment-parameter nodes for env-param causal discovery.
+    :param ep_correlation_threshold: p-value threshold for Pearson
+        correlation pre-screen that adds ``ep -> reward`` edges.
     """
 
     def __init__(
@@ -45,6 +49,8 @@ class CausalDiscoveryStage(PipelineStage):
         discovery_method: str = "pc",
         alpha: float = 0.05,
         seed: int = 42,
+        include_env_params: bool = False,
+        ep_correlation_threshold: float = 0.05,
     ) -> None:
         super().__init__(name="causal_discovery")
         self._env_family = env_family
@@ -52,13 +58,19 @@ class CausalDiscoveryStage(PipelineStage):
         self._method = discovery_method
         self._alpha = alpha
         self._seed = seed
+        self._include_env_params = include_env_params
+        self._ep_correlation_threshold = ep_correlation_threshold
 
     def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Run causal discovery.
 
-        :returns: Dict with keys: graph, dataset, node_names, validation_result.
+        :returns: Dict with keys: graph, dataset, node_names, state_names,
+            validation_result, env_param_node_names.
         """
-        collector = DataCollector(self._env_family)
+        collector = DataCollector(
+            self._env_family,
+            include_env_params=self._include_env_params,
+        )
         dataset = collector.collect(
             n_transitions_per_env=self._n_transitions, seed=self._seed
         )
@@ -75,9 +87,22 @@ class CausalDiscoveryStage(PipelineStage):
         next_state_names = [f"s{i}_next" for i in range(state_dim)]
         node_names = state_names + action_names + ["reward"] + next_state_names
 
+        # Augment with env-param nodes if enabled
+        env_param_node_names: list[str] = []
+        if self._include_env_params and self._env_family.param_names:
+            env_param_node_names = [
+                f"ep_{name}" for name in self._env_family.param_names
+            ]
+            node_names = node_names + env_param_node_names
+
         builder = CausalGraphBuilder()
         graph = builder.discover(
-            dataset, node_names, method=self._method, alpha=self._alpha
+            dataset,
+            node_names,
+            method=self._method,
+            alpha=self._alpha,
+            env_param_names=env_param_node_names if env_param_node_names else None,
+            ep_correlation_threshold=self._ep_correlation_threshold,
         )
 
         validator = MechanismValidator(alpha=self._alpha)
@@ -86,10 +111,12 @@ class CausalDiscoveryStage(PipelineStage):
         )
 
         logger.info(
-            "Causal discovery complete: {} nodes, {} edges, invariant={}",
+            "Causal discovery complete: {} nodes, {} edges, invariant={}, "
+            "env_param_nodes={}",
             len(graph.nodes),
             len(graph.edges),
             validation.is_invariant,
+            env_param_node_names,
         )
 
         return {
@@ -98,6 +125,7 @@ class CausalDiscoveryStage(PipelineStage):
             "node_names": node_names,
             "state_names": state_names,
             "validation_result": validation,
+            "env_param_node_names": env_param_node_names,
         }
 
     def config_hash(self) -> str:
@@ -107,6 +135,8 @@ class CausalDiscoveryStage(PipelineStage):
             "alpha": self._alpha,
             "seed": self._seed,
             "n_envs": self._env_family.n_envs,
+            "include_env_params": self._include_env_params,
+            "ep_correlation_threshold": self._ep_correlation_threshold,
         })
 
 
@@ -115,31 +145,44 @@ class FeatureSelectionStage(PipelineStage):
 
     :param epsilon: Maximum cross-environment ATE variance.
     :param min_ate: Minimum absolute ATE.
+    :param enable_conditional_invariance: If True, check whether env-param
+        ancestors explain non-invariance before rejecting features.
     """
 
     def __init__(
         self,
         epsilon: float = 0.1,
         min_ate: float = 0.01,
+        enable_conditional_invariance: bool = False,
     ) -> None:
         super().__init__(name="feature_selection", dependencies=["causal_discovery"])
         self._epsilon = epsilon
         self._min_ate = min_ate
+        self._enable_conditional_invariance = enable_conditional_invariance
 
     def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Run feature selection.
 
-        :returns: Dict with keys: feature_mask, selected_features, result.
+        :returns: Dict with keys: feature_mask, selected_features, result,
+            context_param_names.
         """
         cd_output = inputs["causal_discovery"]
         graph = cd_output["graph"]
         dataset = cd_output["dataset"]
         state_names = cd_output["state_names"]
+        env_param_node_names: list[str] = cd_output.get("env_param_node_names", [])
 
         selector = InvFeatureSelector(
-            epsilon=self._epsilon, min_ate=self._min_ate
+            epsilon=self._epsilon,
+            min_ate=self._min_ate,
+            enable_conditional_invariance=self._enable_conditional_invariance,
         )
-        result = selector.select(dataset, graph, state_names)
+        result = selector.select(
+            dataset,
+            graph,
+            state_names,
+            env_param_names=env_param_node_names if env_param_node_names else None,
+        )
 
         # If no features selected, fall back to all state features
         if len(result.selected_features) == 0:
@@ -152,21 +195,26 @@ class FeatureSelectionStage(PipelineStage):
             feature_mask = result.feature_mask
 
         logger.info(
-            "Feature selection: {}/{} features selected",
+            "Feature selection: {}/{} features selected, "
+            "context_dependent={}, context_params={}",
             int(feature_mask.sum()),
             len(state_names),
+            list(result.context_dependent_features.keys()),
+            result.context_param_names,
         )
 
         return {
             "feature_mask": feature_mask,
             "selected_features": result.selected_features,
             "result": result,
+            "context_param_names": result.context_param_names,
         }
 
     def config_hash(self) -> str:
         return hash_config({
             "epsilon": self._epsilon,
             "min_ate": self._min_ate,
+            "enable_conditional_invariance": self._enable_conditional_invariance,
         })
 
 
@@ -198,10 +246,12 @@ class PolicyOptimizationStage(PipelineStage):
     def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Train policies.
 
-        :returns: Dict with keys: policies, all_metrics.
+        :returns: Dict with keys: policies, all_metrics, feature_mask,
+            context_param_names.
         """
         fs_output = inputs["feature_selection"]
         feature_mask = fs_output["feature_mask"]
+        context_param_names: list[str] = fs_output.get("context_param_names", [])
 
         state_dim = int(feature_mask.shape[0])
 
@@ -223,6 +273,24 @@ class PolicyOptimizationStage(PipelineStage):
                 f"Unsupported action space type: {type(action_space)}"
             )
 
+        # Resolve context: map ep_X names back to raw param names for env lookup
+        env_param_lookup_names: list[str] | None = None
+        context_dim = 0
+        if context_param_names:
+            # ep_g -> g, ep_m -> m, etc.
+            from circ_rl.causal_discovery.causal_graph import CausalGraph
+
+            env_param_lookup_names = [
+                name.removeprefix(CausalGraph.ENV_PARAM_PREFIX)
+                for name in context_param_names
+            ]
+            context_dim = len(context_param_names)
+            logger.info(
+                "Context-conditional policy: context_dim={}, params={}",
+                context_dim,
+                env_param_lookup_names,
+            )
+
         policies: list[CausalPolicy] = []
         all_metrics = []
 
@@ -237,6 +305,13 @@ class PolicyOptimizationStage(PipelineStage):
                 continuous=continuous,
                 action_low=action_low,
                 action_high=action_high,
+                context_dim=context_dim,
+            )
+
+            rollout_worker = RolloutWorker(
+                self._env_family,
+                n_steps_per_env=self._config.n_steps_per_env,
+                env_param_names=env_param_lookup_names,
             )
 
             trainer = CIRCTrainer(
@@ -244,6 +319,8 @@ class PolicyOptimizationStage(PipelineStage):
                 env_family=self._env_family,
                 config=self._config,
             )
+            # Override the default rollout worker with one that has env params
+            trainer._rollout_worker = rollout_worker
             trainer.to(self._device)
 
             metrics = trainer.run()
@@ -256,6 +333,7 @@ class PolicyOptimizationStage(PipelineStage):
             "policies": policies,
             "all_metrics": all_metrics,
             "feature_mask": feature_mask,
+            "context_param_names": context_param_names,
         }
 
     def config_hash(self) -> str:
@@ -297,9 +375,24 @@ class EnsembleConstructionStage(PipelineStage):
         po_output = inputs["policy_optimization"]
         policies = po_output["policies"]
         feature_mask = po_output["feature_mask"]
+        context_param_names: list[str] = po_output.get("context_param_names", [])
+
+        # Resolve env param lookup names for rollout
+        env_param_lookup_names: list[str] | None = None
+        if context_param_names:
+            from circ_rl.causal_discovery.causal_graph import CausalGraph
+
+            env_param_lookup_names = [
+                name.removeprefix(CausalGraph.ENV_PARAM_PREFIX)
+                for name in context_param_names
+            ]
 
         # Collect evaluation trajectory
-        rollout = RolloutWorker(self._env_family, n_steps_per_env=self._n_eval_steps)
+        rollout = RolloutWorker(
+            self._env_family,
+            n_steps_per_env=self._n_eval_steps,
+            env_param_names=env_param_lookup_names,
+        )
         if policies:
             buffer = rollout.collect(policies[0])
             eval_traj = buffer.get_all_flat()
@@ -325,4 +418,124 @@ class EnsembleConstructionStage(PipelineStage):
         return hash_config({
             "n_eval_steps": self._n_eval_steps,
             "complexity_weight": self._complexity_weight,
+        })
+
+
+class ValidationFeedbackStage(PipelineStage):
+    """Post-training diagnostic: check if per-env returns correlate with ep params.
+
+    Detects environment parameters that may need to be included as policy
+    context but were not identified during feature selection. This is a
+    diagnostic-only stage -- it logs warnings and returns suggestions but
+    does not re-run training.
+
+    :param env_family: The environment family.
+    :param correlation_alpha: p-value threshold for Pearson correlation test.
+    """
+
+    def __init__(
+        self,
+        env_family: EnvironmentFamily,
+        correlation_alpha: float = 0.05,
+    ) -> None:
+        super().__init__(
+            name="validation_feedback",
+            dependencies=["policy_optimization", "feature_selection"],
+        )
+        self._env_family = env_family
+        self._correlation_alpha = correlation_alpha
+
+    def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Run validation feedback.
+
+        Correlates per-env returns from the last training iteration with
+        per-env parameter values. Reports any significant correlations for
+        parameters not already used as policy context.
+
+        :returns: Dict with keys: suggested_context_params, correlations.
+        """
+        from scipy import stats
+
+        po_output = inputs["policy_optimization"]
+        fs_output = inputs["feature_selection"]
+        context_param_names: list[str] = fs_output.get("context_param_names", [])
+
+        # Get per-env returns from the last iteration of the first policy
+        all_metrics = po_output.get("all_metrics", [])
+        if not all_metrics or not all_metrics[0]:
+            logger.warning("No training metrics available for validation feedback")
+            return {"suggested_context_params": [], "correlations": {}}
+
+        last_metrics = all_metrics[0][-1]
+        per_env_returns = last_metrics.per_env_returns
+        if per_env_returns is None or len(per_env_returns) < 3:
+            logger.info(
+                "Validation feedback: insufficient per-env returns "
+                "(need >= 3, got {})",
+                len(per_env_returns) if per_env_returns else 0,
+            )
+            return {"suggested_context_params": [], "correlations": {}}
+
+        # Build per-env param values
+        param_names = self._env_family.param_names
+        if not param_names:
+            return {"suggested_context_params": [], "correlations": {}}
+
+        n_envs = min(len(per_env_returns), self._env_family.n_envs)
+        returns_arr = np.array(per_env_returns[:n_envs])
+
+        # Skip if returns are constant (pearsonr undefined)
+        if np.std(returns_arr) < 1e-12:
+            logger.info("Validation feedback: per-env returns are constant, skipping")
+            return {"suggested_context_params": [], "correlations": {}}
+
+        suggested: list[str] = []
+        correlations: dict[str, dict[str, float]] = {}
+
+        for param_name in param_names:
+            ep_name = f"ep_{param_name}"
+
+            # Skip params already used as context
+            if ep_name in context_param_names:
+                continue
+
+            # Get per-env param values
+            param_values = []
+            for env_idx in range(n_envs):
+                env_params = self._env_family.get_env_params(env_idx)
+                param_values.append(env_params[param_name])
+
+            param_arr = np.array(param_values)
+
+            # Guard: skip constant params
+            if np.std(param_arr) < 1e-12:
+                continue
+
+            corr, p_value = stats.pearsonr(param_arr, returns_arr)
+            correlations[ep_name] = {"correlation": float(corr), "p_value": float(p_value)}
+
+            if p_value < self._correlation_alpha:
+                suggested.append(ep_name)
+                logger.warning(
+                    "Validation feedback: per-env returns significantly "
+                    "correlate with {} (r={:.3f}, p={:.4f}) -- consider "
+                    "adding as policy context",
+                    ep_name,
+                    corr,
+                    p_value,
+                )
+
+        if not suggested:
+            logger.info(
+                "Validation feedback: no additional context params suggested"
+            )
+
+        return {
+            "suggested_context_params": suggested,
+            "correlations": correlations,
+        }
+
+    def config_hash(self) -> str:
+        return hash_config({
+            "correlation_alpha": self._correlation_alpha,
         })

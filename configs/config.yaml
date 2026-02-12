@@ -5,6 +5,7 @@ defaults:
   - environments: cartpole
   - constraints: default
   - regularization: default
+  - env_param_discovery: default
   - _self_
 
 seed: 42

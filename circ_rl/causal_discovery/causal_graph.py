@@ -21,6 +21,7 @@ class CausalGraph:
     """
 
     REWARD_NODE_DEFAULT = "reward"
+    ENV_PARAM_PREFIX = "ep_"
 
     def __init__(
         self,
@@ -151,6 +152,59 @@ class CausalGraph:
         :returns: Set of node names that are ancestors of the reward node.
         """
         return self.ancestors(self._reward_node)
+
+    # -- Environment-parameter node helpers --
+
+    @property
+    def env_param_nodes(self) -> frozenset[str]:
+        """Return all environment-parameter nodes (nodes with ``ep_`` prefix).
+
+        :returns: Set of node names representing environment parameters.
+        """
+        return frozenset(
+            n for n in self._graph.nodes
+            if n.startswith(self.ENV_PARAM_PREFIX)
+        )
+
+    def is_env_param_node(self, node: str) -> bool:
+        """Check whether a node represents an environment parameter.
+
+        :param node: Node name to check.
+        :returns: True if the node name starts with the ``ep_`` prefix.
+        """
+        return node.startswith(self.ENV_PARAM_PREFIX)
+
+    def env_param_parents_of(self, node: str) -> frozenset[str]:
+        """Return the environment-parameter parents of a node.
+
+        :param node: Target node name.
+        :returns: Set of parent node names that are environment parameters.
+        :raises KeyError: If node is not in the graph.
+        """
+        return self.parents(node) & self.env_param_nodes
+
+    def env_param_ancestors_of(self, node: str) -> frozenset[str]:
+        """Return all environment-parameter ancestors of a node.
+
+        Unlike :meth:`env_param_parents_of` which checks only direct parents,
+        this traverses the full ancestor set and returns those that are
+        environment-parameter nodes.
+
+        :param node: Target node name.
+        :returns: Set of ancestor node names that are environment parameters.
+        :raises KeyError: If node is not in the graph.
+        """
+        return self.ancestors(node) & self.env_param_nodes
+
+    def state_ancestors_of_reward(self) -> frozenset[str]:
+        r"""Return ancestors of reward excluding environment-parameter nodes.
+
+        Equivalent to :meth:`ancestors_of_reward` when no ``ep_`` nodes exist.
+        Used for backward-compatible feature selection that ignores env params.
+
+        :returns: Set of non-env-param ancestor node names.
+        """
+        return self.ancestors_of_reward() - self.env_param_nodes
 
     def to_adjacency_matrix(self) -> tuple[np.ndarray, list[str]]:
         """Convert the graph to an adjacency matrix.
