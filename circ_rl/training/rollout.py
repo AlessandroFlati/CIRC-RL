@@ -6,6 +6,7 @@ storing them in the trajectory buffer for training.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 import gymnasium as gym
@@ -31,6 +32,10 @@ class RolloutWorker:
     :param gamma: Discount factor, used to bootstrap truncated episode rewards.
     :param env_param_names: When set, include these environment parameter values
         in each trajectory for context-conditional policies.
+    :param n_workers: Number of parallel threads for env collection. Each thread
+        runs a separate environment; the policy forward pass (PyTorch) and
+        env stepping (NumPy) both release the GIL so threads achieve real
+        parallelism. Set to 1 to disable threading.
     """
 
     def __init__(
@@ -39,11 +44,13 @@ class RolloutWorker:
         n_steps_per_env: int = 200,
         gamma: float = 0.99,
         env_param_names: list[str] | None = None,
+        n_workers: int = 1,
     ) -> None:
         self._env_family = env_family
         self._n_steps = n_steps_per_env
         self._gamma = gamma
         self._env_param_names = env_param_names
+        self._n_workers = max(1, n_workers)
 
     def collect(
         self,
@@ -52,15 +59,32 @@ class RolloutWorker:
     ) -> MultiEnvTrajectoryBuffer:
         """Collect trajectories from all environments.
 
+        When ``n_workers > 1``, environments are collected in parallel
+        using a thread pool. PyTorch inference and NumPy env stepping
+        both release the GIL, so threads achieve real parallelism.
+
         :param policy: The current policy to use for action selection.
         :param device: Torch device for tensor operations.
         :returns: Buffer with one trajectory per environment.
         """
         buffer = MultiEnvTrajectoryBuffer()
+        n_envs = self._env_family.n_envs
 
-        for env_idx in range(self._env_family.n_envs):
-            trajectory = self._collect_single_env(policy, env_idx, device)
-            buffer.add(trajectory)
+        if self._n_workers <= 1 or n_envs <= 1:
+            for env_idx in range(n_envs):
+                trajectory = self._collect_single_env(policy, env_idx, device)
+                buffer.add(trajectory)
+        else:
+            workers = min(self._n_workers, n_envs)
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [
+                    executor.submit(
+                        self._collect_single_env, policy, env_idx, device
+                    )
+                    for env_idx in range(n_envs)
+                ]
+                for future in futures:
+                    buffer.add(future.result())
 
         logger.debug(
             "Collected {} transitions from {} environments",

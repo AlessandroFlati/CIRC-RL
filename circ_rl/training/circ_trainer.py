@@ -7,6 +7,7 @@ complexity regularization, and Lagrangian constraint enforcement.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -114,6 +115,7 @@ class CIRCTrainer:
         config: TrainingConfig,
         constraint_set: ConstraintSet | None = None,
         metrics_logger: MetricsLogger | None = None,
+        n_rollout_workers: int = 1,
     ) -> None:
         self._policy = policy
         self._env_family = env_family
@@ -140,6 +142,7 @@ class CIRCTrainer:
             env_family,
             n_steps_per_env=config.n_steps_per_env,
             gamma=config.gamma,
+            n_workers=n_rollout_workers,
         )
 
         # Constraints
@@ -165,9 +168,15 @@ class CIRCTrainer:
         self._policy.to(device)
         return self
 
-    def run(self) -> list[IterationMetrics]:
+    def run(
+        self,
+        iteration_callback: Callable[[int, IterationMetrics], None] | None = None,
+    ) -> list[IterationMetrics]:
         """Run the full training loop.
 
+        :param iteration_callback: Optional function called after each
+            iteration with ``(iteration, metrics)``. Use for periodic
+            checkpointing or custom logging.
         :returns: List of per-iteration metrics.
         """
         all_metrics: list[IterationMetrics] = []
@@ -195,6 +204,9 @@ class CIRCTrainer:
                     metrics.mean_return,
                     metrics.worst_env_return,
                 )
+
+            if iteration_callback is not None:
+                iteration_callback(iteration, metrics)
 
         logger.info(
             "Training complete. Final: loss={:.4f}, return={:.2f}",
