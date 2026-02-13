@@ -29,6 +29,7 @@ def _record_episode(
     env_idx: int,
     policy: CausalPolicy,
     max_steps: int = 600,
+    env_param_names: list[str] | None = None,
 ) -> tuple[list[np.ndarray], float]:
     """Record one episode with rgb_array frames.
 
@@ -36,6 +37,7 @@ def _record_episode(
     :param env_idx: Which environment to record.
     :param policy: Trained policy.
     :param max_steps: Maximum episode length.
+    :param env_param_names: When set, pass these env params as context.
     :returns: (frames, total_reward) tuple.
     """
     import gymnasium as gym
@@ -50,6 +52,14 @@ def _record_episode(
     for attr, value in params.items():
         setattr(unwrapped, attr, value)
 
+    # Build context tensor if policy uses env params
+    context_tensor: torch.Tensor | None = None
+    if env_param_names and policy.context_dim > 0:
+        context_tensor = torch.tensor(
+            [params[name] for name in env_param_names],
+            dtype=torch.float32,
+        )
+
     obs, _ = env.reset(seed=42)
     frames: list[np.ndarray] = []
     total_reward = 0.0
@@ -63,7 +73,9 @@ def _record_episode(
             obs, dtype=torch.float32
         ).unsqueeze(0)
 
-        action_np = policy.get_action(state_tensor, deterministic=True)
+        action_np = policy.get_action(
+            state_tensor, deterministic=True, context=context_tensor,
+        )
         assert isinstance(action_np, np.ndarray)
 
         obs, reward, terminated, truncated, _ = env.step(action_np)
@@ -235,6 +247,7 @@ def main() -> None:
 
     state_dim = 3   # Pendulum obs: [cos(theta), sin(theta), theta_dot]
     action_dim = 1   # Pendulum action: torque
+    env_param_names = ["g", "m", "l"]
 
     import gymnasium as gym
     action_space = gym.make("Pendulum-v1").action_space
@@ -249,6 +262,7 @@ def main() -> None:
         continuous=True,
         action_low=action_low,
         action_high=action_high,
+        context_dim=len(env_param_names),
     )
 
     print(f"Loading checkpoint: {args.checkpoint}")
@@ -271,6 +285,7 @@ def main() -> None:
         frames, total_reward = _record_episode(
             env_family, env_idx, policy,
             max_steps=args.steps,
+            env_param_names=env_param_names,
         )
         print(f"R={total_reward:.1f} ({len(frames)} frames)")
 

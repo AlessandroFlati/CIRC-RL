@@ -116,6 +116,7 @@ class CIRCTrainer:
         constraint_set: ConstraintSet | None = None,
         metrics_logger: MetricsLogger | None = None,
         n_rollout_workers: int = 1,
+        env_param_names: list[str] | None = None,
     ) -> None:
         self._policy = policy
         self._env_family = env_family
@@ -143,6 +144,7 @@ class CIRCTrainer:
             n_steps_per_env=config.n_steps_per_env,
             gamma=config.gamma,
             n_workers=n_rollout_workers,
+            env_param_names=env_param_names,
         )
 
         # Constraints

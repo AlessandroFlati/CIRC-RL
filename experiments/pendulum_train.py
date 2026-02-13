@@ -40,7 +40,8 @@ def main() -> None:
     n_train_iterations = 1000
     n_steps_per_env = 1024
     n_workers = 4
-    checkpoint_every = 100
+    checkpoint_every = 50
+    env_param_names = ["g", "m", "l"]
     output_dir = "experiments/outputs"
     os.makedirs(output_dir, exist_ok=True)
 
@@ -111,6 +112,7 @@ def main() -> None:
         continuous=True,
         action_low=action_low,
         action_high=action_high,
+        context_dim=len(env_param_names),
     )
     policy.to(device)
 
@@ -123,9 +125,9 @@ def main() -> None:
         n_steps_per_env=n_steps_per_env,
         n_ppo_epochs=10,
         mini_batch_size=64,
-        irm_weight=0.0,
+        irm_weight=0.1,
         worst_case_temperature=1.0,
-        worst_case_variance_weight=0.0,
+        worst_case_variance_weight=0.1,
         entropy_coef=0.01,
     )
 
@@ -134,6 +136,7 @@ def main() -> None:
         env_family=env_family,
         config=config,
         n_rollout_workers=n_workers,
+        env_param_names=env_param_names,
     )
     trainer.to(device)
 
