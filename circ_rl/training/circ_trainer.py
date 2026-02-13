@@ -196,16 +196,15 @@ class CIRCTrainer:
             if self._logger is not None:
                 self._log_metrics(metrics)
 
-            if iteration % max(1, self._config.n_iterations // 10) == 0:
-                logger.info(
-                    "Iteration {}/{}: loss={:.4f}, mean_return={:.2f}, "
-                    "worst_return={:.2f}",
-                    iteration + 1,
-                    self._config.n_iterations,
-                    metrics.total_loss,
-                    metrics.mean_return,
-                    metrics.worst_env_return,
-                )
+            logger.info(
+                "Iteration {}/{}: loss={:.4f}, mean_return={:.2f}, "
+                "worst_return={:.2f}",
+                iteration + 1,
+                self._config.n_iterations,
+                metrics.total_loss,
+                metrics.mean_return,
+                metrics.worst_env_return,
+            )
 
             if iteration_callback is not None:
                 iteration_callback(iteration, metrics)
