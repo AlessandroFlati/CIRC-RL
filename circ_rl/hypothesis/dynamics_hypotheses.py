@@ -66,7 +66,13 @@ class DynamicsHypothesisGenerator:
         register: HypothesisRegister,
         env_param_names: list[str] | None = None,
     ) -> list[str]:
-        """Generate dynamics hypotheses for all variant dimensions.
+        """Generate dynamics hypotheses for all state dimensions.
+
+        Runs symbolic regression on every state dimension. For variant
+        dimensions (identified by the transition analysis), environment
+        parameters are included as input features so SR can discover
+        parametric relationships. For invariant dimensions, only state
+        and action features are used.
 
         :param dataset: Multi-environment exploratory data with next_states.
         :param transition_result: Result from TransitionAnalyzer identifying
@@ -78,28 +84,35 @@ class DynamicsHypothesisGenerator:
             dataset has env_params.
         :returns: List of hypothesis_ids that were registered.
         """
-        variant_dims = transition_result.variant_dims
-
-        if not variant_dims:
-            logger.info("No variant dimensions found; skipping dynamics SR")
-            return []
+        variant_dims = set(transition_result.variant_dims)
+        all_dims = list(state_feature_names)
 
         logger.info(
-            "Generating dynamics hypotheses for {} variant dimensions: {}",
+            "Generating dynamics hypotheses for {} dimensions "
+            "({} variant, {} invariant): {}",
+            len(all_dims),
             len(variant_dims),
-            variant_dims,
+            len(all_dims) - len(variant_dims),
+            all_dims,
         )
 
         regressor = SymbolicRegressor(self._sr_config)
         all_ids: list[str] = []
 
-        for dim_name in variant_dims:
+        for dim_name in all_dims:
             dim_idx = state_feature_names.index(dim_name)
             target_var = f"delta_{dim_name}"
 
+            # Always include env params when available so SR can
+            # discover parametric relationships. The LOEO invariance
+            # test is too lenient (high R^2 even when coefficients
+            # genuinely differ across envs); the falsification test
+            # (structural consistency) is the proper filter.
+            dim_env_params = env_param_names
+
             # Build input features and target
             x, y, var_names = self._build_regression_data(
-                dataset, dim_idx, state_feature_names, env_param_names,
+                dataset, dim_idx, state_feature_names, dim_env_params,
             )
 
             logger.info(

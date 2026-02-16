@@ -346,7 +346,7 @@ def main() -> None:
     if diag_result.conclusion_result:
         print(
             f"  Conclusion test: passed={diag_result.conclusion_result.passed}, "
-            f"mean_err={diag_result.conclusion_result.mean_error:.4f}"
+            f"mean_err={diag_result.conclusion_result.mean_relative_error:.4f}"
         )
 
     elapsed = time.time() - t0

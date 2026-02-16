@@ -690,11 +690,64 @@ class AnalyticPolicyDerivationStage(PipelineStage):
             explained_variance = float(np.mean(r2_values))
 
         else:
-            # MPC solver
-            raise NotImplementedError(
-                "MPC-based analytic policy derivation is not yet "
-                "implemented. Consider using a simpler dynamics model."
+            # MPC solver for nonlinear dynamics
+            from circ_rl.analytic_policy.mpc_solver import MPCConfig
+
+            first_entry = next(iter(best_dynamics.values()))
+
+            # Build per-env MPC policies
+            mpc_solutions: dict[int, MPCSolver] = {}
+
+            for env_idx in range(self._env_family.n_envs):
+                env_params = self._env_family.get_env_params(env_idx)
+
+                # Build dynamics callable: state + action -> next_state
+                dynamics_fn = _build_dynamics_fn(
+                    dynamics_expressions,
+                    state_names,
+                    action_names,
+                    state_dim,
+                    env_params,
+                )
+
+                # Build reward callable
+                reward_fn = None
+                if best_reward is not None:
+                    reward_fn = _build_reward_fn(
+                        best_reward.expression,
+                        state_names,
+                        action_names,
+                        env_params,
+                    )
+
+                mpc_config = MPCConfig(
+                    horizon=10,
+                    gamma=self._gamma,
+                    max_action=float(action_high[0]),
+                )
+                from circ_rl.analytic_policy.mpc_solver import MPCSolver
+
+                mpc_solutions[env_idx] = MPCSolver(
+                    config=mpc_config,
+                    dynamics_fn=dynamics_fn,
+                    reward_fn=reward_fn,
+                )
+
+            # Wrap the per-env MPC solvers in AnalyticPolicy
+            # We store them and override get_action per env
+            analytic_policy = _MPCAnalyticPolicy(
+                dynamics_hypothesis=first_entry,
+                reward_hypothesis=best_reward,
+                state_dim=state_dim,
+                action_dim=action_dim,
+                n_envs=self._env_family.n_envs,
+                mpc_solvers=mpc_solutions,
+                action_low=action_low,
+                action_high=action_high,
             )
+
+            r2_values = [e.training_r2 for e in best_dynamics.values()]
+            explained_variance = float(np.mean(r2_values))
 
         logger.info(
             "Analytic policy derived: solver={}, explained_variance={:.4f}",
@@ -1056,3 +1109,146 @@ class ValidationFeedbackStage(PipelineStage):
         return hash_config({
             "correlation_alpha": self._correlation_alpha,
         })
+
+
+# ---------------------------------------------------------------------------
+# MPC helpers (used by AnalyticPolicyDerivationStage)
+# ---------------------------------------------------------------------------
+
+
+def _build_dynamics_fn(
+    dynamics_expressions: dict[int, SymbolicExpression],
+    state_names: list[str],
+    action_names: list[str],
+    state_dim: int,
+    env_params: dict[str, float] | None,
+) -> Any:
+    """Build a dynamics callable for MPC from symbolic expressions.
+
+    :returns: Callable ``(state, action) -> next_state``.
+    """
+    import sympy
+
+    from circ_rl.hypothesis.expression import SymbolicExpression as _SE
+
+    # Compile per-dimension callables with env params substituted
+    dim_fns: dict[int, Any] = {}
+    var_names = list(state_names) + list(action_names)
+
+    for dim_idx, expr in dynamics_expressions.items():
+        sympy_expr = expr.sympy_expr
+
+        # Substitute env params into the expression
+        if env_params:
+            subs = {sympy.Symbol(k): v for k, v in env_params.items()}
+            sympy_expr = sympy_expr.subs(subs)
+
+        compiled = _SE.from_sympy(sympy_expr)
+        dim_fns[dim_idx] = compiled.to_callable(var_names)
+
+    def dynamics_fn(state: np.ndarray, action: np.ndarray) -> np.ndarray:
+        next_state = state.copy()
+        # Build input row: [state, action]
+        x = np.concatenate([state, action]).reshape(1, -1)
+        for dim_idx, fn in dim_fns.items():
+            delta = fn(x)
+            next_state[dim_idx] += float(delta[0])
+        return next_state
+
+    return dynamics_fn
+
+
+def _build_reward_fn(
+    reward_expression: SymbolicExpression,
+    state_names: list[str],
+    action_names: list[str],
+    env_params: dict[str, float] | None,
+) -> Any:
+    """Build a reward callable for MPC from a symbolic expression.
+
+    :returns: Callable ``(state, action) -> float``.
+    """
+    import sympy
+
+    from circ_rl.hypothesis.expression import SymbolicExpression as _SE
+
+    sympy_expr = reward_expression.sympy_expr
+    if env_params:
+        subs = {sympy.Symbol(k): v for k, v in env_params.items()}
+        sympy_expr = sympy_expr.subs(subs)
+
+    var_names = list(state_names) + list(action_names)
+    compiled = _SE.from_sympy(sympy_expr)
+    fn = compiled.to_callable(var_names)
+
+    def reward_fn(state: np.ndarray, action: np.ndarray) -> float:
+        x = np.concatenate([state, action]).reshape(1, -1)
+        return float(fn(x)[0])
+
+    return reward_fn
+
+
+class _MPCAnalyticPolicy:
+    """AnalyticPolicy wrapper for per-env MPC solvers.
+
+    Implements the same get_action(state, env_idx) interface as
+    AnalyticPolicy but dispatches to per-env MPC solvers.
+    """
+
+    def __init__(
+        self,
+        dynamics_hypothesis: Any,
+        reward_hypothesis: Any,
+        state_dim: int,
+        action_dim: int,
+        n_envs: int,
+        mpc_solvers: dict[int, Any],
+        action_low: np.ndarray | None = None,
+        action_high: np.ndarray | None = None,
+    ) -> None:
+        self._dynamics_hypothesis = dynamics_hypothesis
+        self._reward_hypothesis = reward_hypothesis
+        self._state_dim = state_dim
+        self._action_dim = action_dim
+        self._n_envs = n_envs
+        self._mpc_solvers = mpc_solvers
+        self._action_low = action_low
+        self._action_high = action_high
+        self.solver_type = "mpc"
+
+    @property
+    def n_free_parameters(self) -> int:
+        """MPC has no learned parameters."""
+        return 0
+
+    @property
+    def complexity(self) -> int:
+        """Symbolic complexity of the underlying hypothesis."""
+        from circ_rl.hypothesis.expression import SymbolicExpression as _SE
+
+        expr = self._dynamics_hypothesis.expression
+        if isinstance(expr, _SE):
+            return expr.complexity
+        return self._dynamics_hypothesis.complexity
+
+    def get_action(
+        self,
+        state: np.ndarray,
+        env_idx: int,
+    ) -> np.ndarray:
+        """Compute the optimal action via MPC.
+
+        :param state: Current state, shape ``(state_dim,)``.
+        :param env_idx: Environment index.
+        :returns: Optimal action, shape ``(action_dim,)``.
+        """
+        solver = self._mpc_solvers.get(env_idx)
+        if solver is None:
+            solver = next(iter(self._mpc_solvers.values()))
+
+        action = solver.solve(state, self._action_dim)
+
+        if self._action_low is not None and self._action_high is not None:
+            action = np.clip(action, self._action_low, self._action_high)
+
+        return action
