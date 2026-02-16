@@ -591,7 +591,11 @@ class AnalyticPolicyDerivationStage(PipelineStage):
 
         # Determine solver type from all expressions
         all_linear = all(
-            classifier.classify(entry.expression) == "lqr"
+            classifier.classify(
+                entry.expression.sympy_expr,
+                state_names,
+                action_names,
+            ) == "lqr"
             for entry in best_dynamics.values()
         )
         solver_type = "lqr" if all_linear else "mpc"
