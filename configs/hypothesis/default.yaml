@@ -1,0 +1,8 @@
+include_env_params: true
+
+symbolic_regression:
+  n_equations: 10
+  max_complexity: 20
+  timeout_seconds: 300
+  binary_operators: ["+", "-", "*", "/"]
+  unary_operators: ["sin", "cos", "exp", "sqrt", "abs"]

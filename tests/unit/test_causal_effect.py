@@ -135,3 +135,127 @@ class TestATEEstimation:
         assert isinstance(result.ate, float)
         assert isinstance(result.adjustment_set, frozenset)
         assert result.coefficients.shape[0] >= 2  # intercept + cause
+
+
+class TestMechanismInvariance:
+    """Tests for CausalEffectEstimator.test_mechanism_invariance()."""
+
+    def test_stable_linear_mechanism(self) -> None:
+        """Same linear mechanism in both envs -> high p-value."""
+        rng = np.random.RandomState(42)
+        n = 500
+
+        # Env A: X ~ N(0, 1), R = 2*X + noise
+        x_a = rng.randn(n)
+        r_a = 2.0 * x_a + 0.1 * rng.randn(n)
+        data_a = np.column_stack([x_a, r_a])
+
+        # Env B: X ~ N(3, 1) (different distribution), R = 2*X + noise (same mechanism)
+        x_b = rng.randn(n) + 3.0
+        r_b = 2.0 * x_b + 0.1 * rng.randn(n)
+        data_b = np.column_stack([x_b, r_b])
+
+        p_value = CausalEffectEstimator.test_mechanism_invariance(
+            data_a, data_b, target_idx=1, predictor_idxs=[0],
+        )
+        assert p_value > 0.05, f"Expected invariant, got p={p_value:.4f}"
+
+    def test_unstable_linear_mechanism(self) -> None:
+        """Different linear coefficients -> low p-value."""
+        rng = np.random.RandomState(42)
+        n = 500
+
+        # Env A: R = 2*X + noise
+        x_a = rng.randn(n)
+        r_a = 2.0 * x_a + 0.1 * rng.randn(n)
+        data_a = np.column_stack([x_a, r_a])
+
+        # Env B: R = -1*X + noise (different mechanism)
+        x_b = rng.randn(n)
+        r_b = -1.0 * x_b + 0.1 * rng.randn(n)
+        data_b = np.column_stack([x_b, r_b])
+
+        p_value = CausalEffectEstimator.test_mechanism_invariance(
+            data_a, data_b, target_idx=1, predictor_idxs=[0],
+        )
+        assert p_value < 0.01, f"Expected non-invariant, got p={p_value:.4f}"
+
+    def test_stable_nonlinear_mechanism(self) -> None:
+        """Same quadratic mechanism, different X distributions -> high p-value.
+
+        This is the key test: the polynomial Chow test should correctly
+        identify mechanism invariance even when the feature distributions
+        differ across environments.
+        """
+        rng = np.random.RandomState(42)
+        n = 500
+
+        # Env A: X ~ N(0, 1), R = X^2 + 0.5*X + noise
+        x_a = rng.randn(n)
+        r_a = x_a**2 + 0.5 * x_a + 0.1 * rng.randn(n)
+        data_a = np.column_stack([x_a, r_a])
+
+        # Env B: X ~ N(2, 0.5) (different distribution), same mechanism
+        x_b = rng.randn(n) * 0.5 + 2.0
+        r_b = x_b**2 + 0.5 * x_b + 0.1 * rng.randn(n)
+        data_b = np.column_stack([x_b, r_b])
+
+        p_value = CausalEffectEstimator.test_mechanism_invariance(
+            data_a, data_b, target_idx=1, predictor_idxs=[0],
+            poly_degree=2,
+        )
+        assert p_value > 0.05, f"Expected invariant (quadratic), got p={p_value:.4f}"
+
+    def test_poly_degree_fallback(self) -> None:
+        """When n_features > n_samples/5, degree should reduce automatically."""
+        rng = np.random.RandomState(42)
+        n = 20  # Very few samples
+
+        # 5 predictors with degree 2 -> many poly features, should fall back
+        x_a = rng.randn(n, 5)
+        r_a = x_a[:, 0] + 0.1 * rng.randn(n)
+        data_a = np.column_stack([x_a, r_a])
+
+        x_b = rng.randn(n, 5)
+        r_b = x_b[:, 0] + 0.1 * rng.randn(n)
+        data_b = np.column_stack([x_b, r_b])
+
+        # Should not crash even with many features and few samples
+        p_value = CausalEffectEstimator.test_mechanism_invariance(
+            data_a, data_b, target_idx=5, predictor_idxs=[0, 1, 2, 3, 4],
+            poly_degree=2,
+        )
+        assert 0.0 <= p_value <= 1.0
+
+    def test_multivariate_stable_mechanism(self) -> None:
+        """Two predictors with interaction, same mechanism across envs."""
+        rng = np.random.RandomState(42)
+        n = 500
+
+        # Env A: R = X1*X2 + X1^2 + noise (same mechanism)
+        x1_a = rng.randn(n)
+        x2_a = rng.randn(n)
+        r_a = x1_a * x2_a + x1_a**2 + 0.1 * rng.randn(n)
+        data_a = np.column_stack([x1_a, x2_a, r_a])
+
+        # Env B: different distributions, same mechanism
+        x1_b = rng.randn(n) + 1.0
+        x2_b = rng.randn(n) * 2.0
+        r_b = x1_b * x2_b + x1_b**2 + 0.1 * rng.randn(n)
+        data_b = np.column_stack([x1_b, x2_b, r_b])
+
+        p_value = CausalEffectEstimator.test_mechanism_invariance(
+            data_a, data_b, target_idx=2, predictor_idxs=[0, 1],
+            poly_degree=2,
+        )
+        assert p_value > 0.05, f"Expected invariant, got p={p_value:.4f}"
+
+    def test_empty_predictors_returns_one(self) -> None:
+        """No predictors -> p-value 1.0."""
+        rng = np.random.RandomState(42)
+        data_a = rng.randn(100, 2)
+        data_b = rng.randn(100, 2)
+        p_value = CausalEffectEstimator.test_mechanism_invariance(
+            data_a, data_b, target_idx=0, predictor_idxs=[],
+        )
+        assert p_value == 1.0

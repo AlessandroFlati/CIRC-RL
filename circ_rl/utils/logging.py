@@ -5,13 +5,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import torch
 from loguru import logger
 from torch.utils.tensorboard import SummaryWriter
 
 from circ_rl.utils.seeding import get_git_hash
 
 if TYPE_CHECKING:
+    import torch
     from omegaconf import DictConfig
 
 

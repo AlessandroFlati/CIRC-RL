@@ -11,9 +11,9 @@ Inference in the Presence of Latent Variables and Selection Bias*.
 from __future__ import annotations
 
 from itertools import combinations
+from typing import TYPE_CHECKING
 
 import networkx as nx
-import numpy as np
 from loguru import logger
 
 from circ_rl.causal_discovery.causal_graph import CausalGraph
@@ -22,6 +22,9 @@ from circ_rl.causal_discovery.ci_tests import (
     causal_ci_test_fisher_z,
     causal_ci_test_kernel,
 )
+
+if TYPE_CHECKING:
+    import numpy as np
 
 
 class FCIAlgorithm:

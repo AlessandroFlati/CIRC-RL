@@ -41,6 +41,7 @@ class Trajectory:
     dones: torch.Tensor
     env_id: int
     env_params: torch.Tensor | None = None
+    flat_env_ids: torch.Tensor | None = None
     last_bootstrap_value: float = 0.0
     episode_returns: list[float] = field(default_factory=list)
 
@@ -154,6 +155,12 @@ class MultiEnvTrajectoryBuffer:
         if self._trajectories[0].env_params is not None:
             env_params = torch.cat([t.env_params for t in self._trajectories])  # type: ignore[misc]
 
+        # Per-sample env IDs for auxiliary losses (e.g., dynamics prediction)
+        flat_env_ids = torch.cat([
+            torch.full((t.length,), t.env_id, dtype=torch.long)
+            for t in self._trajectories
+        ])  # (total_transitions,)
+
         return Trajectory(
             states=torch.cat([t.states for t in self._trajectories]),
             actions=torch.cat([t.actions for t in self._trajectories]),
@@ -164,6 +171,7 @@ class MultiEnvTrajectoryBuffer:
             dones=torch.cat([t.dones for t in self._trajectories]),
             env_id=-1,
             env_params=env_params,
+            flat_env_ids=flat_env_ids,
         )
 
     def compute_all_advantages(

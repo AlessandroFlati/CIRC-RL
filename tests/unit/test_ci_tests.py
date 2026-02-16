@@ -89,7 +89,7 @@ class TestKernelCI:
 
     def test_detects_independence(self, independent_data: np.ndarray) -> None:
         result = causal_ci_test_kernel(
-            independent_data, 0, 1, [], n_permutations=100
+            independent_data, 0, 1, [], n_permutations=500
         )
         assert result.independent
 

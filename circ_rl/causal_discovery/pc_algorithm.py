@@ -9,10 +9,9 @@ Reference: Spirtes, Glymour, Scheines (2000). *Causation, Prediction, and Search
 from __future__ import annotations
 
 from itertools import combinations
-from typing import Any
+from typing import TYPE_CHECKING
 
 import networkx as nx
-import numpy as np
 from loguru import logger
 
 from circ_rl.causal_discovery.causal_graph import CausalGraph
@@ -22,6 +21,9 @@ from circ_rl.causal_discovery.ci_tests import (
     causal_ci_test_fisher_z,
     causal_ci_test_kernel,
 )
+
+if TYPE_CHECKING:
+    import numpy as np
 
 
 class PCAlgorithm:
@@ -263,9 +265,8 @@ class PCAlgorithm:
 
         # Remove remaining bidirectional edges by picking an acyclic orientation
         # For any remaining undirected edge, orient arbitrarily (topological order)
-        pdag = self._resolve_undirected_edges(pdag)
+        return self._resolve_undirected_edges(pdag)
 
-        return pdag
 
     @staticmethod
     def _resolve_undirected_edges(pdag: nx.DiGraph) -> nx.DiGraph:
@@ -287,10 +288,23 @@ class PCAlgorithm:
                 undirected_pairs.append((u, v))
                 seen.add(pair)
 
-        # Remove all undirected edges -- directed-only subgraph is a DAG
+        # Remove all undirected edges -- directed-only subgraph should be a DAG
         for u, v in undirected_pairs:
             pdag.remove_edge(u, v)
             pdag.remove_edge(v, u)
+
+        # Safety: v-structure/Meek orientation can rarely produce directed
+        # cycles.  Break any cycles by removing back-edges.
+        while not nx.is_directed_acyclic_graph(pdag):
+            try:
+                cycle = nx.find_cycle(pdag)
+                u_cyc, v_cyc, *_ = cycle[-1]
+                pdag.remove_edge(u_cyc, v_cyc)
+                logger.warning(
+                    "Broke directed cycle by removing edge {} -> {}", u_cyc, v_cyc
+                )
+            except nx.NetworkXNoCycle:
+                break
 
         # Greedily re-add each pair in the orientation that keeps a DAG
         for u, v in undirected_pairs:

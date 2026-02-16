@@ -114,6 +114,8 @@ def _make_mixed_dataset(
 
 
 class TestInvFeatureSelector:
+    """Tests for ATE-variance mode (legacy, use_mechanism_invariance=False)."""
+
     def test_selects_causal_features_only(self) -> None:
         """Spurious features (S1, S2) should be rejected."""
         graph = _make_graph_with_spurious()
@@ -160,6 +162,23 @@ class TestInvFeatureSelector:
             else:
                 assert not result.feature_mask[i]
 
+    def test_feature_weights_match_mask_in_ate_mode(self) -> None:
+        """In ATE-variance mode, weights should be 0.0 or 1.0."""
+        graph = _make_graph_with_spurious()
+        dataset = _make_invariant_dataset()
+        feature_names = ["X1", "X2", "X3", "S1", "S2"]
+
+        selector = InvFeatureSelector(epsilon=0.5, min_ate=0.01)
+        result = selector.select(dataset, graph, feature_names)
+
+        assert result.feature_weights.shape == (5,)
+        assert result.feature_weights.dtype == np.float32
+        for i in range(5):
+            if result.feature_mask[i]:
+                assert result.feature_weights[i] == 1.0
+            else:
+                assert result.feature_weights[i] == 0.0
+
     def test_variant_mechanism_rejected(self) -> None:
         """Feature with variant mechanism (X2) should have higher ATE variance."""
         import networkx as nx
@@ -205,3 +224,131 @@ class TestInvFeatureSelector:
         # Causal features should have variance computed
         for feat in ["X1", "X2", "X3"]:
             assert feat in result.ate_variance
+
+
+class TestMechanismInvarianceMode:
+    """Tests for mechanism invariance mode (use_mechanism_invariance=True)."""
+
+    def test_invariant_features_get_weight_1(self) -> None:
+        """Features with invariant mechanisms should get weight 1.0."""
+        graph = _make_graph_with_spurious()
+        dataset = _make_invariant_dataset()
+        feature_names = ["X1", "X2", "X3", "S1", "S2"]
+
+        selector = InvFeatureSelector(
+            use_mechanism_invariance=True,
+            min_ate=0.01,
+            skip_ancestor_check=True,
+        )
+        result = selector.select(dataset, graph, feature_names)
+
+        # X2 and X3 have direct causal effects on reward with invariant mechanisms
+        # They should be selected with weight 1.0
+        for feat in result.selected_features:
+            idx = feature_names.index(feat)
+            # Invariant mechanism -> weight should be 1.0
+            assert result.feature_weights[idx] == pytest.approx(1.0), (
+                f"{feat}: expected weight 1.0, got {result.feature_weights[idx]:.3f}"
+            )
+
+    def test_variant_mechanism_gets_soft_weight(self) -> None:
+        """Feature with truly variant mechanism should get 0 < weight < 1."""
+        import networkx as nx
+
+        g = nx.DiGraph()
+        g.add_edges_from([("X1", "reward"), ("X2", "reward")])
+        graph = CausalGraph(g, reward_node="reward")
+
+        dataset = _make_mixed_dataset(n_per_env=1000)
+        feature_names = ["X1", "X2"]
+
+        selector = InvFeatureSelector(
+            use_mechanism_invariance=True,
+            min_ate=0.01,
+            min_weight=0.1,
+        )
+        result = selector.select(dataset, graph, feature_names)
+
+        # X1: invariant (coeff=2.0 in both envs) -> weight 1.0
+        assert result.feature_weights[0] == pytest.approx(1.0)
+
+        # X2: variant (coeff flips 1.0 to -1.0) -> low p-value -> soft weight
+        assert 0.0 < result.feature_weights[1] < 1.0, (
+            f"X2 weight should be soft, got {result.feature_weights[1]:.3f}"
+        )
+
+    def test_mechanism_p_values_populated(self) -> None:
+        """mechanism_p_values should be populated for evaluated features."""
+        import networkx as nx
+
+        g = nx.DiGraph()
+        g.add_edges_from([("X1", "reward"), ("X2", "reward")])
+        graph = CausalGraph(g, reward_node="reward")
+
+        dataset = _make_mixed_dataset(n_per_env=1000)
+        feature_names = ["X1", "X2"]
+
+        selector = InvFeatureSelector(
+            use_mechanism_invariance=True,
+            min_ate=0.01,
+        )
+        result = selector.select(dataset, graph, feature_names)
+
+        assert "X1" in result.mechanism_p_values
+        assert "X2" in result.mechanism_p_values
+        # X1 invariant -> high p-value
+        assert result.mechanism_p_values["X1"] > 0.01
+        # X2 variant -> low p-value
+        assert result.mechanism_p_values["X2"] < 0.01
+
+    def test_spurious_features_rejected_by_ancestor_check(self) -> None:
+        """Non-ancestors should get weight 0.0."""
+        graph = _make_graph_with_spurious()
+        dataset = _make_invariant_dataset()
+        feature_names = ["X1", "X2", "X3", "S1", "S2"]
+
+        selector = InvFeatureSelector(
+            use_mechanism_invariance=True,
+            min_ate=0.01,
+        )
+        result = selector.select(dataset, graph, feature_names)
+
+        assert result.feature_weights[3] == 0.0  # S1
+        assert result.feature_weights[4] == 0.0  # S2
+        assert "S1" in result.rejected_features
+        assert "S2" in result.rejected_features
+
+    def test_feature_mask_derived_from_weights(self) -> None:
+        """feature_mask should be True where weight > 0."""
+        graph = _make_graph_with_spurious()
+        dataset = _make_invariant_dataset()
+        feature_names = ["X1", "X2", "X3", "S1", "S2"]
+
+        selector = InvFeatureSelector(
+            use_mechanism_invariance=True,
+            min_ate=0.01,
+            skip_ancestor_check=True,
+        )
+        result = selector.select(dataset, graph, feature_names)
+
+        for i in range(5):
+            assert result.feature_mask[i] == (result.feature_weights[i] > 0)
+
+    def test_mechanism_alpha_validation(self) -> None:
+        with pytest.raises(ValueError, match="mechanism_alpha"):
+            InvFeatureSelector(
+                use_mechanism_invariance=True,
+                mechanism_alpha=0.0,
+            )
+        with pytest.raises(ValueError, match="mechanism_alpha"):
+            InvFeatureSelector(
+                use_mechanism_invariance=True,
+                mechanism_alpha=1.0,
+            )
+
+    def test_min_weight_validation(self) -> None:
+        with pytest.raises(ValueError, match="min_weight"):
+            InvFeatureSelector(
+                use_mechanism_invariance=True,
+                min_weight=-0.1,
+            )

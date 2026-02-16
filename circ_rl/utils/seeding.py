@@ -18,7 +18,7 @@ def seed_everything(seed: int) -> None:
         raise ValueError(f"Seed must be non-negative, got {seed}")
 
     random.seed(seed)
-    np.random.seed(seed)  # noqa: NPY002
+    np.random.seed(seed)
     torch.manual_seed(seed)
 
     if torch.cuda.is_available():
@@ -36,7 +36,7 @@ def get_git_hash() -> str:
         a git repository.
     """
     result = subprocess.run(
-        ["git", "rev-parse", "--short", "HEAD"],  # noqa: S603, S607
+        ["git", "rev-parse", "--short", "HEAD"],  # noqa: S607
         capture_output=True,
         text=True,
         check=True,

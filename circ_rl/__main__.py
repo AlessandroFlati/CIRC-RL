@@ -1,4 +1,4 @@
-"""Hydra entry point for CIRC-RL.
+"""Hydra entry point for CIRC-RL v2.
 
 Usage::
 
@@ -11,30 +11,38 @@ Or with config overrides::
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import hydra
 from loguru import logger
-from omegaconf import DictConfig
 
 from circ_rl.environments.env_family import EnvironmentFamily
 from circ_rl.orchestration.pipeline import CIRCPipeline
 from circ_rl.orchestration.stages import (
+    AnalyticPolicyDerivationStage,
     CausalDiscoveryStage,
-    EnsembleConstructionStage,
+    DiagnosticValidationStage,
     FeatureSelectionStage,
-    PolicyOptimizationStage,
-    ValidationFeedbackStage,
+    HypothesisFalsificationStage,
+    HypothesisGenerationStage,
+    ResidualLearningStage,
+    TransitionAnalysisStage,
 )
-from circ_rl.training.circ_trainer import TrainingConfig
 from circ_rl.utils.seeding import seed_everything
+
+if TYPE_CHECKING:
+    from omegaconf import DictConfig
+
+    from circ_rl.orchestration.pipeline import PipelineStage
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(cfg: DictConfig) -> None:
-    """Run the CIRC-RL pipeline."""
+    """Run the CIRC-RL v2 pipeline."""
     seed_everything(cfg.get("seed", 42))
 
     device = cfg.get("device", "cpu")
-    logger.info("Starting CIRC-RL pipeline (device={})", device)
+    logger.info("Starting CIRC-RL v2 pipeline (device={})", device)
     logger.info("Config: {}", dict(cfg))
 
     # Build environment family
@@ -54,34 +62,14 @@ def main(cfg: DictConfig) -> None:
         seed=cfg.get("seed", 42),
     )
 
-    # Build training config
-    train_cfg = cfg.training
-    training_config = TrainingConfig(
-        n_iterations=train_cfg.n_iterations,
-        gamma=train_cfg.gamma,
-        learning_rate=train_cfg.learning_rate,
-        n_steps_per_env=train_cfg.get("n_steps_per_env", 200),
-        n_ppo_epochs=train_cfg.get("n_ppo_epochs", 4),
-        mini_batch_size=train_cfg.get("mini_batch_size", 64),
-        irm_weight=train_cfg.get("irm_weight", 1.0),
-    )
-
     # Env-param discovery config
     ep_cfg = cfg.get("env_param_discovery", {})
     include_env_params = bool(ep_cfg.get("enabled", False))
-    conditional_invariance = bool(ep_cfg.get("conditional_invariance", True))
-
     ep_correlation_threshold = float(ep_cfg.get("ep_correlation_threshold", 0.05))
 
-    if include_env_params:
-        logger.info(
-            "Env-param causal discovery enabled (conditional_invariance={})",
-            conditional_invariance,
-        )
-
-    # Build pipeline stages
+    # Build v2 pipeline stages
     cd_cfg = cfg.causal_discovery
-    stages = [
+    stages: list[PipelineStage] = [
         CausalDiscoveryStage(
             env_family=env_family,
             n_transitions_per_env=cd_cfg.n_transitions_per_env,
@@ -94,47 +82,28 @@ def main(cfg: DictConfig) -> None:
         FeatureSelectionStage(
             epsilon=cfg.get("feature_selection", {}).get("epsilon", 0.1),
             min_ate=cfg.get("feature_selection", {}).get("min_ate", 0.01),
-            enable_conditional_invariance=conditional_invariance and include_env_params,
         ),
-        PolicyOptimizationStage(
-            env_family=env_family,
-            training_config=training_config,
-            n_policies=train_cfg.get("n_policies", 3),
-            device=device,
-        ),
-        EnsembleConstructionStage(
-            env_family=env_family,
-        ),
+        TransitionAnalysisStage(),
+        HypothesisGenerationStage(include_env_params=include_env_params),
+        HypothesisFalsificationStage(),
+        AnalyticPolicyDerivationStage(env_family=env_family),
+        ResidualLearningStage(env_family=env_family),
+        DiagnosticValidationStage(env_family=env_family),
     ]
-
-    # Add validation feedback stage when env-param discovery is enabled
-    if include_env_params:
-        validation_alpha = float(ep_cfg.get("validation_alpha", 0.05))
-        stages.append(
-            ValidationFeedbackStage(
-                env_family=env_family,
-                correlation_alpha=validation_alpha,
-            )
-        )
 
     pipeline = CIRCPipeline(stages, cache_dir=cfg.get("cache_dir", ".circ_cache"))
     results = pipeline.run(force_from=cfg.get("force_from", None))
 
-    ensemble = results["ensemble_construction"]["ensemble"]
-    logger.info(
-        "Pipeline complete. Ensemble has {} policies.",
-        ensemble.n_policies,
-    )
-
-    # Log validation feedback if available
-    if "validation_feedback" in results:
-        vf = results["validation_feedback"]
-        suggested = vf.get("suggested_context_params", [])
-        if suggested:
-            logger.warning(
-                "Validation feedback suggests additional context params: {}",
-                suggested,
-            )
+    # Report final result
+    diag = results.get("diagnostic_validation", {})
+    recommended = diag.get("recommended_action")
+    if recommended is not None:
+        logger.info(
+            "Pipeline complete. Recommended action: {}",
+            recommended.value,
+        )
+    else:
+        logger.info("Pipeline complete.")
 
 
 if __name__ == "__main__":

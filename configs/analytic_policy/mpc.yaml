@@ -1,0 +1,7 @@
+solver: mpc
+gamma: 0.99
+horizon: 20
+max_action: 2.0
+method: SLSQP
+max_iter: 100
+tolerance: 1.0e-6

@@ -6,9 +6,12 @@ during training and verification.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
-from circ_rl.constraints.const_definition import ConstraintFunction
+if TYPE_CHECKING:
+    from circ_rl.constraints.const_definition import ConstraintFunction
 
 
 class ConstraintSet:

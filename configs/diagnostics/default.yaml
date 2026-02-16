@@ -1,0 +1,5 @@
+premise_r2_threshold: 0.5
+derivation_divergence_threshold: 1.0
+conclusion_error_threshold: 0.3
+eval_episodes: 5
+max_steps: 200

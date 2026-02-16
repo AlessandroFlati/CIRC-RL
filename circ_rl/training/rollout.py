@@ -9,7 +9,6 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
-import gymnasium as gym
 import numpy as np
 import torch
 from loguru import logger

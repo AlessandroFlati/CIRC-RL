@@ -109,17 +109,22 @@ def causal_ci_test_kernel(
     conditioning_idxs: list[int],
     alpha: float = 0.05,
     n_permutations: int = 200,
+    max_samples: int = 1000,
 ) -> CITestResult:
-    r"""Kernel-based conditional independence test.
+    r"""Kernel-based conditional independence test using HSIC.
 
-    Uses a permutation-based approach with RBF kernels to test for
-    conditional independence in nonlinear settings. This is a simplified
-    implementation using kernel regression residuals.
+    Uses the Hilbert-Schmidt Independence Criterion (HSIC) with RBF
+    kernels and a permutation test for significance.  HSIC detects
+    arbitrary non-linear dependencies, unlike the Fisher-z test which
+    only detects linear associations.
 
-    The approach:
-    1. Regress X on Z using kernel smoothing to get residuals :math:`\epsilon_X`
-    2. Regress Y on Z using kernel smoothing to get residuals :math:`\epsilon_Y`
-    3. Test independence of residuals using a permutation test on correlation
+    For the conditional case :math:`X \perp\!\!\!\perp Y \mid Z`:
+
+    1. Regress X on Z using kernel smoothing to get residuals
+       :math:`\epsilon_X`.
+    2. Regress Y on Z using kernel smoothing to get residuals
+       :math:`\epsilon_Y`.
+    3. Test independence of residuals via HSIC permutation test.
 
     :param data: Data matrix of shape ``(n_samples, n_variables)``.
     :param x_idx: Column index of variable X.
@@ -127,33 +132,42 @@ def causal_ci_test_kernel(
     :param conditioning_idxs: Column indices of conditioning variables Z.
     :param alpha: Significance level.
     :param n_permutations: Number of permutations for the permutation test.
+    :param max_samples: Maximum samples to use (subsamples if exceeded).
     :returns: CITestResult with independence decision.
     """
     n_samples = data.shape[0]
     cond_set = frozenset(conditioning_idxs)
 
+    # Subsample for computational efficiency (HSIC is O(n^2))
+    if n_samples > max_samples:
+        rng_sub = np.random.RandomState(42)
+        idx = rng_sub.choice(n_samples, max_samples, replace=False)
+        data = data[idx]
+        n_samples = max_samples
+
     x = data[:, x_idx]  # (n_samples,)
     y = data[:, y_idx]  # (n_samples,)
 
     if len(conditioning_idxs) == 0:
-        corr = float(np.abs(np.corrcoef(x, y)[0, 1]))
-        observed_stat = corr * np.sqrt(n_samples)
+        K_x_c = _centered_rbf_kernel(x)  # (n_samples, n_samples)
+        K_y_c = _centered_rbf_kernel(y)  # (n_samples, n_samples)
     else:
         z = data[:, conditioning_idxs]  # (n_samples, n_cond)
         res_x = _kernel_residuals(x, z)
         res_y = _kernel_residuals(y, z)
-        corr = float(np.abs(np.corrcoef(res_x, res_y)[0, 1]))
-        observed_stat = corr * np.sqrt(n_samples)
+        K_x_c = _centered_rbf_kernel(res_x)  # (n_samples, n_samples)
+        K_y_c = _centered_rbf_kernel(res_y)  # (n_samples, n_samples)
+
+    observed_stat = float(np.sum(K_x_c * K_y_c)) / (n_samples * n_samples)
 
     rng = np.random.RandomState(42)
     count_ge = 0
     for _ in range(n_permutations):
         perm = rng.permutation(n_samples)
-        if len(conditioning_idxs) == 0:
-            perm_corr = float(np.abs(np.corrcoef(x[perm], y)[0, 1]))
-        else:
-            perm_corr = float(np.abs(np.corrcoef(res_x[perm], res_y)[0, 1]))
-        perm_stat = perm_corr * np.sqrt(n_samples)
+        # Permuting rows+cols of centered K is equivalent to
+        # centering the permuted kernel (proven via centering algebra)
+        K_x_perm = K_x_c[np.ix_(perm, perm)]
+        perm_stat = float(np.sum(K_x_perm * K_y_c)) / (n_samples * n_samples)
         if perm_stat >= observed_stat:
             count_ge += 1
 
@@ -165,6 +179,45 @@ def causal_ci_test_kernel(
         statistic=float(observed_stat),
         conditioning_set=cond_set,
     )
+
+
+def _hsic_statistic(x: np.ndarray, y: np.ndarray) -> float:
+    """Compute the biased HSIC statistic between 1D arrays.
+
+    Uses RBF kernels with the median heuristic for bandwidth selection.
+    HSIC measures non-linear statistical dependence; it equals zero iff
+    X and Y are independent (in the population, for characteristic kernels).
+
+    :param x: First variable, shape ``(n,)``.
+    :param y: Second variable, shape ``(n,)``.
+    :returns: HSIC statistic (non-negative scalar).
+    """
+    n = len(x)
+    K_x_c = _centered_rbf_kernel(x)  # (n, n)
+    K_y_c = _centered_rbf_kernel(y)  # (n, n)
+    return float(np.sum(K_x_c * K_y_c)) / (n * n)
+
+
+def _centered_rbf_kernel(x: np.ndarray) -> np.ndarray:
+    """Compute a double-centered RBF kernel matrix for a 1D array.
+
+    Bandwidth is set via the median heuristic (median of pairwise
+    distances).
+
+    :param x: Input array, shape ``(n,)``.
+    :returns: Double-centered kernel matrix, shape ``(n, n)``.
+    """
+    dists_sq = (x[:, None] - x[None, :]) ** 2  # (n, n)
+    # Median heuristic: bandwidth = median of pairwise distances
+    n = len(x)
+    upper_tri = dists_sq[np.triu_indices(n, k=1)]
+    bandwidth = float(np.sqrt(np.median(upper_tri))) + 1e-10
+    K = np.exp(-dists_sq / (2.0 * bandwidth * bandwidth))  # (n, n)
+    # Double center: K_c = K - row_mean - col_mean + grand_mean
+    row_mean = K.mean(axis=1, keepdims=True)  # (n, 1)
+    col_mean = K.mean(axis=0, keepdims=True)  # (1, n)
+    grand_mean = K.mean()
+    return K - row_mean - col_mean + grand_mean  # (n, n)
 
 
 def _partial_correlation(

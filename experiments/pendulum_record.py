@@ -6,8 +6,10 @@ showing the policy in all 6 physics variants.
 Usage::
 
     uv run python experiments/pendulum_record.py [checkpoint_path] [--tag TAG]
+    uv run python experiments/pendulum_record.py --best --tag best
 
 If checkpoint_path is omitted, defaults to experiments/outputs/pendulum_policy.pt.
+Use --best to load experiments/outputs/pendulum_policy_best.pt instead.
 """
 
 from __future__ import annotations
@@ -20,7 +22,9 @@ import numpy as np
 import torch
 from loguru import logger
 
+from circ_rl.environments.data_collector import DataCollector
 from circ_rl.environments.env_family import EnvironmentFamily
+from circ_rl.feature_selection.transition_analyzer import TransitionAnalyzer
 from circ_rl.policy.causal_policy import CausalPolicy
 
 
@@ -204,8 +208,13 @@ def main() -> None:
     parser.add_argument(
         "checkpoint",
         nargs="?",
-        default="experiments/outputs/pendulum_policy.pt",
+        default=None,
         help="Path to policy checkpoint (.pt file)",
+    )
+    parser.add_argument(
+        "--best",
+        action="store_true",
+        help="Load best worst-case checkpoint (pendulum_policy_best.pt)",
     )
     parser.add_argument(
         "--tag",
@@ -225,6 +234,14 @@ def main() -> None:
         help="Simulation steps per environment (default: 600, = 30s at 20fps)",
     )
     args = parser.parse_args()
+
+    # Resolve checkpoint path
+    if args.checkpoint is not None:
+        checkpoint_path = args.checkpoint
+    elif args.best:
+        checkpoint_path = "experiments/outputs/pendulum_policy_best.pt"
+    else:
+        checkpoint_path = "experiments/outputs/pendulum_policy.pt"
 
     logger.remove()
     logger.add(sys.stderr, level="INFO")
@@ -254,6 +271,12 @@ def main() -> None:
     action_low = action_space.low   # type: ignore[union-attr]
     action_high = action_space.high  # type: ignore[union-attr]
 
+    # Compute dynamics reference scale (same env family as training)
+    collector = DataCollector(env_family, include_env_params=True)
+    discovery_data = collector.collect(n_transitions_per_env=2000, seed=42)
+    state_names = [f"s{i}" for i in range(state_dim)]
+    ta_result = TransitionAnalyzer().analyze(discovery_data, state_names, action_dim)
+
     policy = CausalPolicy(
         full_state_dim=state_dim,
         feature_mask=np.ones(state_dim, dtype=bool),
@@ -263,10 +286,12 @@ def main() -> None:
         action_low=action_low,
         action_high=action_high,
         context_dim=len(env_param_names),
+        use_dynamics_normalization=True,
+        dynamics_reference_scale=ta_result.reference_scale,
     )
 
-    print(f"Loading checkpoint: {args.checkpoint}")
-    state_dict = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+    print(f"Loading checkpoint: {checkpoint_path}")
+    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     policy.load_state_dict(state_dict)
     policy.eval()
 

@@ -47,7 +47,10 @@ class CausalPolicy(nn.Module):
 
     :param full_state_dim: Dimensionality of the full state space.
     :param action_dim: Number of discrete actions, or continuous action dimensions.
-    :param feature_mask: Boolean array indicating causal features.
+    :param feature_mask: Array indicating causal features. Boolean arrays
+        use hard selection (True/False). Float arrays in ``[0, 1]`` enable
+        soft weighting: features with weight > 0 are included and scaled
+        by their weight.
     :param hidden_dims: Sizes of hidden layers in the shared trunk.
     :param activation: Activation function class.
     :param use_info_bottleneck: Whether to use the IB encoder.
@@ -58,6 +61,15 @@ class CausalPolicy(nn.Module):
     :param context_dim: Number of context dimensions (environment parameters).
         When > 0, the policy expects a context tensor to be concatenated with
         the causal features before the trunk. Set to 0 (default) to disable.
+    :param use_dynamics_normalization: When True and ``continuous=True``,
+        enables a dynamics predictor (context -> predicted dynamics scale)
+        trained via an auxiliary loss in the trainer. Context is still
+        concatenated to the trunk for full expressiveness. When False
+        (default), the dynamics predictor is not created.
+    :param dynamics_reference_scale: Reference dynamics scale from
+        ``TransitionAnalyzer``. Actions are scaled by
+        ``predicted_scale / reference_scale``.
+    :param dynamics_ratio_range: Soft bounds for the dynamics ratio.
     """
 
     _LOG_STD_MIN = -20.0
@@ -76,6 +88,9 @@ class CausalPolicy(nn.Module):
         action_low: np.ndarray | None = None,
         action_high: np.ndarray | None = None,
         context_dim: int = 0,
+        use_dynamics_normalization: bool = False,
+        dynamics_reference_scale: float = 1.0,
+        dynamics_ratio_range: tuple[float, float] = (0.01, 100.0),
     ) -> None:
         super().__init__()
 
@@ -85,11 +100,21 @@ class CausalPolicy(nn.Module):
                 f"full_state_dim ({full_state_dim},)"
             )
 
+        # Support both boolean masks and float weight arrays
+        if feature_mask.dtype == np.bool_:
+            weights = feature_mask.astype(np.float32)
+        else:
+            weights = feature_mask.astype(np.float32)
+
+        self.register_buffer(
+            "_feature_weights",
+            torch.from_numpy(weights),
+        )
         self.register_buffer(
             "_feature_mask",
-            torch.from_numpy(feature_mask.astype(np.bool_)),
+            self._feature_weights > 0,
         )
-        causal_dim = int(feature_mask.sum())
+        causal_dim = int(self._feature_mask.sum())
         if causal_dim == 0:
             raise ValueError("feature_mask selects zero features")
 
@@ -115,8 +140,27 @@ class CausalPolicy(nn.Module):
             )
 
         self._context_dim = context_dim
+        self._use_dynamics_norm = use_dynamics_normalization and continuous
+        self._dynamics_ratio_range = dynamics_ratio_range
         self._use_ib = use_info_bottleneck
         self._encoder: InformationBottleneckEncoder | None = None
+
+        # Dynamics predictor: context -> predicted dynamics scale (positive)
+        if self._use_dynamics_norm:
+            if context_dim == 0:
+                raise ValueError(
+                    "use_dynamics_normalization requires context_dim > 0"
+                )
+            self._dynamics_predictor = nn.Sequential(
+                nn.Linear(context_dim, 32),
+                nn.ReLU(),
+                nn.Linear(32, 1),
+                nn.Softplus(),
+            )
+            self.register_buffer(
+                "_dynamics_reference_scale",
+                torch.tensor(dynamics_reference_scale),
+            )
 
         if use_info_bottleneck:
             self._encoder = InformationBottleneckEncoder(
@@ -125,9 +169,14 @@ class CausalPolicy(nn.Module):
                 hidden_dims=hidden_dims[:1] if hidden_dims else (64,),
                 activation=activation,
             )
-            trunk_input_dim = latent_dim + context_dim
+            base_dim = latent_dim
         else:
-            trunk_input_dim = causal_dim + context_dim
+            base_dim = causal_dim
+
+        # Context always enters the trunk for full expressiveness.
+        # When dynamics normalization is active, the dynamics predictor
+        # is trained separately via an auxiliary loss in the trainer.
+        trunk_input_dim = base_dim + context_dim
 
         # Shared trunk
         trunk_layers: list[nn.Module] = []
@@ -161,10 +210,12 @@ class CausalPolicy(nn.Module):
 
     @property
     def policy_parameters(self) -> list[torch.nn.Parameter]:
-        """Parameters for the policy (trunk + policy head + optional encoder)."""
+        """Parameters for the policy (trunk + policy head + optional encoder + dynamics predictor)."""
         params = list(self._trunk.parameters()) + list(self._policy_head.parameters())
         if self._encoder is not None:
             params.extend(self._encoder.parameters())
+        if self._use_dynamics_norm:
+            params.extend(self._dynamics_predictor.parameters())
         return params
 
     @property
@@ -190,6 +241,9 @@ class CausalPolicy(nn.Module):
         :returns: (features, value, kl) tuple.
         """
         causal_features = state[:, self._feature_mask]  # (batch, causal_dim)
+        # Apply soft weights (identity when weights are 1.0)
+        active_weights = self._feature_weights[self._feature_mask]  # (causal_dim,)
+        causal_features = causal_features * active_weights  # (batch, causal_dim)
         kl = torch.zeros(state.shape[0], device=state.device)
 
         if self._use_ib and self._encoder is not None:
@@ -199,7 +253,7 @@ class CausalPolicy(nn.Module):
         else:
             trunk_input = causal_features  # (batch, causal_dim)
 
-        # Concatenate context (env params) if provided
+        # Concatenate context (env params) if provided.
         if self._context_dim > 0 and context is not None:
             trunk_input = torch.cat([trunk_input, context], dim=-1)
 
@@ -211,7 +265,8 @@ class CausalPolicy(nn.Module):
         return features, value, kl
 
     def _continuous_distribution(
-        self, features: torch.Tensor
+        self,
+        features: torch.Tensor,
     ) -> tuple[Normal, torch.Tensor]:
         """Build a Normal distribution from trunk features.
 
@@ -222,6 +277,7 @@ class CausalPolicy(nn.Module):
         mean, log_std = raw.chunk(2, dim=-1)  # each (batch, action_dim)
         log_std = log_std.clamp(self._LOG_STD_MIN, self._LOG_STD_MAX)
         std = log_std.exp()
+
         return Normal(mean, std), mean
 
     def _squash_action(self, raw_action: torch.Tensor) -> torch.Tensor:
@@ -352,6 +408,8 @@ class CausalPolicy(nn.Module):
 
         with torch.no_grad():
             causal_features = state[:, self._feature_mask]
+            active_weights = self._feature_weights[self._feature_mask]
+            causal_features = causal_features * active_weights
 
             if self._use_ib and self._encoder is not None:
                 trunk_input = self._encoder.encode_deterministic(causal_features)
@@ -366,17 +424,13 @@ class CausalPolicy(nn.Module):
 
             if self._continuous:
                 dist, mean = self._continuous_distribution(features)
-                if deterministic:
-                    raw_action = mean
-                else:
-                    raw_action = dist.sample()
+                raw_action = mean if deterministic else dist.sample()
                 action = self._squash_action(raw_action)
                 return action.squeeze(0).cpu().numpy()
+            logits = self._policy_head(features)
+            if deterministic:
+                action = logits.argmax(dim=-1)
             else:
-                logits = self._policy_head(features)
-                if deterministic:
-                    action = logits.argmax(dim=-1)
-                else:
-                    dist_d = Categorical(logits=logits)
-                    action = dist_d.sample()
-                return int(action.item())
+                dist_d = Categorical(logits=logits)
+                action = dist_d.sample()
+            return int(action.item())

@@ -68,6 +68,7 @@ class EnvironmentFamily:
         param_distributions: dict[str, tuple[float, float]],
         n_envs: int,
         seed: int = 42,
+        fixed_params: dict[str, float] | None = None,
     ) -> EnvironmentFamily:
         """Create an EnvironmentFamily from a Gymnasium environment ID.
 
@@ -79,13 +80,17 @@ class EnvironmentFamily:
         :param param_distributions: Mapping of attribute names to (low, high) ranges.
         :param n_envs: Number of environment instances.
         :param seed: Random seed.
+        :param fixed_params: Mapping of attribute names to constant values.
+            These are set on every environment but not tracked as varied
+            parameters. Useful for overriding defaults (e.g., ``max_torque``).
         :returns: A new EnvironmentFamily instance.
         """
+        _fixed = fixed_params or {}
 
         def factory(params: dict[str, float]) -> gym.Env[Any, Any]:
             env = gym.make(base_env)
             unwrapped = env.unwrapped
-            for attr, value in params.items():
+            for attr, value in {**_fixed, **params}.items():
                 if not hasattr(unwrapped, attr):
                     raise AttributeError(
                         f"Environment {base_env} does not have attribute '{attr}'. "

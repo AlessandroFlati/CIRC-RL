@@ -9,13 +9,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import combinations
+from typing import TYPE_CHECKING
 
 import numpy as np
 from loguru import logger
 from scipy import stats
 
-from circ_rl.causal_discovery.causal_graph import CausalGraph
-from circ_rl.environments.data_collector import ExploratoryDataset
+if TYPE_CHECKING:
+    from circ_rl.causal_discovery.causal_graph import CausalGraph
+    from circ_rl.environments.data_collector import ExploratoryDataset
 
 
 @dataclass(frozen=True)
@@ -111,7 +113,7 @@ class MechanismValidator:
         target_idx = name_to_idx[target_node]
 
         for parent in sorted(parents):
-            parent_idx = name_to_idx[parent]
+            name_to_idx[parent]
 
             # Get all parent indices for regression (include ep parents
             # as covariates but only iterate over non-ep parents above)
@@ -204,8 +206,7 @@ class MechanismValidator:
             return 1.0
 
         f_stat = numerator / denominator
-        p_value = float(1.0 - stats.f.cdf(f_stat, k, dof_denom))
-        return p_value
+        return float(1.0 - stats.f.cdf(f_stat, k, dof_denom))
 
 
 def _compute_residuals(

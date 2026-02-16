@@ -11,14 +11,15 @@ Lower MDL = better trade-off between fit and simplicity.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
-import torch.nn as nn
 from loguru import logger
 
-from circ_rl.policy.causal_policy import CausalPolicy
-from circ_rl.training.trajectory_buffer import Trajectory
+if TYPE_CHECKING:
+    from circ_rl.policy.causal_policy import CausalPolicy
+    from circ_rl.training.trajectory_buffer import Trajectory
 
 
 @dataclass(frozen=True)

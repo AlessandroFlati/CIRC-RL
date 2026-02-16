@@ -1,31 +1,32 @@
-"""Concrete pipeline stages for the CIRC-RL framework.
+"""Concrete pipeline stages for the CIRC-RL v2 framework.
 
-Implements the four phases of CIRC-RL as pipeline stages:
+Implements the scientific discovery pipeline as pipeline stages:
 1. Causal Discovery
 2. Feature Selection
-3. Policy Optimization
-4. Ensemble Construction
+2.5. Transition Analysis
+3. Hypothesis Generation (symbolic regression)
+4. Hypothesis Falsification
+5. Analytic Policy Derivation (LQR/MPC)
+6. Residual Learning (bounded correction)
+7. Diagnostic Validation (premise/derivation/conclusion)
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import torch
 from loguru import logger
 
 from circ_rl.causal_discovery.builder import CausalGraphBuilder
 from circ_rl.causal_discovery.mechanism_validator import MechanismValidator
 from circ_rl.environments.data_collector import DataCollector
-from circ_rl.environments.env_family import EnvironmentFamily
-from circ_rl.evaluation.ensemble import EnsemblePolicy
-from circ_rl.evaluation.mdl_scorer import MDLScorer
 from circ_rl.feature_selection.inv_feature_selector import InvFeatureSelector
 from circ_rl.orchestration.pipeline import PipelineStage, hash_config
-from circ_rl.policy.causal_policy import CausalPolicy
-from circ_rl.training.circ_trainer import CIRCTrainer, TrainingConfig
-from circ_rl.training.rollout import RolloutWorker
+
+if TYPE_CHECKING:
+    from circ_rl.environments.env_family import EnvironmentFamily
+    from circ_rl.hypothesis.expression import SymbolicExpression
 
 
 class CausalDiscoveryStage(PipelineStage):
@@ -143,28 +144,31 @@ class CausalDiscoveryStage(PipelineStage):
 class FeatureSelectionStage(PipelineStage):
     """Phase 2: Select invariant causal features.
 
-    :param epsilon: Maximum cross-environment ATE variance.
+    :param epsilon: Maximum cross-environment ATE variance (ATE mode).
     :param min_ate: Minimum absolute ATE.
-    :param enable_conditional_invariance: If True, check whether env-param
-        ancestors explain non-invariance before rejecting features.
+    :param use_mechanism_invariance: Use Chow-test mechanism invariance
+        with soft weighting instead of ATE-variance hard filter.
+    :param enable_conditional_invariance: Legacy flag for ATE variance mode.
     """
 
     def __init__(
         self,
         epsilon: float = 0.1,
         min_ate: float = 0.01,
+        use_mechanism_invariance: bool = False,
         enable_conditional_invariance: bool = False,
     ) -> None:
         super().__init__(name="feature_selection", dependencies=["causal_discovery"])
         self._epsilon = epsilon
         self._min_ate = min_ate
+        self._use_mechanism_invariance = use_mechanism_invariance
         self._enable_conditional_invariance = enable_conditional_invariance
 
     def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Run feature selection.
 
-        :returns: Dict with keys: feature_mask, selected_features, result,
-            context_param_names.
+        :returns: Dict with keys: feature_mask, feature_weights,
+            selected_features, result, context_param_names.
         """
         cd_output = inputs["causal_discovery"]
         graph = cd_output["graph"]
@@ -175,6 +179,7 @@ class FeatureSelectionStage(PipelineStage):
         selector = InvFeatureSelector(
             epsilon=self._epsilon,
             min_ate=self._min_ate,
+            use_mechanism_invariance=self._use_mechanism_invariance,
             enable_conditional_invariance=self._enable_conditional_invariance,
         )
         result = selector.select(
@@ -190,8 +195,10 @@ class FeatureSelectionStage(PipelineStage):
                 "No features selected by invariance filter; "
                 "falling back to all state features"
             )
+            feature_weights = np.ones(len(state_names), dtype=np.float32)
             feature_mask = np.ones(len(state_names), dtype=bool)
         else:
+            feature_weights = result.feature_weights
             feature_mask = result.feature_mask
 
         logger.info(
@@ -205,6 +212,7 @@ class FeatureSelectionStage(PipelineStage):
 
         return {
             "feature_mask": feature_mask,
+            "feature_weights": feature_weights,
             "selected_features": result.selected_features,
             "result": result,
             "context_param_names": result.context_param_names,
@@ -214,210 +222,712 @@ class FeatureSelectionStage(PipelineStage):
         return hash_config({
             "epsilon": self._epsilon,
             "min_ate": self._min_ate,
+            "use_mechanism_invariance": self._use_mechanism_invariance,
             "enable_conditional_invariance": self._enable_conditional_invariance,
         })
 
 
-class PolicyOptimizationStage(PipelineStage):
-    """Phase 3: Train causal policies.
+class TransitionAnalysisStage(PipelineStage):
+    """Phase 2.5: Analyze transition dynamics for dynamics normalization.
 
-    :param env_family: The environment family.
-    :param training_config: Training configuration.
-    :param n_policies: Number of policies to train (for ensemble).
-    :param device: Torch device for training.
+    Estimates per-environment dynamics scales and tests whether transition
+    mechanisms are invariant using LOEO R^2.
+
+    :param loeo_r2_threshold: Minimum R^2 for invariant transitions.
+    """
+
+    def __init__(self, loeo_r2_threshold: float = 0.9) -> None:
+        super().__init__(
+            name="transition_analysis",
+            dependencies=["causal_discovery"],
+        )
+        self._loeo_r2_threshold = loeo_r2_threshold
+
+    def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Run transition dynamics analysis.
+
+        :returns: Dict with keys: dynamics_scales, reference_scale,
+            transition_result.
+        """
+        from circ_rl.feature_selection.transition_analyzer import TransitionAnalyzer
+
+        cd_output = inputs["causal_discovery"]
+        dataset = cd_output["dataset"]
+        state_names = cd_output["state_names"]
+
+        # Infer action_dim from dataset
+        action_dim = 1 if dataset.actions.ndim == 1 else dataset.actions.shape[1]
+
+        analyzer = TransitionAnalyzer(loeo_r2_threshold=self._loeo_r2_threshold)
+        result = analyzer.analyze(dataset, state_names, action_dim)
+
+        return {
+            "dynamics_scales": result.dynamics_scales,
+            "reference_scale": result.reference_scale,
+            "transition_result": result,
+        }
+
+    def config_hash(self) -> str:
+        return hash_config({
+            "loeo_r2_threshold": self._loeo_r2_threshold,
+        })
+
+
+class HypothesisGenerationStage(PipelineStage):
+    """Phase 3: Generate symbolic hypotheses via symbolic regression.
+
+    Runs PySR on variant state dimensions (dynamics) and reward to
+    discover analytic functional forms.
+
+    See ``CIRC-RL_Framework.md`` Section 3.4.
+
+    :param include_env_params: Include env params as SR features.
+    """
+
+    def __init__(
+        self,
+        include_env_params: bool = True,
+    ) -> None:
+        super().__init__(
+            name="hypothesis_generation",
+            dependencies=[
+                "causal_discovery",
+                "feature_selection",
+                "transition_analysis",
+            ],
+        )
+        self._include_env_params = include_env_params
+
+    def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Generate dynamics and reward hypotheses.
+
+        :returns: Dict with keys: register, variable_names.
+        """
+        from circ_rl.hypothesis.dynamics_hypotheses import DynamicsHypothesisGenerator
+        from circ_rl.hypothesis.hypothesis_register import HypothesisRegister
+        from circ_rl.hypothesis.reward_hypotheses import RewardHypothesisGenerator
+
+        cd_output = inputs["feature_selection"]  # FeatureSelection produces result
+        # We need the dataset and state_names from causal_discovery,
+        # which is a dependency of feature_selection
+        fs_output = inputs["feature_selection"]
+        ta_output = inputs["transition_analysis"]
+
+        # Retrieve artifacts via transitive deps: dataset/state_names
+        # flow through the pipeline's all_artifacts dict.
+        # Access causal_discovery output via the transition_analysis stage's input.
+        # Actually, we need the dataset from the pipeline. The simplest
+        # approach: require causal_discovery as a dependency too.
+        cd_output = inputs.get("causal_discovery", {})
+        dataset = cd_output.get("dataset")
+        state_names: list[str] = cd_output.get("state_names", [])
+        env_param_node_names: list[str] = cd_output.get("env_param_node_names", [])
+
+        if dataset is None:
+            raise ValueError(
+                "HypothesisGenerationStage requires causal_discovery output "
+                "(dataset, state_names)"
+            )
+
+        transition_result = ta_output["transition_result"]
+        fs_result = fs_output["result"]
+        validation_result = cd_output.get("validation_result")
+
+        # Env param names (raw, not ep_-prefixed)
+        from circ_rl.causal_discovery.causal_graph import CausalGraph
+
+        raw_env_param_names: list[str] | None = None
+        if env_param_node_names:
+            raw_env_param_names = [
+                name.removeprefix(CausalGraph.ENV_PARAM_PREFIX)
+                for name in env_param_node_names
+            ]
+
+        register = HypothesisRegister()
+
+        # Dynamics hypotheses
+        dyn_gen = DynamicsHypothesisGenerator(
+            include_env_params=self._include_env_params,
+        )
+        dyn_ids = dyn_gen.generate(
+            dataset=dataset,
+            transition_result=transition_result,
+            state_feature_names=state_names,
+            register=register,
+            env_param_names=raw_env_param_names,
+        )
+
+        # Reward hypotheses
+        reward_is_invariant = (
+            validation_result.is_invariant if validation_result else True
+        )
+        reward_gen = RewardHypothesisGenerator()
+        reward_ids = reward_gen.generate(
+            dataset=dataset,
+            feature_selection_result=fs_result,
+            state_feature_names=state_names,
+            register=register,
+            reward_is_invariant=reward_is_invariant,
+            env_param_names=raw_env_param_names,
+        )
+
+        # Build variable names (shared across hypothesis evaluation)
+        actions_2d = (
+            dataset.actions if dataset.actions.ndim == 2
+            else dataset.actions[:, np.newaxis]
+        )
+        action_dim = actions_2d.shape[1]
+        action_names = (
+            ["action"] if action_dim == 1
+            else [f"action_{i}" for i in range(action_dim)]
+        )
+        variable_names = list(state_names) + action_names
+        if raw_env_param_names and self._include_env_params:
+            variable_names.extend(raw_env_param_names)
+
+        logger.info(
+            "Hypothesis generation complete: {} dynamics + {} reward hypotheses",
+            len(dyn_ids),
+            len(reward_ids),
+        )
+
+        return {
+            "register": register,
+            "variable_names": variable_names,
+            "state_names": state_names,
+            "action_names": action_names,
+        }
+
+    def config_hash(self) -> str:
+        return hash_config({
+            "include_env_params": self._include_env_params,
+        })
+
+
+class HypothesisFalsificationStage(PipelineStage):
+    """Phase 4: Falsify and score hypotheses.
+
+    Runs structural consistency, OOD prediction, and trajectory
+    prediction tests, then selects the best via symbolic MDL.
+
+    See ``CIRC-RL_Framework.md`` Section 3.5.
+
+    :param structural_p_threshold: p-value for structural consistency.
+    :param ood_confidence: OOD confidence interval level.
+    :param held_out_fraction: Fraction of envs held out for OOD test.
+    """
+
+    def __init__(
+        self,
+        structural_p_threshold: float = 0.01,
+        ood_confidence: float = 0.99,
+        held_out_fraction: float = 0.2,
+    ) -> None:
+        super().__init__(
+            name="hypothesis_falsification",
+            dependencies=["hypothesis_generation", "causal_discovery"],
+        )
+        self._structural_p = structural_p_threshold
+        self._ood_confidence = ood_confidence
+        self._held_out_fraction = held_out_fraction
+
+    def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Run falsification on all hypotheses.
+
+        :returns: Dict with keys: register, falsification_result,
+            best_dynamics, best_reward.
+        """
+        from circ_rl.hypothesis.falsification_engine import (
+            FalsificationConfig,
+            FalsificationEngine,
+        )
+
+        hg_output = inputs["hypothesis_generation"]
+        cd_output = inputs["causal_discovery"]
+
+        register = hg_output["register"]
+        variable_names = hg_output["variable_names"]
+        state_names = hg_output["state_names"]
+        dataset = cd_output["dataset"]
+
+        config = FalsificationConfig(
+            structural_p_threshold=self._structural_p,
+            ood_confidence=self._ood_confidence,
+            held_out_fraction=self._held_out_fraction,
+        )
+        engine = FalsificationEngine(config)
+        result = engine.run(
+            register=register,
+            dataset=dataset,
+            state_feature_names=state_names,
+            variable_names=variable_names,
+        )
+
+        # Extract best validated hypotheses
+        best_dynamics: dict[str, Any] = {}
+        best_reward = None
+        for target, hyp_id in result.best_per_target.items():
+            if hyp_id is None:
+                continue
+            entry = register.get(hyp_id)
+            if target == "reward":
+                best_reward = entry
+            else:
+                best_dynamics[target] = entry
+
+        logger.info(
+            "Falsification complete: {}/{} validated, best_dynamics={}, "
+            "best_reward={}",
+            result.n_validated,
+            result.n_tested,
+            list(best_dynamics.keys()),
+            best_reward.hypothesis_id if best_reward else None,
+        )
+
+        return {
+            "register": register,
+            "falsification_result": result,
+            "best_dynamics": best_dynamics,
+            "best_reward": best_reward,
+            "variable_names": variable_names,
+            "state_names": state_names,
+        }
+
+    def config_hash(self) -> str:
+        return hash_config({
+            "structural_p": self._structural_p,
+            "ood_confidence": self._ood_confidence,
+            "held_out_fraction": self._held_out_fraction,
+        })
+
+
+class AnalyticPolicyDerivationStage(PipelineStage):
+    """Phase 5: Derive analytic policy from validated hypotheses.
+
+    Classifies dynamics as linear/nonlinear, then applies LQR or MPC
+    solver per environment.
+
+    See ``CIRC-RL_Framework.md`` Section 3.6.
+
+    :param env_family: Environment family for per-env solving.
+    :param gamma: Discount factor for LQR DARE.
     """
 
     def __init__(
         self,
         env_family: EnvironmentFamily,
-        training_config: TrainingConfig,
-        n_policies: int = 3,
-        device: str = "cpu",
+        gamma: float = 0.99,
     ) -> None:
         super().__init__(
-            name="policy_optimization",
-            dependencies=["feature_selection"],
+            name="analytic_policy_derivation",
+            dependencies=["hypothesis_falsification", "transition_analysis"],
         )
         self._env_family = env_family
-        self._config = training_config
-        self._n_policies = n_policies
-        self._device = torch.device(device)
+        self._gamma = gamma
 
     def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
-        """Train policies.
+        """Derive the analytic policy.
 
-        :returns: Dict with keys: policies, all_metrics, feature_mask,
-            context_param_names.
+        :returns: Dict with keys: analytic_policy, explained_variance,
+            solver_type, dynamics_expressions.
         """
-        fs_output = inputs["feature_selection"]
-        feature_mask = fs_output["feature_mask"]
-        context_param_names: list[str] = fs_output.get("context_param_names", [])
+        from circ_rl.analytic_policy.analytic_policy import (
+            AnalyticPolicy,
+            extract_linear_dynamics,
+            extract_quadratic_cost,
+        )
+        from circ_rl.analytic_policy.hypothesis_classifier import HypothesisClassifier
+        from circ_rl.analytic_policy.lqr_solver import (
+            LinearDynamics,
+            LQRSolver,
+            QuadraticCost,
+        )
 
-        state_dim = int(feature_mask.shape[0])
+        hf_output = inputs["hypothesis_falsification"]
+        ta_output = inputs["transition_analysis"]
 
+        best_dynamics = hf_output["best_dynamics"]
+        best_reward = hf_output["best_reward"]
+        state_names = hf_output["state_names"]
+
+        if not best_dynamics:
+            raise ValueError(
+                "No validated dynamics hypotheses found. "
+                "Cannot derive analytic policy."
+            )
+
+        ta_output["transition_result"]
+
+        # Get action info
         import gymnasium as gym
 
         action_space = self._env_family.action_space
-        if isinstance(action_space, gym.spaces.Discrete):
-            action_dim = int(action_space.n)
-            continuous = False
-            action_low = None
-            action_high = None
-        elif isinstance(action_space, gym.spaces.Box):
+        if isinstance(action_space, gym.spaces.Box):
             action_dim = int(action_space.shape[0])
-            continuous = True
+            action_names = (
+                ["action"] if action_dim == 1
+                else [f"action_{i}" for i in range(action_dim)]
+            )
             action_low = action_space.low
             action_high = action_space.high
         else:
             raise TypeError(
-                f"Unsupported action space type: {type(action_space)}"
+                "Analytic policy derivation requires continuous (Box) "
+                f"action space, got {type(action_space)}"
             )
 
-        # Resolve context: map ep_X names back to raw param names for env lookup
-        env_param_lookup_names: list[str] | None = None
-        context_dim = 0
-        if context_param_names:
-            # ep_g -> g, ep_m -> m, etc.
-            from circ_rl.causal_discovery.causal_graph import CausalGraph
+        state_dim = len(state_names)
 
-            env_param_lookup_names = [
-                name.removeprefix(CausalGraph.ENV_PARAM_PREFIX)
-                for name in context_param_names
-            ]
-            context_dim = len(context_param_names)
-            logger.info(
-                "Context-conditional policy: context_dim={}, params={}",
-                context_dim,
-                env_param_lookup_names,
-            )
+        # Classify dynamics and derive policy
+        classifier = HypothesisClassifier()
 
-        policies: list[CausalPolicy] = []
-        all_metrics = []
+        # Collect validated dynamics expressions by dim index
+        dynamics_expressions: dict[int, SymbolicExpression] = {}
+        for target, entry in best_dynamics.items():
+            # target = "delta_sN" -> dim_idx = N
+            dim_name = target.removeprefix("delta_")
+            dim_idx = state_names.index(dim_name)
+            dynamics_expressions[dim_idx] = entry.expression
 
-        for i in range(self._n_policies):
-            logger.info("Training policy {}/{}", i + 1, self._n_policies)
+        # Determine solver type from all expressions
+        all_linear = all(
+            classifier.classify(entry.expression) == "lqr"
+            for entry in best_dynamics.values()
+        )
+        solver_type = "lqr" if all_linear else "mpc"
 
-            policy = CausalPolicy(
-                full_state_dim=state_dim,
+        logger.info(
+            "Analytic policy: solver={}, {} dynamics dimensions",
+            solver_type,
+            len(dynamics_expressions),
+        )
+
+        explained_variance = 0.0
+        analytic_policy: AnalyticPolicy
+
+        if solver_type == "lqr":
+            # Build LQR solutions per environment
+            lqr_solver = LQRSolver()
+            lqr_solutions: dict[int, Any] = {}
+
+            for env_idx in range(self._env_family.n_envs):
+                env_params = self._env_family.get_env_params(env_idx)
+
+                # Stack dynamics rows into full A, B matrices
+                a_rows = []
+                b_rows = []
+                c_vals = []
+
+                for dim_idx in range(state_dim):
+                    if dim_idx in dynamics_expressions:
+                        ld = extract_linear_dynamics(
+                            dynamics_expressions[dim_idx],
+                            state_names,
+                            action_names,
+                            env_params=env_params if env_params else None,
+                        )
+                        a_rows.append(ld.a_matrix)
+                        b_rows.append(ld.b_matrix)
+                        c_vals.append(ld.c_vector[0])
+                    else:
+                        # Invariant dimension: identity dynamics
+                        a_row = np.zeros((1, state_dim))
+                        b_row = np.zeros((1, action_dim))
+                        a_rows.append(a_row)
+                        b_rows.append(b_row)
+                        c_vals.append(0.0)
+
+                a_matrix = np.eye(state_dim) + np.vstack(a_rows)
+                b_matrix = np.vstack(b_rows)
+
+                # Cost matrices: try extracting from reward hypothesis
+                q_cost = None
+                if best_reward is not None:
+                    q_cost = extract_quadratic_cost(
+                        best_reward.expression.sympy_expr,
+                        state_names,
+                        action_names,
+                    )
+
+                if q_cost is None:
+                    # Default: penalize all state deviations equally
+                    q_cost = QuadraticCost(
+                        q_matrix=np.eye(state_dim),
+                        r_matrix=np.eye(action_dim) * 0.01,
+                    )
+
+                full_dynamics = LinearDynamics(
+                    a_matrix=a_matrix,
+                    b_matrix=b_matrix,
+                    c_vector=np.array(c_vals),
+                )
+
+                sol = lqr_solver.solve(
+                    full_dynamics, q_cost, gamma=self._gamma,
+                )
+                lqr_solutions[env_idx] = sol
+
+            # Use best dynamics entry for policy metadata
+            first_entry = next(iter(best_dynamics.values()))
+            analytic_policy = AnalyticPolicy(
+                dynamics_hypothesis=first_entry,
+                reward_hypothesis=best_reward,
+                solver_type="lqr",
+                state_dim=state_dim,
                 action_dim=action_dim,
-                feature_mask=feature_mask,
-                hidden_dims=(256, 256),
-                continuous=continuous,
+                n_envs=self._env_family.n_envs,
+                lqr_solutions=lqr_solutions,
                 action_low=action_low,
                 action_high=action_high,
-                context_dim=context_dim,
             )
 
-            rollout_worker = RolloutWorker(
-                self._env_family,
-                n_steps_per_env=self._config.n_steps_per_env,
-                env_param_names=env_param_lookup_names,
+            # Estimate explained variance from training R^2
+            r2_values = [e.training_r2 for e in best_dynamics.values()]
+            explained_variance = float(np.mean(r2_values))
+
+        else:
+            # MPC solver
+            raise NotImplementedError(
+                "MPC-based analytic policy derivation is not yet "
+                "implemented. Consider using a simpler dynamics model."
             )
 
-            trainer = CIRCTrainer(
-                policy=policy,
-                env_family=self._env_family,
-                config=self._config,
-            )
-            # Override the default rollout worker with one that has env params
-            trainer._rollout_worker = rollout_worker
-            trainer.to(self._device)
-
-            metrics = trainer.run()
-            # Move policy back to CPU for serialization/ensemble
-            policy.to(torch.device("cpu"))
-            policies.append(policy)
-            all_metrics.append(metrics)
+        logger.info(
+            "Analytic policy derived: solver={}, explained_variance={:.4f}",
+            solver_type,
+            explained_variance,
+        )
 
         return {
-            "policies": policies,
-            "all_metrics": all_metrics,
-            "feature_mask": feature_mask,
-            "context_param_names": context_param_names,
+            "analytic_policy": analytic_policy,
+            "explained_variance": explained_variance,
+            "solver_type": solver_type,
+            "dynamics_expressions": dynamics_expressions,
         }
 
     def config_hash(self) -> str:
         return hash_config({
-            "n_iterations": self._config.n_iterations,
-            "learning_rate": self._config.learning_rate,
-            "n_policies": self._n_policies,
-            "n_steps_per_env": self._config.n_steps_per_env,
+            "gamma": self._gamma,
+            "n_envs": self._env_family.n_envs,
         })
 
 
-class EnsembleConstructionStage(PipelineStage):
-    """Phase 4: Build MDL-weighted ensemble from trained policies.
+class ResidualLearningStage(PipelineStage):
+    """Phase 6: Train bounded residual correction.
 
-    :param env_family: Environment family for evaluation.
-    :param n_eval_steps: Steps for evaluation trajectory.
-    :param complexity_weight: MDL complexity weight.
+    Trains a small neural network correction on top of the analytic
+    policy, bounded by eta_max * |a_analytic|.
+
+    See ``CIRC-RL_Framework.md`` Section 3.7.
+
+    :param env_family: Environment family for rollouts.
+    :param n_iterations: Number of residual PPO iterations.
+    :param eta_max: Maximum correction fraction.
+    :param skip_if_eta2_above: Skip if explained variance exceeds this.
+    :param abort_if_eta2_below: Abort if explained variance below this.
     """
 
     def __init__(
         self,
         env_family: EnvironmentFamily,
-        n_eval_steps: int = 500,
-        complexity_weight: float = 0.01,
+        n_iterations: int = 50,
+        eta_max: float = 0.1,
+        skip_if_eta2_above: float = 0.98,
+        abort_if_eta2_below: float = 0.70,
     ) -> None:
         super().__init__(
-            name="ensemble_construction",
-            dependencies=["policy_optimization"],
+            name="residual_learning",
+            dependencies=["analytic_policy_derivation"],
         )
         self._env_family = env_family
-        self._n_eval_steps = n_eval_steps
-        self._complexity_weight = complexity_weight
+        self._n_iterations = n_iterations
+        self._eta_max = eta_max
+        self._skip_threshold = skip_if_eta2_above
+        self._abort_threshold = abort_if_eta2_below
 
     def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
-        """Build the ensemble.
+        """Run residual training.
 
-        :returns: Dict with keys: ensemble, mdl_scores.
+        :returns: Dict with keys: composite_policy, residual_policy,
+            residual_metrics, skipped.
         """
-        po_output = inputs["policy_optimization"]
-        policies = po_output["policies"]
-        feature_mask = po_output["feature_mask"]
-        context_param_names: list[str] = po_output.get("context_param_names", [])
-
-        # Resolve env param lookup names for rollout
-        env_param_lookup_names: list[str] | None = None
-        if context_param_names:
-            from circ_rl.causal_discovery.causal_graph import CausalGraph
-
-            env_param_lookup_names = [
-                name.removeprefix(CausalGraph.ENV_PARAM_PREFIX)
-                for name in context_param_names
-            ]
-
-        # Collect evaluation trajectory
-        rollout = RolloutWorker(
-            self._env_family,
-            n_steps_per_env=self._n_eval_steps,
-            env_param_names=env_param_lookup_names,
+        from circ_rl.policy.composite_policy import CompositePolicy
+        from circ_rl.policy.residual_policy import ResidualPolicy
+        from circ_rl.training.residual_trainer import (
+            ResidualTrainer,
+            ResidualTrainingConfig,
         )
-        if policies:
-            buffer = rollout.collect(policies[0])
-            eval_traj = buffer.get_all_flat()
+
+        apd_output = inputs["analytic_policy_derivation"]
+        analytic_policy = apd_output["analytic_policy"]
+        explained_variance = apd_output["explained_variance"]
+
+        import gymnasium as gym
+
+        action_space = self._env_family.action_space
+        if not isinstance(action_space, gym.spaces.Box):
+            raise TypeError(
+                f"Residual learning requires Box action space, "
+                f"got {type(action_space)}"
+            )
+        state_dim = int(self._env_family.observation_space.shape[0])  # type: ignore[union-attr]
+        action_dim = int(action_space.shape[0])
+
+        config = ResidualTrainingConfig(
+            n_iterations=self._n_iterations,
+            eta_max=self._eta_max,
+            explained_variance=explained_variance,
+            skip_if_eta2_above=self._skip_threshold,
+            abort_if_eta2_below=self._abort_threshold,
+        )
+
+        residual = ResidualPolicy(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            eta_max=self._eta_max,
+        )
+
+        trainer = ResidualTrainer(
+            analytic_policy=analytic_policy,
+            residual_policy=residual,
+            env_family=self._env_family,
+            config=config,
+        )
+
+        skipped = False
+        metrics: list[Any] = []
+
+        if trainer.should_skip():
+            logger.info(
+                "Residual learning skipped: explained_variance={:.4f} > {:.4f}",
+                explained_variance,
+                self._skip_threshold,
+            )
+            skipped = True
+            residual_out = None
+        elif trainer.should_abort():
+            logger.warning(
+                "Residual learning aborted: explained_variance={:.4f} < {:.4f}",
+                explained_variance,
+                self._abort_threshold,
+            )
+            residual_out = None
         else:
-            raise ValueError("No policies to evaluate")
+            metrics = trainer.run()
+            residual_out = residual
 
-        ensemble = EnsemblePolicy.from_mdl_scores(
-            policies, eval_traj, complexity_weight=self._complexity_weight
-        )
-
-        logger.info(
-            "Ensemble built: {} policies, weights={}",
-            ensemble.n_policies,
-            ensemble.weights.tolist(),
+        composite = CompositePolicy(
+            analytic_policy=analytic_policy,
+            residual_policy=residual_out,
+            explained_variance=explained_variance,
         )
 
         return {
-            "ensemble": ensemble,
-            "mdl_scores": ensemble.scores,
+            "composite_policy": composite,
+            "residual_policy": residual_out,
+            "residual_metrics": metrics,
+            "skipped": skipped,
         }
 
     def config_hash(self) -> str:
         return hash_config({
-            "n_eval_steps": self._n_eval_steps,
-            "complexity_weight": self._complexity_weight,
+            "n_iterations": self._n_iterations,
+            "eta_max": self._eta_max,
+            "skip_threshold": self._skip_threshold,
+            "abort_threshold": self._abort_threshold,
+        })
+
+
+class DiagnosticValidationStage(PipelineStage):
+    """Phase 7: Run diagnostic validation suite.
+
+    Tests premise (dynamics hypothesis still valid), derivation
+    (policy trajectories match predictions), and conclusion
+    (observed returns match predicted).
+
+    See ``CIRC-RL_Framework.md`` Section 3.9.
+
+    :param env_family: Environment family for evaluation.
+    :param premise_r2_threshold: R^2 threshold for premise test.
+    :param derivation_divergence_threshold: Divergence threshold.
+    :param conclusion_error_threshold: Relative error threshold.
+    """
+
+    def __init__(
+        self,
+        env_family: EnvironmentFamily,
+        premise_r2_threshold: float = 0.5,
+        derivation_divergence_threshold: float = 1.0,
+        conclusion_error_threshold: float = 0.3,
+    ) -> None:
+        super().__init__(
+            name="diagnostic_validation",
+            dependencies=[
+                "analytic_policy_derivation",
+                "residual_learning",
+                "causal_discovery",
+                "hypothesis_falsification",
+            ],
+        )
+        self._env_family = env_family
+        self._premise_r2 = premise_r2_threshold
+        self._derivation_div = derivation_divergence_threshold
+        self._conclusion_err = conclusion_error_threshold
+
+    def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Run the diagnostic suite.
+
+        :returns: Dict with keys: diagnostic_result, recommended_action.
+        """
+        from circ_rl.diagnostics.diagnostic_suite import DiagnosticSuite
+
+        apd_output = inputs["analytic_policy_derivation"]
+        inputs["residual_learning"]
+        cd_output = inputs["causal_discovery"]
+        hf_output = inputs["hypothesis_falsification"]
+
+        analytic_policy = apd_output["analytic_policy"]
+        dynamics_expressions = apd_output["dynamics_expressions"]
+        dataset = cd_output["dataset"]
+        state_names = cd_output["state_names"]
+        variable_names = hf_output["variable_names"]
+
+        # Use a subset of envs as test envs
+        n_envs = self._env_family.n_envs
+        test_env_ids = list(range(n_envs))
+
+        suite = DiagnosticSuite(
+            premise_r2_threshold=self._premise_r2,
+            derivation_divergence_threshold=self._derivation_div,
+            conclusion_error_threshold=self._conclusion_err,
+        )
+
+        result = suite.run(
+            policy=analytic_policy,
+            dynamics_expressions=dynamics_expressions,
+            dataset=dataset,
+            state_feature_names=state_names,
+            variable_names=variable_names,
+            env_family=self._env_family,
+            predicted_returns={},
+            test_env_ids=test_env_ids,
+        )
+
+        logger.info(
+            "Diagnostic validation: recommended_action={}",
+            result.recommended_action.value,
+        )
+
+        return {
+            "diagnostic_result": result,
+            "recommended_action": result.recommended_action,
+        }
+
+    def config_hash(self) -> str:
+        return hash_config({
+            "premise_r2": self._premise_r2,
+            "derivation_div": self._derivation_div,
+            "conclusion_err": self._conclusion_err,
         })
 
 
@@ -512,7 +1022,10 @@ class ValidationFeedbackStage(PipelineStage):
                 continue
 
             corr, p_value = stats.pearsonr(param_arr, returns_arr)
-            correlations[ep_name] = {"correlation": float(corr), "p_value": float(p_value)}
+            correlations[ep_name] = {
+                "correlation": float(corr),
+                "p_value": float(p_value),
+            }
 
             if p_value < self._correlation_alpha:
                 suggested.append(ep_name)

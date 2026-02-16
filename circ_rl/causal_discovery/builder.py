@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -11,7 +11,62 @@ from circ_rl.causal_discovery.ci_tests import CITestMethod
 from circ_rl.causal_discovery.fci_algorithm import FCIAlgorithm
 from circ_rl.causal_discovery.ges_algorithm import GESAlgorithm
 from circ_rl.causal_discovery.pc_algorithm import PCAlgorithm
-from circ_rl.environments.data_collector import ExploratoryDataset
+
+if TYPE_CHECKING:
+    from circ_rl.environments.data_collector import ExploratoryDataset
+
+
+def _distance_correlation_test(
+    x: np.ndarray,
+    y: np.ndarray,
+    n_permutations: int = 200,
+    alpha: float = 0.05,
+) -> bool:
+    """Test for non-linear association using distance covariance.
+
+    Distance covariance (dCov) equals zero iff X and Y are independent.
+    It detects arbitrary non-linear relationships that Pearson
+    correlation misses (e.g., Y = X^2 when X is symmetric).
+
+    Uses a permutation test: permute Y, recompute dCov, count how
+    often the permuted statistic exceeds the observed one.
+
+    :param x: First variable, shape ``(n,)``.
+    :param y: Second variable, shape ``(n,)``.
+    :param n_permutations: Number of permutations.
+    :param alpha: Significance level.
+    :returns: True if association is significant (reject independence).
+    """
+    n = len(x)
+    # Pairwise distance matrices
+    a = np.abs(x[:, None] - x[None, :])  # (n, n)
+    b = np.abs(y[:, None] - y[None, :])  # (n, n)
+
+    # Double center A
+    A = a - a.mean(axis=0, keepdims=True) - a.mean(axis=1, keepdims=True) + a.mean()
+
+    # Double center B and compute observed dCov^2
+    B = b - b.mean(axis=0, keepdims=True) - b.mean(axis=1, keepdims=True) + b.mean()
+    observed = float((A * B).sum())  # proportional to dCov^2 * n^2
+
+    # Permutation test
+    rng = np.random.RandomState(42)
+    count_ge = 0
+    for _ in range(n_permutations):
+        perm = rng.permutation(n)
+        b_perm = b[np.ix_(perm, perm)]
+        B_perm = (
+            b_perm
+            - b_perm.mean(axis=0, keepdims=True)
+            - b_perm.mean(axis=1, keepdims=True)
+            + b_perm.mean()
+        )
+        perm_stat = float((A * B_perm).sum())
+        if perm_stat >= observed:
+            count_ge += 1
+
+    p_value = (count_ge + 1) / (n_permutations + 1)
+    return p_value < alpha
 
 
 class CausalGraphBuilder:
@@ -30,6 +85,8 @@ class CausalGraphBuilder:
         method: str = "pc",
         reward_node: str = CausalGraph.REWARD_NODE_DEFAULT,
         env_param_names: list[str] | None = None,
+        state_feature_names: list[str] | None = None,
+        nonlinear_state_reward_screen: bool = False,
         **kwargs: Any,
     ) -> CausalGraph:
         """Discover causal structure from observational data.
@@ -44,6 +101,12 @@ class CausalGraphBuilder:
             When provided, the augmented flat array (with env-param columns)
             is used, and structural constraints are enforced: no non-ep node
             can be a parent of an ep node (env params are exogenous).
+        :param state_feature_names: Names of state feature nodes. Required
+            when ``nonlinear_state_reward_screen`` is True.
+        :param nonlinear_state_reward_screen: When True, adds state -> reward
+            edges for features with significant non-linear association with
+            reward (using distance correlation). This catches relationships
+            like ``s^2 -> reward`` that the Fisher-z CI test misses.
         :param kwargs: Additional arguments passed to the algorithm constructor.
         :returns: Discovered CausalGraph.
         :raises ValueError: If method is not recognized.
@@ -87,6 +150,12 @@ class CausalGraphBuilder:
             graph = CausalGraphBuilder._add_correlated_ep_edges(
                 graph, data, node_names, frozenset(env_param_names),
                 reward_node, ep_correlation_threshold,
+            )
+
+        # Add state -> reward edges for non-linearly associated features
+        if nonlinear_state_reward_screen and state_feature_names:
+            graph = CausalGraphBuilder._add_nonlinear_state_reward_edges(
+                graph, data, node_names, state_feature_names, reward_node,
             )
 
         return graph
@@ -202,6 +271,90 @@ class CausalGraphBuilder:
         return CausalGraph(g, reward_node=reward_node)
 
     @staticmethod
+    def _add_nonlinear_state_reward_edges(
+        graph: CausalGraph,
+        data: np.ndarray,
+        node_names: list[str],
+        state_feature_names: list[str],
+        reward_node: str,
+        alpha: float = 0.05,
+        max_samples: int = 2000,
+        n_permutations: int = 200,
+    ) -> CausalGraph:
+        """Add state -> reward edges for non-linearly associated features.
+
+        Uses distance correlation with a permutation test to detect
+        non-linear associations that the Fisher-z (linear) CI test misses.
+        For example, if reward depends on ``s^2``, the Pearson correlation
+        with ``s`` is zero (when ``s`` is symmetric around 0), but the
+        distance correlation is non-zero.
+
+        :param graph: Causal graph (possibly missing state -> reward edges).
+        :param data: Pooled flat array, shape ``(n_samples, n_vars)``.
+        :param node_names: Variable names matching data columns.
+        :param state_feature_names: Names of state feature nodes.
+        :param reward_node: Name of the reward node.
+        :param alpha: Significance level for permutation test.
+        :param max_samples: Maximum samples for distance correlation.
+        :param n_permutations: Number of permutations.
+        :returns: A new CausalGraph with added state -> reward edges.
+        """
+        import networkx as nx
+        from loguru import logger
+
+        name_to_idx = {name: i for i, name in enumerate(node_names)}
+        reward_idx = name_to_idx.get(reward_node)
+        if reward_idx is None:
+            return graph
+
+        n_samples = data.shape[0]
+        # Subsample for O(n^2) distance computation
+        if n_samples > max_samples:
+            rng = np.random.RandomState(42)
+            idx = rng.choice(n_samples, max_samples, replace=False)
+            data_sub = data[idx]
+        else:
+            data_sub = data
+
+        reward_col = data_sub[:, reward_idx]
+
+        g = graph.graph  # copy
+        edges_added: list[tuple[str, str]] = []
+
+        for feat_name in sorted(state_feature_names):
+            feat_idx = name_to_idx.get(feat_name)
+            if feat_idx is None:
+                continue
+            # Already has edge
+            if g.has_edge(feat_name, reward_node):
+                continue
+
+            feat_col = data_sub[:, feat_idx]
+            significant = _distance_correlation_test(
+                feat_col, reward_col, n_permutations, alpha,
+            )
+            if significant:
+                g.add_edge(feat_name, reward_node)
+                if not nx.is_directed_acyclic_graph(g):
+                    # Adding this edge would create a cycle -- skip it
+                    g.remove_edge(feat_name, reward_node)
+                    logger.debug(
+                        "Non-linear pre-screen: skipping {} -> {} (would create cycle)",
+                        feat_name, reward_node,
+                    )
+                else:
+                    edges_added.append((feat_name, reward_node))
+
+        if edges_added:
+            logger.info(
+                "Non-linear pre-screen added {} state->reward edges: {}",
+                len(edges_added),
+                edges_added,
+            )
+
+        return CausalGraph(g, reward_node=reward_node)
+
+    @staticmethod
     def from_domain_knowledge(
         edges: list[tuple[str, str]],
         reward_node: str = CausalGraph.REWARD_NODE_DEFAULT,
@@ -243,7 +396,6 @@ class CausalGraphBuilder:
             dataset, node_names, method=method, reward_node=reward_node, **kwargs
         )
 
-        import networkx as nx
 
         g = graph.graph
 

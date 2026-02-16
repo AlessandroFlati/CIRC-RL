@@ -135,7 +135,7 @@ class CIRCPipeline:
         :raises ValueError: If dependencies form a cycle or reference unknown stages.
         """
         # Kahn's algorithm
-        in_degree: dict[str, int] = {name: 0 for name in self._stages}
+        in_degree: dict[str, int] = dict.fromkeys(self._stages, 0)
         adjacency: dict[str, list[str]] = {name: [] for name in self._stages}
 
         for name, stage in self._stages.items():

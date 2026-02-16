@@ -75,7 +75,7 @@ class CheckpointManager:
             )
 
         path = checkpoints[-1]
-        state = torch.load(path, weights_only=False)  # noqa: S614
+        state = torch.load(path, weights_only=False)
         step: int = state.pop("step")
         logger.info("Loaded latest checkpoint: {} (step {})", path.name, step)
         return state, step
@@ -90,7 +90,7 @@ class CheckpointManager:
         if not path.exists():
             raise FileNotFoundError(f"No best checkpoint found at {path}")
 
-        state = torch.load(path, weights_only=False)  # noqa: S614
+        state = torch.load(path, weights_only=False)
         step: int = state.pop("step")
         logger.info("Loaded best checkpoint (step {})", step)
         return state, step

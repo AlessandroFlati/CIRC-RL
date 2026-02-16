@@ -1,14 +1,18 @@
-# CIRC-RL: A Causal-Invariant Framework for Robust Reinforcement Learning
+# CIRC-RL: A Causal-Invariant Framework for Scientific Policy Discovery
 
 ## Abstract
 
-We propose **Causal Invariant Regularized Constrained Reinforcement Learning (CIRC-RL)**, a methodological framework designed to reduce overfitting in reinforcement learning by exploiting causal structure, enforcing invariance across environments, penalizing complexity, and satisfying safety constraints. Unlike standard RL approaches that optimize for correlation-based reward maximization on a single training distribution, CIRC-RL targets policies that (i) exploit causal mechanisms rather than spurious associations, (ii) generalize across distributional shifts that preserve causal structure, (iii) maintain minimal complexity, and (iv) satisfy domain-specific constraints. We formalize each component mathematically, establish theoretical guarantees where possible, acknowledge fundamental limitations, and position this framework as a structural defense against common failure modes in RL deployment.
+We propose **Causal Invariant Regularized Constrained Reinforcement Learning (CIRC-RL)**, a methodological framework that replaces the standard optimize-and-hope paradigm of reinforcement learning with a process of **scientific discovery applied to sequential decision-making**. Rather than training neural networks to approximate unknown policy functions, CIRC-RL discovers explicit, falsifiable hypotheses about the structure of environment dynamics and reward mechanisms, deduces optimal policies as logical consequences of validated hypotheses, and reserves function approximation exclusively for residual components that resist analytic characterization.
+
+The framework proceeds through a cycle inspired by the scientific method: (i) causal structure discovery via conditional independence testing, (ii) invariance verification across environment families, (iii) explicit hypothesis generation on functional forms via symbolic regression, (iv) systematic falsification of candidate hypotheses, (v) analytic derivation of optimal policies from validated hypotheses, and (vi) bounded residual learning for unexplained variance. Each component produces **falsifiable, interpretable, and diagnosticable** outputs -- when the framework fails, the failure is localized to a specific hypothesis, enabling targeted correction rather than opaque retraining.
+
+We formalize each component mathematically, establish theoretical guarantees where possible, acknowledge fundamental limitations, and position this framework as a structural alternative to function-approximation-based RL for domains where the underlying mechanisms are at least partially discoverable.
 
 ---
 
 ## 1. Introduction
 
-### 1.1 The Overfitting Problem in RL
+### 1.1 The Epistemological Problem in RL
 
 Reinforcement learning suffers from a particularly severe form of overfitting due to four structural properties:
 
@@ -26,17 +30,30 @@ $$\pi^* = \arg\max_{\pi} \mathbb{E}_{\tau \sim \rho_\pi}[R(\tau)]$$
 
 where $\tau = (s_0, a_0, r_0, s_1, a_1, r_1, \ldots)$ is a trajectory sampled under policy $\pi$ from the induced state-action distribution $\rho_\pi$. This objective is **distribution-specific**: the optimal policy depends critically on $\rho_\pi$, which in turn depends on the training environment dynamics, initial state distribution, and the policy itself.
 
-The central problem: **a policy that maximizes expected return on the training distribution may fail catastrophically on deployment distributions, even when these distributions share the same underlying causal structure.**
+However, the problems above are symptoms of a deeper issue. The standard RL pipeline -- collect data, optimize a parameterized function approximator, evaluate performance -- is not a process of **knowledge acquisition**. It is curve fitting with a reinforcement signal. The agent does not form hypotheses about why actions lead to rewards, does not deduce consequences of its assumptions, and cannot diagnose the source of its failures. It discovers nothing; it merely fits.
 
-### 1.2 Core Insight
+### 1.2 The Deeper Problem: RL is Not Science
 
-We observe that **useful patterns are invariant under transformations that preserve causal structure, while spurious patterns are fragile to such transformations.**
+Consider the contrast with the scientific method:
 
-This insight leads to a reformulation: instead of seeking the policy that best fits the training distribution, seek the policy that:
-1. Exploits causal mechanisms verified across multiple environments
-2. Achieves robust performance under worst-case distributional shifts
-3. Maintains minimal complexity sufficient to capture causal structure
-4. Satisfies constraints derived from domain knowledge
+| Aspect | Scientific Method | Standard RL | CIRC-RL |
+|--------|------------------|-------------|---------|
+| **Starting point** | Formulate a hypothesis | Choose a network architecture | Discover causal structure |
+| **Process** | Deduce consequences, test them | Optimize loss function | Generate hypotheses, falsify, deduce policy |
+| **Output** | Falsifiable theory | Opaque weight vector | Explicit functional form + bounded residual |
+| **On failure** | Identify which hypothesis failed | Retrain (no diagnosis) | Localize failure to specific hypothesis |
+| **Generalization** | Theory predicts novel cases | Hope | Deduction from validated structure |
+
+The core insight of this framework is: **the optimal policy for a well-understood system is not an object to be learned -- it is a consequence to be derived.** Learning enters only where understanding ends.
+
+### 1.3 Core Principles
+
+CIRC-RL is built on four principles, in lexicographic order:
+
+1. **Safety** (Constraints): Encode domain knowledge as hard constraints that no policy may violate.
+2. **Understanding** (Causal Discovery + Hypothesis Generation): Discover the causal and functional structure of the environment before attempting to act in it.
+3. **Derivation over Approximation** (Analytic Policy): Derive optimal policies from validated structural knowledge; approximate only what cannot be derived.
+4. **Parsimony** (MDL): Among equivalent explanations, prefer the simplest.
 
 ---
 
@@ -54,8 +71,10 @@ $$R_t = f_r(S_t, A_t, S_{t+1}, U_r^t)$$
 
 where:
 - $f_s: \mathcal{S} \times \mathcal{A} \times \mathcal{U}_s \to \mathcal{S}$ is the state transition function
-- $f_r: \mathcal{S} \times \mathcal{A} \times \mathcal{S} \times \mathcal{U}_r \to \mathbb{R}$ is the reward function  
+- $f_r: \mathcal{S} \times \mathcal{A} \times \mathcal{S} \times \mathcal{U}_r \to \mathbb{R}$ is the reward function
 - $U_s^t, U_r^t$ are unobserved exogenous variables (noise, hidden confounders)
+
+**Crucially, $f_s$ and $f_r$ are not arbitrary functions to be approximated -- they are mechanisms to be discovered.** The central epistemological shift of CIRC-RL is treating these functions as objects of scientific inquiry rather than targets of function approximation.
 
 **Causal Graph.** We denote the causal graph as $\mathcal{G} = (\mathcal{V}, \mathcal{E})$ where vertices $\mathcal{V}$ include states, actions, rewards, and unobserved variables, and edges $\mathcal{E}$ represent direct causal influence.
 
@@ -75,39 +94,45 @@ $$\forall e, e' \in \mathcal{E}: \quad P_e(Y | do(X)) = P_{e'}(Y | do(X))$$
 
 That is, the interventional distribution is identical across environments.
 
+**Definition 2.3 (Transition Mechanism Invariance).** State feature $s_i$ has an **invariant transition mechanism** if:
+
+$$P_e(s_i' \mid s, a) = P_{e'}(s_i' \mid s, a) \quad \forall\, e, e' \in \mathcal{E}$$
+
+This is the dual of reward mechanism invariance: it identifies which dimensions of the state space have dynamics that vary across environments.
+
 **Assumption 2.1 (Shared Causal Structure).** Environments in $\mathcal{E}$ differ only in parametric variations or exogenous noise distributions, not in fundamental causal relationships. Formally, the causal graph $\mathcal{G}$ is invariant: $\mathcal{G}_e = \mathcal{G}_{e'}$ for all $e, e' \in \mathcal{E}$.
 
-This assumption is **not verifiable a priori** but is empirically reasonable in many domains (e.g., physics-based simulators with parameter variations, financial markets across different time periods).
+This assumption is **not verifiable a priori** but is empirically testable: if the causal graph varies, conditional independence patterns will differ across environments.
 
 ### 2.3 Complexity and Description Length
 
-**Definition 2.3 (Kolmogorov Complexity).** The Kolmogorov complexity $K(\pi)$ of a policy $\pi$ is the length of the shortest program (in bits) that implements $\pi$ on a universal Turing machine.
+**Definition 2.4 (Kolmogorov Complexity).** The Kolmogorov complexity $K(\pi)$ of a policy $\pi$ is the length of the shortest program (in bits) that implements $\pi$ on a universal Turing machine.
 
 Since $K(\pi)$ is uncomputable, we use tractable approximations:
 
+**Symbolic Complexity:**
+$$C_{\text{sym}}(h) = |h|_{\text{nodes}}$$
+the number of nodes in the expression tree of a symbolic hypothesis $h$. This is the natural complexity measure for analytic functional forms and directly computable.
+
 **Parametric Complexity:**
 $$C_{\text{param}}(\pi_\theta) = |\theta|$$
-the number of parameters.
+the number of free parameters. For analytic policies, this is typically small (the constants in a closed-form expression). For residual neural components, it measures the approximator size.
 
-**Functional Complexity:**  
+**Functional Complexity:**
 $$C_{\text{func}}(\pi) = \mathbb{E}_{s \sim \rho}[\mathcal{H}(\pi(\cdot|s))]$$
 the expected entropy of the policy distribution.
 
-**Path Complexity:**
-$$C_{\text{path}}(\pi) = \mathbb{E}_{\tau \sim \rho_\pi}\left[\sum_{t=0}^{T-1} d(a_t, a_{t+1})\right]$$
-the expected action variation along trajectories.
-
-**Assumption 2.2 (MDL Principle).** Among policies achieving similar performance, prefer those with lower description length. This encodes Occam's razor: simpler explanations are more likely to generalize.
+**Assumption 2.2 (MDL Principle).** Among hypotheses achieving similar predictive accuracy, prefer those with lower description length. This encodes Occam's razor: simpler explanations are more likely to generalize because they have fewer degrees of freedom available for overfitting.
 
 ### 2.4 Safety Constraints
 
-**Definition 2.4 (Constraint Function).** A constraint function $C_i: \mathcal{T} \to \mathbb{R}$ maps trajectories to real values representing cost or risk. A constraint is satisfied if:
+**Definition 2.5 (Constraint Function).** A constraint function $C_i: \mathcal{T} \to \mathbb{R}$ maps trajectories to real values representing cost or risk. A constraint is satisfied if:
 
 $$\mathbb{E}_{\tau \sim \rho_\pi}[C_i(\tau)] \leq \delta_i$$
 
 for some threshold $\delta_i \in \mathbb{R}$.
 
-Constraints encode domain knowledge about unacceptable behaviors (e.g., collision probability, energy consumption, regulatory violations).
+Constraints encode domain knowledge about unacceptable behaviors (e.g., collision probability, energy consumption, regulatory violations, maximum drawdown).
 
 **Assumption 2.3 (Constraint Completeness).** The specified constraints $\lbrace C_i\rbrace$ adequately capture safety requirements for the domain. This assumption is pragmatic: we cannot formalize unknown unknowns, but we can formalize known risks.
 
@@ -133,390 +158,503 @@ $$\min_\pi \quad \text{Var}_{e \in \mathcal{E}}\left[\mathbb{E}_{\tau \sim \rho_
 
 **Priority 4 (Simplicity).** Among policies satisfying priorities 1-3, prefer those with minimal complexity:
 
-$$\min_\pi \quad \alpha_1 C_{\text{param}}(\pi) + \alpha_2 C_{\text{func}}(\pi) + \alpha_3 C_{\text{path}}(\pi)$$
+$$\min_\pi \quad \alpha_1 C_{\text{sym}}(\pi) + \alpha_2 C_{\text{param}}(\pi) + \alpha_3 C_{\text{func}}(\pi)$$
 
 Lexicographic ordering means: we only consider priority $k+1$ among policies that are Pareto-optimal for priorities $1, \ldots, k$.
 
-### 3.2 Component 1: Causal Policy Learning
+### 3.2 Phase 1: Causal Structure Identification
 
-**Objective.** Learn policies that maximize interventional effects rather than observational correlations.
-
-**Formalization.** Define the causal policy value as:
-
-$$V^\pi_{\text{causal}}(s) = \mathbb{E}_{\tau \sim \rho_\pi}\left[\sum_{t=0}^\infty \gamma^t R_t \mid S_0 = s, do(\pi)\right]$$
-
-The $do(\pi)$ operator indicates that the policy is applied via intervention, eliminating confounding from unobserved variables.
-
-**Causal Q-Function.** The causal action-value function satisfies:
-
-$$Q^\pi_{\text{causal}}(s, a) = \mathbb{E}[R_t + \gamma V^\pi_{\text{causal}}(S_{t+1}) \mid S_t = s, do(A_t = a)]$$
-
-**Estimation via Counterfactuals.** When the environment supports resettability, estimate causal effects by comparing:
-- **Factual**: reward obtained when following policy naturally
-- **Counterfactual**: reward obtained when forcing alternative actions at specific timesteps
-
-The causal effect of action $a$ at state $s$ is:
-
-$$\tau_{\text{causal}}(s, a) = \mathbb{E}[R(\tau) | do(A_t = a), S_t = s] - \mathbb{E}[R(\tau) | S_t = s]$$
-
-**Estimation via Instrumental Variables.** When counterfactuals are infeasible, exploit instrumental variables $Z$ satisfying:
-1. $Z$ influences $A$ (relevance)
-2. $Z$ does not directly influence $R$ except through $A$ (exclusion restriction)
-3. $Z$ is independent of unobserved confounders (exogeneity)
-
-The causal effect is identified by:
-
-$$\frac{\partial \mathbb{E}[R | Z]}{\partial \mathbb{E}[A | Z]}$$
-
-### 3.3 Component 2: Invariant Risk Minimization
-
-**Objective.** Find policies whose performance mechanism is stable across environments.
-
-**Formalization.** Following Arjovsky et al. (2019), augment the standard RL objective with an invariance penalty:
-
-$$\mathcal{L}_{\text{IRM}}(\pi) = \sum_{e \in \mathcal{E}} R^e(\pi) + \lambda \sum_{e \in \mathcal{E}} \|\nabla_{\omega|_{\omega=1}} R^e(\omega \cdot \pi)\|^2$$
-
-where:
-- $R^e(\pi) = \mathbb{E}_{\tau \sim \rho_\pi^e}[R(\tau)]$ is expected return in environment $e$
-- The gradient term penalizes policies whose optimal scaling varies across environments
-- $\lambda > 0$ controls the strength of invariance enforcement
-
-**Interpretation.** The penalty is zero if and only if $\pi$ is simultaneously optimal (up to scaling) in all environments. This forces the learner to find representations and mechanisms that work across distributional shifts.
-
-**Worst-Case Optimization.** Alternatively, directly optimize for robustness:
-
-$$\pi^* = \arg\max_\pi \quad \min_{e \in \mathcal{E}} \mathbb{E}_{\tau \sim \rho_\pi^e}[R(\tau)]$$
-
-This min-max formulation ensures performance degrades gracefully under distribution shift.
-
-### 3.4 Component 3: Complexity Regularization
-
-**Objective.** Prevent memorization of environment-specific patterns by penalizing complexity.
-
-**Formalization.** Augment the value function with complexity penalties:
-
-$$V_{\text{reg}}^\pi(s) = V^\pi(s) - \beta_1 C_{\text{param}}(\pi) - \beta_2 C_{\text{func}}(\pi) - \beta_3 C_{\text{path}}(\pi)$$
-
-**Information Bottleneck.** For deep policies $\pi_\theta = \pi_{\text{dec}} \circ \phi_{\text{enc}}$ where $\phi: \mathcal{S} \to \mathcal{Z}$ encodes states to a latent representation, enforce:
-
-$$\min_{\phi, \pi} \quad I(S; Z) - \beta \cdot I(Z; A)$$
-
-where $I(\cdot; \cdot)$ denotes mutual information. This forces the representation $Z$ to compress the state while retaining action-relevant information, preventing overfitting to irrelevant state features.
-
-**Practical Implementation.** Use variational approximations:
-
-$$\mathcal{L}_{\text{IB}} = \mathbb{KL}(q_\phi(z|s) \| p(z)) - \beta \mathbb{E}_{q_\phi}[\log \pi_{\text{dec}}(a|z)]$$
-
-where $p(z) = \mathcal{N}(0, I)$ is a simple prior.
-
-### 3.5 Component 4: Constrained Optimization
-
-**Objective.** Ensure policies satisfy safety constraints throughout training and deployment.
-
-**Formalization.** Solve the constrained MDP:
-
-$$
-\begin{aligned}
-\max_\pi \quad & \mathbb{E}_{\tau \sim \rho_\pi}[R(\tau)] \\
-\text{subject to} \quad & \mathbb{E}_{\tau \sim \rho_\pi}[C_i(\tau)] \leq \delta_i, \quad \forall i \in \lbrace 1, \ldots, m\rbrace
-\end{aligned}
-$$
-
-**Lagrangian Approach.** Introduce Lagrange multipliers $\lambda_i \geq 0$ and optimize:
-
-$$\mathcal{L}(\pi, \lbrace\lambda_i\rbrace) = \mathbb{E}_{\tau \sim \rho_\pi}\left[R(\tau) - \sum_{i=1}^m \lambda_i C_i(\tau)\right]$$
-
-with dual updates:
-
-$$\lambda_i \leftarrow \max\left(0, \lambda_i + \eta \left(\mathbb{E}[C_i(\tau)] - \delta_i\right)\right)$$
-
-**Hard Constraints.** Alternatively, enforce constraints via projection:
-
-$$\pi_{t+1} = \text{Proj}_{\mathcal{C}}\left(\pi_t + \alpha \nabla_\pi \mathbb{E}[R(\tau)]\right)$$
-
-where $\mathcal{C} = \lbrace\pi : \mathbb{E}[C_i(\tau)] \leq \delta_i, \forall i\rbrace$ is the feasible set.
-
-### 3.6 Integrated Algorithm Structure
-
-The complete CIRC-RL framework proceeds in phases:
-
-**Phase 1: Causal Structure Identification**
 1. Collect exploratory data from multiple environments $e \in \mathcal{E}$
-2. Infer causal graph $\mathcal{G}$ via conditional independence testing or domain knowledge
+2. Infer causal graph $\mathcal{G}$ via conditional independence testing (PC algorithm), score-based methods (GES with BIC/MDL), or algorithms handling latent confounders (FCI)
 3. Identify causal parents of reward: $\text{Pa}_{\mathcal{G}}(R)$
 4. Validate invariance of causal mechanisms across environments
 
-**Phase 2: Feature Selection via Causal Invariance**
-1. For each feature $f \in \mathcal{F}$, test whether $f \in \text{Anc}_{\mathcal{G}}(R)$ (ancestors of reward in causal graph)
-2. Test stability of $P(R | do(f))$ across environments
-3. Retain only features with stable causal effects: $\mathcal{F}_{\text{robust}} = \lbrace f : \text{Var}_e[P_e(R|do(f))] < \epsilon\rbrace$
-
-**Phase 3: Policy Optimization**
-1. Initialize policy $\pi_0$ and Lagrange multipliers $\lbrace\lambda_i^0\rbrace$
-2. For iteration $t = 1, \ldots, T$:
-   - Sample environments $\lbrace e_j\rbrace_{j=1}^B$ from $\mathcal{E}$
-   - Collect trajectories $\lbrace\tau_j^e\rbrace$ under $\pi_t$ in each environment $e_j$
-   - Estimate causal effects via counterfactuals or IV
-   - Compute gradients with respect to:
-     - Worst-case return: $\nabla_\pi \min_e R^e(\pi)$
-     - Variance penalty: $\nabla_\pi \text{Var}_e[R^e(\pi)]$
-     - Complexity penalty: $\nabla_\pi C(\pi)$
-     - Constraint violations: $\nabla_\pi C_i(\pi)$
-   - Update policy via composite gradient
-   - Update Lagrange multipliers based on constraint satisfaction
-3. Return ensemble of top-$k$ policies weighted by inverse complexity
-
-**Phase 4: Ensemble Construction**
-1. Evaluate all policies $\lbrace\pi_i\rbrace$ satisfying hard constraints
-2. Compute MDL scores: $\text{MDL}(\pi_i) = -\log P(D|\pi_i) + C(\pi_i)$
-3. Construct ensemble with weights: $w_i \propto \exp(-\text{MDL}(\pi_i))$
-4. Deploy ensemble policy: $\pi_{\text{ens}}(a|s) = \sum_i w_i \pi_i(a|s)$
-
----
-
-## 4. Theoretical Guarantees
-
-### 4.1 Causal Generalization Bound
-
-**Theorem 4.1 (Causal Invariance Implies Generalization).** Let $\mathcal{E}$ be an environment family with shared causal graph $\mathcal{G}$. If policy $\pi$ achieves return $R^e(\pi) \geq R_0$ in all training environments $e \in \mathcal{E}_{\text{train}}$ via causal mechanisms, then for a novel environment $e' \in \mathcal{E} \setminus \mathcal{E}_{\text{train}}$ drawn from the same family:
-
-$$P\left(R^{e'}(\pi) \geq R_0 - \epsilon\right) \geq 1 - \delta$$
-
-where $\epsilon$ depends on the magnitude of environment shift and $\delta$ on the number of training environments.
-
-**Proof Sketch.** Causal mechanisms are invariant under interventions that preserve causal structure (Assumption 2.1). If $\pi$ exploits only causal paths $\text{Pa}_{\mathcal{G}}(R)$ and these are stable across $\mathcal{E}_{\text{train}}$, then by PAC bounds and the consistency of interventional distributions, the policy generalizes to new environments sharing the same graph structure.
-
-**Limitation.** This guarantee requires:
-1. Correct identification of $\mathcal{G}$ (untestable without ground truth)
-2. No hidden confounders (untestable assumption)
-3. Novel environment $e'$ shares causal structure (cannot be verified before deployment)
-
-### 4.2 Sample Complexity with MDL Regularization
-
-**Theorem 4.2 (MDL Bound).** Let $\Pi_K = \lbrace\pi : C(\pi) \leq K\rbrace$ be the class of policies with complexity at most $K$. Then the sample complexity required to find a near-optimal policy in $\Pi_K$ is:
-
-$$n = O\left(\frac{K + \log(1/\delta)}{\epsilon^2}\right)$$
-
-where $\epsilon$ is the suboptimality gap and $\delta$ is the failure probability.
-
-**Proof.** Follows from Rissanen's MDL principle combined with VC-dimension bounds. The description length $K$ serves as a proxy for VC dimension, bounding the number of hypotheses effectively considered.
-
-**Implication.** Simpler policies (low $K$) require exponentially fewer samples to learn, reducing overfitting risk.
-
-### 4.3 Constraint Satisfaction Guarantees
-
-**Theorem 4.3 (PAC-Safe RL).** If constraints $\lbrace C_i\rbrace$ are satisfied during training with empirical violation probability $\hat{p}_i \leq \delta_i - \epsilon$, then with probability at least $1 - \delta$ over deployment:
-
-$$P_{\text{deploy}}\left(C_i(\tau) > \delta_i\right) \leq \delta_i + O\left(\sqrt{\frac{\log(m/\delta)}{n}}\right)$$
-
-where $n$ is the number of training trajectories and $m$ is the number of constraints.
-
-**Proof.** Application of Hoeffding's inequality with union bound over $m$ constraints.
-
-**Limitation.** Assumes constraints are i.i.d. across trajectories (often violated in RL due to temporal correlation) and that training distribution is similar to deployment distribution.
-
-### 4.4 Ensemble Robustness
-
-**Theorem 4.4 (Ensemble Stability).** Let $\lbrace\pi_i\rbrace_{i=1}^k$ be policies with MDL weights $w_i \propto \exp(-\text{MDL}(\pi_i))$. The ensemble policy $\pi_{\text{ens}} = \sum_i w_i \pi_i$ satisfies:
-
-$$\text{Var}_{e \in \mathcal{E}}[R^e(\pi_{\text{ens}})] \leq \min_i \text{Var}_{e \in \mathcal{E}}[R^e(\pi_i)]$$
-
-**Proof.** Ensemble averaging reduces variance. MDL weighting ensures that low-complexity (more stable) policies receive higher weight, further reducing variance.
-
-**Implication.** Ensembles are more robust to environment shifts than any individual policy, without introducing selection bias (we don't choose "the best", we aggregate).
-
----
-
-## 5. Fundamental Limitations
-
-### 5.1 Epistemological Boundaries
-
-**No Free Lunch.** Even with infinite computational resources, there exists no algorithm that performs optimally across all possible environments. Every learning algorithm embeds inductive biases. CIRC-RL's bias is toward causal invariance and simplicity.
-
-**Hume's Problem of Induction.** We cannot logically guarantee that causal relationships observed in training environments will persist in deployment. Causal invariance is an empirical hypothesis, not a logical necessity.
-
-**Gödel Incompleteness.** For sufficiently complex environments, there exist true statements about optimal policies that cannot be proven within any formal system we construct. Some aspects of generalization are inherently unprovable.
-
-**Uncomputable Ideals.** Kolmogorov complexity is uncomputable, and exact causal discovery is NP-hard. All practical implementations are approximations.
-
-### 5.2 Untestable Assumptions
-
-**Assumption Dependency.** The guarantees in Section 4 rest on assumptions that cannot be verified without ground truth:
-
-1. **Causal graph correctness**: We assume $\mathcal{G}$ is correctly identified, but causal discovery from observational data admits multiple compatible graphs (Markov equivalence classes).
-
-2. **No hidden confounders**: We assume all relevant variables are observed, but this is untestable. Unobserved confounders can invalidate causal conclusions.
-
-3. **Environment family structure**: We assume deployment environments belong to the same family $\mathcal{E}$ as training environments, but black swan events (COVID-19, market crashes, novel adversaries) are by definition outside this family.
-
-4. **Constraint completeness**: We assume specified constraints capture all safety requirements, but we cannot formalize "unknown unknowns."
-
-### 5.3 Computational Intractability
-
-**Worst-case optimization** (minimax over environments) is computationally expensive and may require solving separate RL problems for each environment.
-
-**Causal discovery** via conditional independence testing has exponential complexity in the number of variables.
-
-**MDL estimation** requires evaluating description lengths, which depends on the choice of encoding scheme and is sensitive to model class.
-
-### 5.4 What CIRC-RL Does NOT Guarantee
-
-❌ **Zero overfitting**: Impossible in principle (No Free Lunch)
-
-❌ **Generalization to arbitrary distribution shifts**: Only to shifts preserving causal structure
-
-❌ **Safety under unspecified threats**: Only under formalized constraints
-
-❌ **Optimality**: Only Pareto-optimality under lexicographic preferences
-
-❌ **Computational efficiency**: Causal inference and multienv optimization are expensive
-
-### 5.5 What CIRC-RL DOES Provide
-
-✅ **Structural defense against common failure modes**: Reward hacking, spurious correlations, environment-specific memorization
-
-✅ **Reduced overfitting probability**: From ~80-90% (naive RL) to ~10-20% (empirical estimate)
-
-✅ **Principled framework for encoding domain knowledge**: Via constraints and causal priors
-
-✅ **Theoretical grounding**: Connections to causal inference, MDL, robust optimization
-
-✅ **Practical implementability**: All components have tractable approximations
-
----
-
-## 6. Relationship to Existing Work
-
-### 6.1 Causal Reinforcement Learning
-
-**Causal Confusion (de Haan et al., 2019).** Identifies the problem of agents learning correlational rather than causal policies. CIRC-RL addresses this via explicit causal structure and interventional objectives.
-
-**Counterfactual Data Augmentation (Buesing et al., 2018).** Uses model-based RL to generate counterfactual trajectories. CIRC-RL generalizes this to model-free settings via instrumental variables.
-
-**Causal Imitation Learning (Zhang et al., 2020).** Applies causal inference to imitation learning. CIRC-RL extends to the RL setting with multiple environments.
-
-### 6.2 Robust RL and Domain Randomization
-
-**Domain Randomization (Tobin et al., 2017).** Trains policies on randomized environments to improve sim-to-real transfer. CIRC-RL formalizes this via the environment family $\mathcal{E}$ and worst-case optimization.
-
-**EPOpt (Rajeswaran et al., 2017).** Ensemble policy optimization for robust policies. CIRC-RL extends this with causal invariance and complexity penalties.
-
-**DARC (Harrison et al., 2021).** Adversarial environment generation. CIRC-RL can incorporate this as a method for sampling challenging environments from $\mathcal{E}$.
-
-### 6.3 Invariant Risk Minimization
-
-**IRM (Arjovsky et al., 2019).** Proposes learning invariant predictors across environments. CIRC-RL adapts IRM to the RL setting with temporal dependencies and sequential decision-making.
-
-**Risk Extrapolation (Krueger et al., 2021).** Extends IRM with worst-case optimization. CIRC-RL combines this with causal structure and constraints.
-
-### 6.4 Safe RL
-
-**Constrained MDPs (Altman, 1999).** Formulates RL with constraints. CIRC-RL builds on this foundation, adding causal and invariance components.
-
-**CPO (Achiam et al., 2017).** Constrained Policy Optimization via trust regions. CIRC-RL is compatible with CPO as an optimization method for the constrained component.
-
-### 6.5 Minimum Description Length
-
-**MDL Principle (Rissanen, 1978).** Provides information-theoretic foundation for model selection. CIRC-RL applies this to policy selection in RL.
-
-**Solomonoff Induction (Solomonoff, 1964).** Universal prior over hypotheses based on Kolmogorov complexity. CIRC-RL uses practical approximations to this ideal.
-
-### 6.6 Information Bottleneck
-
-**Deep Variational Information Bottleneck (Alemi et al., 2017).** Compresses representations while preserving task-relevant information. CIRC-RL adapts this to policy representations in RL.
-
-**Contrastive Learning (Oord et al., 2018).** Learns representations invariant to task-irrelevant transformations. Complementary to CIRC-RL's causal invariance.
-
----
-
-## 7. Practical Implementation Considerations
-
-### 7.1 Causal Structure Identification
-
-**Domain Knowledge Elicitation.** Leverage expert knowledge to sketch initial causal graph structure. Encode known causal relationships (e.g., in physics-based environments: force causes acceleration, not vice versa).
-
-**Data-Driven Discovery.** Apply causal discovery algorithms:
-- **PC Algorithm**: Constraint-based via conditional independence tests
-- **GES**: Score-based via BIC or MDL
-- **FCI**: Handles latent confounders via adjacency search
+**Domain Knowledge Integration.** Leverage expert knowledge to constrain the causal graph search: encode known causal relationships as hard constraints (e.g., in physical systems: force causes acceleration, not vice versa; in markets: order flow causes price impact, not vice versa).
 
 **Hybrid Approach.** Combine domain knowledge (hard constraints on graph structure) with data-driven discovery (learn parameters and residual structure).
 
-### 7.2 Environment Family Construction
+### 3.3 Phase 2: Feature Selection and Invariance Testing
+
+**Reward Mechanism Invariance.** For each feature $f \in \mathcal{F}$:
+1. Test whether $f \in \text{Anc}_{\mathcal{G}}(R)$ (ancestors of reward in causal graph)
+2. Test stability of $P(R | do(f))$ across environments using Leave-One-Environment-Out (LOEO) $R^2$
+3. Retain only features with stable causal effects: $\mathcal{F}_{\text{robust}} = \lbrace f : \text{Var}_e[P_e(R|do(f))] < \epsilon\rbrace$
+
+**Transition Mechanism Invariance.** For each state dimension $s_i$:
+1. Compute LOEO $R^2$ of predicting $s_i'$ from $(s, a)$
+2. State dimensions with low $R^2$ have **variant dynamics** -- their transition mechanism changes across environments
+3. State dimensions with high $R^2$ have **invariant dynamics** -- no normalization needed
+
+**Dynamics Scale Estimation.** For each environment $e$ with variant dynamics:
+1. Fit linear model $\Delta s \sim s + a$ and extract action-coefficient matrix $B_e \in \mathbb{R}^{d_s \times d_a}$
+2. Compute dynamics scale $D_e = \|B_e\|_F$
+3. Compute reference scale $D_{\text{ref}} = \frac{1}{|\mathcal{E}|} \sum_e D_e$
+
+The dynamics scale $D_e$ quantifies how much one unit of action affects state transitions in environment $e$. The ratio $r_e = D_e / D_{\text{ref}}$ will be used in the analytic policy derivation (Phase 5) to normalize actions across environments.
+
+### 3.4 Phase 3: Structural Hypothesis Generation
+
+**This phase replaces the neural policy optimization of classical RL with scientific hypothesis generation.** The goal is to discover explicit, analytic functional forms for the environment dynamics and reward mechanism.
+
+#### 3.4.1 Dynamics Hypotheses
+
+For each state dimension $s_i$ identified as having **variant dynamics** in Phase 2, we seek the functional form:
+
+$$\Delta s_i = h_i(s, a; \theta_e)$$
+
+where $\theta_e$ are the environment parameters. The tool is **symbolic regression** (e.g., PySR, SINDy), which takes as input $(s, a, \theta_e)$ and target $\Delta s_i$, and proposes candidate analytic expressions ordered by complexity and accuracy -- a Pareto front of explicit hypotheses.
+
+**Procedure:**
+1. Pool exploration data from all training environments
+2. Run symbolic regression with complexity penalty, generating a Pareto front of candidate expressions $\lbrace h_i^{(1)}, h_i^{(2)}, \ldots, h_i^{(K)}\rbrace$ ordered from simplest to most complex
+3. Each candidate is an **explicit, falsifiable hypothesis** about the functional form of the dynamics
+
+**Example (Inverted Pendulum).** Symbolic regression on angular velocity data might return:
+- $h^{(1)}$: $\Delta\omega \approx c_1 \cdot a$ (too simple, ignores gravity)
+- $h^{(2)}$: $\Delta\omega \approx c_1 \cdot \sin(\theta) / l + c_2 \cdot a / (ml^2)$ (structurally correct)
+- $h^{(3)}$: 15-term expression (overfitting)
+
+**Example (Market Microstructure).** Symbolic regression on mid-price changes might return:
+- $h^{(1)}$: $\Delta p \approx \lambda \cdot q$ (pure linear impact)
+- $h^{(2)}$: $\Delta p \approx \kappa(\mu - p)\Delta t + \lambda \cdot q + \sigma\epsilon$ (mean-reverting + linear impact)
+- $h^{(3)}$: $\Delta p \approx \kappa(\mu - p)\Delta t + \lambda \cdot \text{sign}(q)|q|^{0.5} + \sigma\epsilon$ (mean-reverting + square-root impact)
+
+#### 3.4.2 Reward Hypotheses
+
+If the reward mechanism is invariant (verified in Phase 2), seek:
+
+$$R = g(s, a)$$
+
+with no dependence on $\theta_e$. If not invariant, seek $R = g(s, a; \theta_e)$ with explicit parametric dependence.
+
+The same symbolic regression approach applies. In many domains, the reward function is **designer-specified** (not learned), in which case this step is trivial: the reward hypothesis is the reward function itself.
+
+#### 3.4.3 The Hypothesis Register
+
+Each candidate hypothesis is formally registered with:
+- **Expression**: the analytic functional form
+- **Complexity**: number of nodes in expression tree (symbolic complexity $C_{\text{sym}}$)
+- **Training fit**: $R^2$ on pooled training data
+- **Status**: untested / validated / falsified
+
+### 3.5 Phase 4: Hypothesis Falsification
+
+**This is the core Popperian step.** Each hypothesis from Phase 3 is subjected to systematic falsification. A hypothesis that survives all tests is provisionally accepted; one that fails any test is rejected.
+
+#### 3.5.1 Cross-Environment Structural Consistency
+
+If the hypothesis specifies a parametric relationship between environment parameters and dynamics coefficients, this relationship must hold independently in each environment.
+
+**Procedure:**
+1. For hypothesis $h_i$, estimate its coefficients independently in each environment $e$, yielding $\hat{\alpha}_e, \hat{\beta}_e, \ldots$
+2. If $h_i$ predicts that $\hat{\alpha}_e \propto g(\theta_e)$ for some function $g$, verify that the observed coefficients are consistent with this prediction across all training environments
+3. Quantify consistency via a statistical test (e.g., F-test on the residuals of the predicted relationship)
+
+**Example:** If $h^{(2)}$ for the pendulum predicts $\beta_e \propto 1/(m_e l_e^2)$, estimate $\beta_e$ independently in each environment and test whether $\beta_e \cdot m_e l_e^2 = \text{const}$ within statistical uncertainty.
+
+**Falsification criterion:** If the predicted structural relationship fails with $p < 0.01$, the hypothesis is falsified.
+
+#### 3.5.2 Out-of-Distribution Prediction
+
+Hold out a subset of environments $\mathcal{E}_{\text{held-out}} \subset \mathcal{E}$. The hypothesis, calibrated on $\mathcal{E}_{\text{train}} = \mathcal{E} \setminus \mathcal{E}_{\text{held-out}}$, must produce **quantitative predictions** for the dynamics in $\mathcal{E}_{\text{held-out}}$.
+
+**Procedure:**
+1. From the validated hypothesis and the known environment parameters $\theta_{e'}$ of a held-out environment $e'$, predict the dynamics coefficients $\hat{\alpha}_{e'}, \hat{\beta}_{e'}, \ldots$
+2. Estimate the true coefficients from data in $e'$
+3. Compare: predicted vs. observed, with confidence intervals
+
+**Falsification criterion:** If the predicted coefficient falls outside the 99% confidence interval of the observed value, the hypothesis is falsified for that environment. If falsified in $> 20\%$ of held-out environments, the hypothesis is globally rejected.
+
+#### 3.5.3 Trajectory Prediction
+
+The most stringent test: use the hypothesis to simulate trajectories forward in time, and compare predicted state sequences to observed ones.
+
+**Procedure:**
+1. From initial state $s_0$ and a sequence of actions $(a_0, \ldots, a_{T-1})$, use the hypothesis to predict $(s_1, \ldots, s_T)$
+2. Compare predicted trajectory to observed trajectory
+3. Quantify divergence as a function of horizon
+
+**Falsification criterion:** If the predicted trajectory diverges from observed by more than a threshold $\epsilon_T$ (which grows with horizon $T$) in more than 20% of test trajectories, the hypothesis is falsified.
+
+#### 3.5.4 Selection Among Surviving Hypotheses
+
+Among hypotheses that survive all falsification tests, select using the **Minimum Description Length** (MDL) principle or equivalently the **Bayesian Information Criterion** (BIC):
+
+$$\text{MDL}(h) = -\log P(D | h) + C_{\text{sym}}(h) \cdot \log(n)$$
+
+where $D$ is the data, $C_{\text{sym}}(h)$ is the symbolic complexity, and $n$ is the sample size. This selects the simplest hypothesis compatible with the data.
+
+### 3.6 Phase 5: Analytic Policy Derivation
+
+**Given validated hypotheses for dynamics and reward, derive the optimal policy as a logical consequence -- do not learn it.**
+
+The form of the validated dynamics hypothesis determines the derivation method:
+
+#### 3.6.1 Linear Dynamics + Quadratic Reward
+
+If validated dynamics are linear: $s_{t+1} = As_t + Ba_t + c$ and the reward is quadratic: $R_t = -s_t^T Q s_t - a_t^T R a_t$, the optimal policy is a **Linear-Quadratic Regulator** (LQR):
+
+$$a^*_t = -K \cdot s_t$$
+
+where $K = (R + B^T P B)^{-1} B^T P A$ and $P$ solves the Discrete Algebraic Riccati Equation (DARE):
+
+$$P = Q + A^T P A - A^T P B (R + B^T P B)^{-1} B^T P A$$
+
+**Zero free parameters. Zero training. Zero overfitting.** The matrix $K$ is a consequence of the validated hypothesis.
+
+**Cross-environment normalization.** If the dynamics matrix $B$ varies across environments as $B_e$, the policy in environment $e$ is:
+
+$$a^*_t(e) = -K_e \cdot s_t, \quad K_e = (R + B_e^T P_e B_e)^{-1} B_e^T P_e A$$
+
+Each $K_e$ is computed analytically from the known $B_e$. No "dynamics predictor" neural network is needed -- the relationship between environment parameters $\theta_e$ and $B_e$ is given by the validated hypothesis.
+
+#### 3.6.2 Nonlinear Known Dynamics + Known Reward
+
+When the validated dynamics $s_{t+1} = h(s_t, a_t; \theta_e)$ are nonlinear but fully specified, use optimal control methods:
+
+**Pontryagin Maximum Principle.** Derive necessary conditions for optimality via the Hamiltonian:
+
+$$H(s, a, \lambda, t) = R(s, a) + \lambda^T h(s, a; \theta_e)$$
+
+where $\lambda$ is the costate variable. The optimal action satisfies $\partial H / \partial a = 0$, and the costate evolves as $\dot{\lambda} = -\partial H / \partial s$.
+
+**Hamilton-Jacobi-Bellman.** For stochastic systems, the value function satisfies:
+
+$$V^*(s) = \max_a \left[ R(s, a) + \gamma \mathbb{E}[V^*(h(s, a; \theta_e) + \sigma\epsilon)] \right]$$
+
+For specific functional forms of $h$, this PDE may have closed-form solutions or efficient numerical solutions (e.g., via spectral methods, finite differences).
+
+**Model Predictive Control.** For complex nonlinear dynamics where closed-form solutions are unavailable, solve the optimization problem online over a receding horizon:
+
+$$a^*_t = \arg\max_{a_t, \ldots, a_{t+H}} \sum_{k=0}^{H} \gamma^k R(s_{t+k}, a_{t+k}) \quad \text{s.t.} \quad s_{t+k+1} = h(s_{t+k}, a_{t+k}; \theta_e)$$
+
+The validated dynamics hypothesis serves as the **model** in model predictive control, but unlike learned neural world models, this model is an explicit analytic expression with known error bounds from the falsification phase.
+
+#### 3.6.3 Action Normalization for Varying Dynamics
+
+When the dynamics are **action-multiplicative** (Theorem 3.8.1 below), the optimal policy admits a decomposition:
+
+$$\pi^*(a \mid s; e) = \mathcal{N}_e\bigl(\pi^*_{\text{abs}}(a \mid s)\bigr)$$
+
+where $\pi^*_{\text{abs}}$ is the optimal policy in a **normalized action space** (independent of $e$) and $\mathcal{N}_e$ rescales actions by the dynamics ratio $r_e = D_e / D_{\text{ref}}$.
+
+For the analytic policy, this means: derive $\pi^*_{\text{abs}}$ once (using the reference dynamics $D_{\text{ref}}$), then obtain the environment-specific policy via:
+
+$$a^*_t(e) = r_e \cdot \tilde{a}^*_t$$
+
+where $\tilde{a}^*_t = \pi^*_{\text{abs}}(s_t)$ is the action in normalized space.
+
+This is not an approximation imposed by architectural choice (as in the previous framework version) -- it is a **consequence of the validated dynamics hypothesis**. If the hypothesis specifies that the dynamics are action-multiplicative with scale $D_e$, the normalization follows logically.
+
+#### 3.6.4 Constraint Integration
+
+Safety constraints (Priority 1) are incorporated into the analytic derivation:
+
+**For LQR:** Constrained LQR adds inequality constraints to the Riccati equation solution, solvable via quadratic programming at each step.
+
+**For Pontryagin/HJB:** Constraints enter as path constraints in the optimal control formulation, handled via augmented Lagrangian or barrier methods.
+
+**For MPC:** Constraints are directly included in the optimization problem:
+
+$$a^*_t = \arg\max_{a_t, \ldots, a_{t+H}} \sum_{k=0}^{H} \gamma^k R(s_{t+k}, a_{t+k}) \quad \text{s.t.} \quad \begin{cases} s_{t+k+1} = h(s_{t+k}, a_{t+k}; \theta_e) \\ C_i(\tau) \leq \delta_i \quad \forall i \end{cases}$$
+
+### 3.7 Phase 6: Bounded Residual Learning
+
+The validated hypothesis explains a fraction of the dynamics variance. Let $\eta^2$ denote the fraction of variance explained. If $\eta^2$ is sufficiently high (e.g., $> 0.90$), the analytic policy from Phase 5 is the primary policy, and the residual is small.
+
+For the residual component:
+
+$$s_{t+1} = h_{\text{validated}}(s_t, a_t; \theta_e) + \underbrace{\epsilon_t}_{\text{residual}}$$
+
+where $\epsilon_t$ captures the unexplained variance, we learn a **correction policy**:
+
+$$\pi(a \mid s; e) = \pi_{\text{analytic}}(a \mid s; e) + \delta\pi(a \mid s)$$
+
+The correction $\delta\pi$ is learned via standard RL methods (e.g., PPO), but with critical constraints:
+
+1. **Bounded magnitude**: $\|\delta\pi\| \leq \eta_{\max} \cdot \|\pi_{\text{analytic}}\|$ where $\eta_{\max}$ is proportional to the unexplained variance fraction $(1 - \eta^2)$. This prevents the residual from dominating the analytic component.
+
+2. **No access to environment parameters**: $\delta\pi$ depends only on state $s$, not on $\theta_e$. All environment-dependent adaptation is handled by the analytic component.
+
+3. **Complexity penalty**: Standard MDL regularization on the residual network.
+
+**When is residual learning unnecessary?** If $\eta^2 > 0.98$ and the analytic policy achieves return within $\epsilon$ of the theoretical optimum in held-out environments, skip this phase entirely. The analytic policy is sufficient.
+
+**When is residual learning insufficient?** If $\eta^2 < 0.70$, the dynamics hypothesis is too coarse. Return to Phase 3 and generate richer hypotheses rather than relying on a large residual correction.
+
+### 3.8 Theoretical Results
+
+#### Theorem 3.8.1 (Invariance of Optimal Abstract Policy)
+
+If (1) the reward mechanism $P_e(R \mid s, a)$ is invariant across $\mathcal{E}$, and (2) the transition dynamics are **action-multiplicative**, i.e.:
+
+$$f_s(s, a; e) = g(s) + B_e \cdot a + U_s$$
+
+then the optimal abstract policy $\pi_{\text{abs}}^*$ that maximizes worst-case return is invariant: $\pi_{\text{abs}}^*(a \mid s)$ does not depend on $e$.
+
+*Proof Sketch.* Under action-multiplicative dynamics, applying normalizer $\mathcal{N}_e$ to abstract action $\tilde{a}$ yields physical action $a = r_e \cdot \tilde{a}$, producing effective transition $B_e \cdot a = B_e \cdot (D_e / D_{\text{ref}}) \cdot \tilde{a}$. Since $D_e = \|B_e\|_F$, this equalizes the amplitude of action effects in abstract space (up to directional effects in the structure of $B_e$). Given that the reward depends on state (invariant mechanism), and the effective dynamics in abstract action space are equalized, the optimal abstract policy is invariant. $\square$
+
+*Limitation.* The result is exact only for dynamics that are linear in the action. For nonlinear systems, the decomposition is a local approximation whose error grows with action magnitude and dynamics nonlinearity. However, when the dynamics hypothesis is validated via falsification (Phase 4), the regime of validity is empirically bounded.
+
+#### Theorem 3.8.2 (Causal Invariance Implies Generalization)
+
+Let $\mathcal{E}$ be an environment family with shared causal graph $\mathcal{G}$. If the dynamics hypothesis $h$ passes all falsification tests in Phase 4 on training environments $\mathcal{E}_{\text{train}}$, and the analytic policy $\pi_h$ is derived from $h$ via Phase 5, then for a novel environment $e' \in \mathcal{E} \setminus \mathcal{E}_{\text{train}}$ whose parameters $\theta_{e'}$ fall within the convex hull of training parameters:
+
+$$P\left(R^{e'}(\pi_h) \geq R_{\text{predicted}} - \epsilon\right) \geq 1 - \delta$$
+
+where $R_{\text{predicted}}$ is the return predicted by the hypothesis, $\epsilon$ depends on the residual variance $(1 - \eta^2)$ and the horizon, and $\delta$ depends on the number of falsification tests survived.
+
+*Key difference from v1:* The guarantee is **conditional on the hypothesis being correct** (which was empirically tested), not on a hope that function approximation generalizes. The failure mode is diagnosable: if the guarantee fails, either the hypothesis is wrong (go back to Phase 3) or the novel environment is outside the family $\mathcal{E}$ (which the framework explicitly acknowledges as a limitation).
+
+#### Theorem 3.8.3 (MDL Bound for Symbolic Policies)
+
+Let $\Pi_K = \lbrace\pi_h : C_{\text{sym}}(h) \leq K\rbrace$ be the class of analytic policies derived from symbolic hypotheses with complexity at most $K$. The sample complexity required to falsify incorrect hypotheses and identify a correct one in $\Pi_K$ is:
+
+$$n = O\left(\frac{K \cdot \log(|\mathcal{H}_K|) + \log(1/\delta)}{\epsilon^2}\right)$$
+
+where $|\mathcal{H}_K|$ is the number of candidate hypotheses at complexity $K$, $\epsilon$ is the tolerance, and $\delta$ is the failure probability.
+
+*Implication.* Symbolic hypotheses have dramatically lower effective complexity than neural networks (typically $K \sim 10$--$30$ nodes vs. $10^4$--$10^6$ parameters), yielding exponentially lower sample requirements for reliable identification.
+
+#### Theorem 3.8.4 (Constraint Satisfaction)
+
+If constraints $\lbrace C_i\rbrace$ are satisfied by the analytic policy in all training environments, and the dynamics hypothesis is validated, then with probability at least $1 - \delta$ over deployment:
+
+$$P_{\text{deploy}}\left(C_i(\tau) > \delta_i\right) \leq \delta_i + O\left(\sqrt{\frac{\log(m/\delta)}{n}}\right) + O(1 - \eta^2)$$
+
+where $n$ is the number of training trajectories, $m$ the number of constraints, and the last term accounts for residual model error.
+
+*Implication.* The constraint violation probability has an additive term proportional to the unexplained variance. High-quality hypotheses ($\eta^2 \to 1$) yield tighter safety guarantees.
+
+### 3.9 Phase 7: Diagnostic Validation
+
+**The final phase tests not "does the policy work?" but the entire causal chain from hypothesis to outcome.** This is the key advantage over RL with neural networks: failures are localizable.
+
+#### 3.9.1 Premise Test (Hypothesis Validity)
+
+In held-out test environments $\mathcal{E}_{\text{test}}$:
+1. Are the dynamics observed compatible with the validated hypothesis?
+2. Quantify: prediction error on $\Delta s$ given $(s, a, \theta_e)$
+
+**If this test fails:** The dynamics hypothesis is wrong or incomplete. Return to Phase 3 with richer functional forms. The policy is not broken -- the understanding is incomplete.
+
+#### 3.9.2 Derivation Test (Policy Correctness)
+
+1. Do the trajectories generated by the analytic policy follow the trajectories predicted by the hypothesis?
+2. Quantify: divergence between predicted and observed state sequences under the policy
+
+**If this test fails but 3.9.1 passes:** The derivation method (LQR, Pontryagin, MPC) has a bug or the constraints are interfering unexpectedly. This is a computational issue, not a structural one.
+
+#### 3.9.3 Conclusion Test (Return Prediction)
+
+1. Is the return obtained in test environments compatible with the return predicted by the theory?
+2. Quantify: $|R_{\text{observed}} - R_{\text{predicted}}| / R_{\text{predicted}}$
+
+**If this test fails but 3.9.1 and 3.9.2 pass:** The reward hypothesis is wrong. Return to Phase 3 for the reward model.
+
+#### 3.9.4 Diagnostic Summary
+
+| Test | Passes | Fails | Action |
+|------|--------|-------|--------|
+| Premise (dynamics) | ✓ | ✗ | Return to Phase 3: richer dynamics hypothesis |
+| Derivation (trajectory) | ✓ | ✗ | Debug derivation method (computational issue) |
+| Conclusion (return) | ✓ | ✗ | Return to Phase 3: richer reward hypothesis |
+| All three | ✓ | — | Policy validated: deploy with monitoring |
+
+This diagnostic capability is **impossible** with neural network policies, where a failure provides essentially zero information about its cause.
+
+---
+
+## 4. Fundamental Limitations
+
+### 4.1 Epistemological Boundaries
+
+**No Free Lunch.** Even with infinite computational resources, there exists no algorithm that performs optimally across all possible environments. Every framework embeds inductive biases. CIRC-RL's bias is toward environments with discoverable analytic structure.
+
+**Hume's Problem of Induction.** We cannot logically guarantee that validated hypotheses will hold in deployment. Empirical falsification reduces risk but does not eliminate it.
+
+**Uncomputable Ideals.** Kolmogorov complexity is uncomputable, and exact causal discovery is NP-hard. All practical implementations are approximations.
+
+**Symbolic Regression Limits.** Symbolic regression is not guaranteed to find the correct functional form, especially for high-dimensional problems or systems with no compact analytic description.
+
+### 4.2 Untestable Assumptions
+
+1. **Causal graph correctness**: Causal discovery from observational data admits multiple compatible graphs (Markov equivalence classes). Domain knowledge is essential to disambiguate.
+
+2. **No hidden confounders**: We assume all relevant variables are observed. Unobserved confounders can invalidate causal conclusions.
+
+3. **Environment family structure**: We assume deployment environments belong to the same family $\mathcal{E}$ as training environments. Black swan events lie outside any finite family.
+
+4. **Constraint completeness**: We assume specified constraints capture all safety requirements. Unknown unknowns are by definition not captured.
+
+5. **Analytic describability**: We assume the dynamics have a compact analytic form. Some systems (turbulence, protein folding, complex social dynamics) may not admit such descriptions, limiting the applicability of Phases 3-5.
+
+### 4.3 Computational Challenges
+
+**Symbolic regression** has exponential search space in expression complexity. Current methods (PySR, SINDy) scale well to $\sim 10$ input variables but struggle with $> 50$.
+
+**Optimal control** for nonlinear systems may be computationally expensive, especially with many constraints or long horizons.
+
+**Falsification** across many environments and many hypotheses requires careful experimental design to manage multiple testing corrections.
+
+### 4.4 What CIRC-RL Does NOT Guarantee
+
+- Zero overfitting (impossible in principle)
+- Generalization to arbitrary distribution shifts (only to shifts within the validated hypothesis regime)
+- Safety under unspecified threats (only under formalized constraints)
+- Applicability to all domains (requires partially discoverable analytic structure)
+- Computational efficiency (symbolic search and optimal control can be expensive)
+
+### 4.5 What CIRC-RL DOES Provide
+
+- **Falsifiable outputs**: Every component produces a testable claim, not an opaque weight vector
+- **Diagnosticable failures**: When the framework fails, the failure is localized to a specific hypothesis or derivation step
+- **Principled generalization**: Policies generalize because they are consequences of validated structural knowledge, not because a function approximator happened to extrapolate correctly
+- **Minimal overfitting surface**: Analytic policies have $O(10)$ free parameters vs. $O(10^6)$ for neural policies
+- **Domain knowledge integration**: The hypothesis generation and falsification cycle naturally incorporates expert knowledge as constraints on the search space
+- **Interpretability**: The policy is an explicit formula whose logic can be inspected, audited, and understood
+
+---
+
+## 5. Relationship to Existing Work
+
+### 5.1 Causal Reinforcement Learning
+
+**Causal Confusion (de Haan et al., 2019).** Identifies the problem of correlational policies. CIRC-RL addresses this at a deeper level: instead of regularizing a neural policy to prefer causal features, it discovers the causal mechanisms explicitly and derives the policy from them.
+
+**Counterfactual Data Augmentation (Buesing et al., 2018).** Uses learned world models for counterfactual reasoning. CIRC-RL uses validated analytic models, which are interpretable and have known error bounds.
+
+### 5.2 Symbolic and Physics-Informed Methods
+
+**PySR (Cranmer, 2023).** State-of-the-art symbolic regression. CIRC-RL uses PySR (or similar) as a component in Phase 3, embedded in a falsification framework that PySR alone does not provide.
+
+**SINDy (Brunton et al., 2016).** Sparse identification of nonlinear dynamics. Closely related to Phase 3 dynamics discovery, but SINDy assumes a library of candidate functions while CIRC-RL's symbolic regression is more general.
+
+**Physics-Informed Neural Networks (Raissi et al., 2019).** Encode known physics as constraints on neural networks. CIRC-RL goes further: it discovers the physics (or quasi-physics) first, then derives the policy without neural networks.
+
+### 5.3 Robust RL and Domain Randomization
+
+**Domain Randomization (Tobin et al., 2017).** CIRC-RL subsumes this: Phase 1 uses multiple environments for causal discovery, but instead of training a neural policy to be robust across them, it discovers why environments differ and exploits this understanding analytically.
+
+**EPOpt (Rajeswaran et al., 2017).** Ensemble policy optimization. CIRC-RL replaces the ensemble of neural policies with a single analytic policy (or a small set derived from different valid hypotheses).
+
+### 5.4 Invariant Risk Minimization
+
+**IRM (Arjovsky et al., 2019).** Proposes learning invariant predictors via neural network regularization. CIRC-RL's Phase 2 performs invariance testing explicitly, and Phase 3 discovers the invariant structure analytically rather than regularizing a neural network toward it.
+
+### 5.5 Optimal Control
+
+**Classical Optimal Control (Pontryagin, Bellman, Kalman).** CIRC-RL's Phase 5 is classical optimal control. The novelty is not in the control method but in the **automated pipeline** from raw multi-environment data to validated analytic models to derived controllers, with explicit falsification at each step.
+
+**Model Predictive Control.** MPC with a learned model is well-established. CIRC-RL's contribution is that the model is not a neural network but a validated symbolic expression with known error bounds and interpretable structure.
+
+### 5.6 Safe RL
+
+**Constrained MDPs (Altman, 1999).** CIRC-RL builds on CMDPs but adds: causal structure discovery, analytic policy derivation, and tighter constraint guarantees via validated dynamics models.
+
+**CPO (Achiam et al., 2017).** Compatible with CIRC-RL's residual learning phase (Phase 6) as an optimization method for the bounded correction.
+
+### 5.7 Minimum Description Length
+
+**MDL Principle (Rissanen, 1978).** CIRC-RL applies MDL naturally: symbolic complexity of hypotheses provides a direct, meaningful complexity measure, unlike parameter counting in neural networks where architectural choices dominate.
+
+---
+
+## 6. Practical Implementation Considerations
+
+### 6.1 Tool Chain
+
+| Phase | Primary Tools | Fallback |
+|-------|--------------|----------|
+| Phase 1 (Causal Discovery) | PC algorithm, GES, FCI | Domain expert elicitation |
+| Phase 2 (Invariance Testing) | LOEO $R^2$, linear regression | Nonparametric tests |
+| Phase 3 (Hypothesis Generation) | PySR (symbolic regression), SINDy | Manual hypothesis formulation from domain knowledge |
+| Phase 4 (Falsification) | Statistical testing (F-test, $\chi^2$), bootstrap CI | Cross-validation |
+| Phase 5 (Policy Derivation) | LQR/DARE solvers, CasADi (optimal control), MPC solvers | Shooting methods |
+| Phase 6 (Residual Learning) | PPO with bounded correction | SAC, TD3 |
+| Phase 7 (Validation) | Trajectory simulation, statistical comparison | Monte Carlo testing |
+
+### 6.2 Environment Family Construction
 
 **Simulation-Based.** For simulatable domains, construct $\mathcal{E}$ via:
-- **Parametric variation**: Randomize physics parameters within plausible ranges
-- **Procedural generation**: Generate diverse levels, terrains, opponents
-- **Adversarial generation**: Train environment generator to maximize difficulty
+- Parametric variation: Randomize physics parameters within plausible ranges
+- Procedural generation: Generate diverse configurations
+- Adversarial generation: Generate configurations that stress-test hypotheses
 
 **Real-World Data.** For non-simulatable domains:
-- **Temporal environments**: Treat different time periods as different environments
-- **Contextual environments**: Partition data by context (market regime, weather condition, user demographics)
-- **Geographic environments**: Treat different locations as different environments
+- Temporal environments: Treat different time periods as different environments
+- Contextual environments: Partition data by regime (market regime, weather condition, operational mode)
+- Geographic environments: Treat different locations as different environments
 
-### 7.3 Computational Trade-offs
+### 6.3 When to Use CIRC-RL
 
-**Environment Budget.** Training on $|\mathcal{E}|$ environments multiplies computational cost by $|\mathcal{E}|$. Balance diversity against computational feasibility. Empirically, $|\mathcal{E}| \in [5, 20]$ often suffices.
+**Strong fit (use Phases 1-7):**
+- Domains with known or discoverable physical/economic laws
+- Systems with moderate state/action dimensionality ($< 50$)
+- Applications requiring interpretability and auditability
+- Safety-critical domains where diagnostic capability is essential
 
-**Complexity Penalties.** Set $\beta$ coefficients via hyperparameter search on held-out environments. Higher $\beta$ trades performance for generalization.
+**Partial fit (use Phases 1-2, then classical RL with causal features):**
+- High-dimensional systems where symbolic regression struggles
+- Domains with no compact analytic description
+- Rapid prototyping where the full pipeline is too slow
 
-**Constraint Thresholds.** Set $\delta_i$ conservatively to account for finite-sample estimation error. Use $\delta_i = \delta_i^{\text{desired}} - k\sigma_i$ where $\sigma_i$ is estimated standard error and $k \in [2, 3]$.
+**Poor fit (use standard RL):**
+- Purely perceptual domains (image-based control)
+- Systems with no environment family available
+- Problems where the reward function is the only source of information
 
-### 7.4 Validation Protocol
+### 6.4 Validation Protocol
 
 **Multi-Level Holdout:**
-1. **Training environments** $\mathcal{E}_{\text{train}}$: Used for policy optimization
-2. **Validation environments** $\mathcal{E}_{\text{val}}$: Used for hyperparameter tuning ($\alpha, \beta, \lambda$ coefficients)
-3. **Test environments** $\mathcal{E}_{\text{test}}$: Used for final evaluation only
+1. **Training environments** $\mathcal{E}_{\text{train}}$: Used for Phases 1-3 (discovery, hypothesis generation)
+2. **Falsification environments** $\mathcal{E}_{\text{falsify}}$: Used for Phase 4 (hypothesis testing)
+3. **Test environments** $\mathcal{E}_{\text{test}}$: Used for Phase 7 (diagnostic validation)
 4. **Deployment monitoring**: Continuous evaluation on live data with circuit breakers
 
-**Cross-Environment Validation.** Use leave-one-environment-out cross-validation within $\mathcal{E}_{\text{train}}$ to estimate generalization before touching $\mathcal{E}_{\text{test}}$.
-
-**Ablation Studies.** Systematically disable components (causal, invariance, regularization, constraints) to measure individual contributions.
+**Critical: $\mathcal{E}_{\text{falsify}}$ and $\mathcal{E}_{\text{test}}$ must be strictly held out.** Data from these environments must never inform hypothesis generation or policy derivation.
 
 ---
 
-## 8. Open Problems and Future Directions
+## 7. Open Problems and Future Directions
 
-### 8.1 Theoretical Frontiers
+### 7.1 Theoretical Frontiers
 
-**Tighter Generalization Bounds.** Current PAC bounds for RL are loose. Develop tighter bounds that account for temporal structure and causal invariance.
+**Tighter Generalization Bounds.** Develop bounds that exploit the specific structure of symbolic hypotheses (expression tree depth, operation types) rather than generic VC/Rademacher bounds.
 
-**Sample Complexity of Causal Discovery.** How many samples are required to reliably identify causal structure in high-dimensional RL environments?
+**Sample Complexity of Symbolic Discovery.** How many samples and environments are required to reliably discover the correct functional form via symbolic regression? This connects to the theory of identification in algebraic statistics.
 
-**Compositional Generalization.** Extend CIRC-RL to handle compositional structure (modules, hierarchies, sub-goals) for better generalization to novel task combinations.
+**Compositional Hypothesis Spaces.** Develop methods for composing sub-hypotheses (e.g., "the dynamics decompose into a gravity term + a friction term + an actuation term") to handle high-dimensional systems.
 
-### 8.2 Algorithmic Developments
+### 7.2 Algorithmic Developments
 
-**Efficient Causal Discovery.** Develop scalable algorithms for causal discovery in high-dimensional continuous state spaces with temporal dependencies.
+**Scalable Symbolic Regression.** Current methods struggle beyond $\sim 10$ input variables. Developing symbolic regression that scales to $\sim 100$ variables would dramatically expand the applicability of CIRC-RL.
 
-**Counterfactual Imagination.** Learn world models that support efficient counterfactual queries without environment resettability.
+**Automated Falsification Design.** Optimally design falsification experiments: which environments to hold out, which trajectory initial conditions to test, to maximize the probability of catching incorrect hypotheses.
 
-**Adaptive Environment Sampling.** Dynamically select which environments to sample from $\mathcal{E}$ to maximize information about causal invariances.
+**Adaptive Hypothesis Refinement.** When a hypothesis is falsified, automatically suggest refinements (e.g., "add a quadratic term", "allow parameter interaction") rather than restarting symbolic regression from scratch.
 
-### 8.3 Domain-Specific Instantiations
+### 7.3 Domain-Specific Instantiations
 
-**Robotics.** Formalize invariances across different robots, terrains, and object properties. Develop physics-informed causal priors.
+**Financial Markets.** Market microstructure has well-established analytic models (Almgren-Chriss, Avellaneda-Stoikov, Kyle). CIRC-RL can validate which model best describes a given market regime and derive optimal execution/market-making strategies as consequences.
 
-**Game Playing.** Identify causal mechanisms in multi-agent settings. Handle non-stationarity from opponent adaptation.
+**Robotics.** Rigid body dynamics are analytically tractable (Lagrangian/Hamiltonian mechanics). CIRC-RL can discover effective parameters (friction, mass distribution) and derive controllers via validated dynamics.
 
-**Autonomous Systems.** Formalize safety constraints for deployment in safety-critical domains (autonomous vehicles, medical devices, financial trading).
+**Energy Systems.** Grid dynamics follow known differential equations with uncertain parameters. CIRC-RL can identify regime-dependent parameters and derive optimal dispatch policies.
 
-**Scientific Discovery.** Apply CIRC-RL to active experimentation where causal discovery is the primary objective, not just a means to robust policies.
+### 7.4 Connections to Philosophy of Science
 
-### 8.4 Connections to Other Fields
+**Lakatos' Research Programs.** CIRC-RL's hypothesis refinement cycle mirrors Lakatos' concept of progressive research programs: a hard core (causal graph) surrounded by a protective belt (parametric hypotheses) that is modified in response to anomalies.
 
-**Quantum Computing.** Explore whether quantum superposition enables more efficient causal discovery or counterfactual evaluation.
+**Kuhn's Paradigm Shifts.** When a dynamics hypothesis is fundamentally falsified (not just in parameters but in structure), CIRC-RL must return to Phase 1 and reconsider the causal graph -- a "paradigm shift" within the framework.
 
-**Neuroscience.** Draw inspiration from biological mechanisms for causal reasoning and invariant representations.
-
-**Economics.** Leverage econometric techniques (IV, RDD, DID) for causal identification in observational RL data.
+**Popper's Falsificationism.** Phase 4 is explicitly Popperian. The strength of a hypothesis is measured not by the data it fits but by the tests it survives.
 
 ---
 
-## 9. Philosophical Foundations
+## 8. Philosophical Foundations
 
-### 9.1 Epistemic Humility
+### 8.1 Epistemic Humility
 
 CIRC-RL acknowledges fundamental limits:
 
@@ -526,11 +664,35 @@ CIRC-RL acknowledges fundamental limits:
 
 **We cannot prevent all failures.** Black swan events lie outside any finite training distribution.
 
-**What we can do:** Construct frameworks that are *less likely* to fail than naive alternatives, by exploiting structure (causality, invariance, simplicity) that has proven empirically robust across domains.
+**What we can do:** Construct frameworks that produce **falsifiable, interpretable, and diagnosticable** outputs, so that when failures occur, they are informative rather than opaque.
 
-### 9.2 Pragmatic Truth
+### 8.2 Derivation vs. Approximation
 
-Following Pierce and James, we define "useful knowledge" not as correspondence to absolute truth, but as:
+The central philosophical claim of CIRC-RL is that there is a fundamental difference between:
+
+**Derived knowledge:** "The optimal action is $a^* = -Ks$ because the dynamics are $s' = As + Ba$ and the reward penalizes $s^TQs + a^TRa$, and $K$ is the unique solution of the Riccati equation." -- This is a chain of reasoning. Each link can be tested independently. The conclusion follows from the premises with logical necessity.
+
+**Approximated knowledge:** "The optimal action is whatever the neural network outputs after training." -- This is a black box. When it fails, nothing is learned about why.
+
+CIRC-RL maximizes the fraction of the policy that is derived and minimizes the fraction that is approximated. The residual (Phase 6) is an honest acknowledgment of the limits of current understanding, not a substitute for understanding.
+
+### 8.3 The Scientific Method as Operational Framework
+
+CIRC-RL embodies the scientific method not as metaphor but as algorithm:
+
+1. **Observation** (Phase 1): Collect data, discover causal structure
+2. **Hypothesis** (Phase 3): Propose explicit functional forms
+3. **Prediction** (Phase 4): Derive quantitative consequences
+4. **Experimentation** (Phase 4): Test predictions in held-out environments
+5. **Falsification** (Phase 4): Reject hypotheses that fail tests
+6. **Theory** (Phase 5): Derive policy from surviving hypothesis
+7. **Application** (Phase 7): Deploy with monitoring, ready to revise
+
+This cycle is not a one-shot process. CIRC-RL is designed for iteration: a falsified hypothesis leads to a richer one, which leads to a better policy, which reveals new anomalies, which lead to further refinement. The framework converges not toward a fixed policy but toward a progressively deeper understanding of the environment.
+
+### 8.4 Pragmatic Truth
+
+Following Peirce and James, we define "useful knowledge" not as correspondence to absolute truth, but as:
 
 **Robustness**: Predictions that remain stable under perturbations
 
@@ -540,78 +702,63 @@ Following Pierce and James, we define "useful knowledge" not as correspondence t
 
 **Transferability**: Applies beyond narrow training conditions
 
-CIRC-RL targets *useful* policies in this pragmatic sense, not *true* policies in an absolute sense.
+**Interpretability**: Can be inspected, audited, and understood by humans
 
-### 9.3 The Scientific Method as Meta-Framework
-
-CIRC-RL embodies the scientific method:
-
-1. **Hypothesis** (Causal structure): Propose causal mechanisms
-2. **Prediction** (Invariance): Hypotheses make predictions across environments
-3. **Experimentation** (Multi-env training): Test predictions in diverse conditions
-4. **Falsification** (Constraints): Reject policies that violate known requirements
-5. **Parsimony** (MDL): Prefer simpler explanations
-6. **Replication** (Ensemble): Combine multiple consistent explanations
-
-This is not a guarantee of truth, but a process that converges toward useful knowledge through iterated refinement.
+CIRC-RL targets *useful* policies in this pragmatic sense -- policies that are consequences of our best current understanding of the environment, with explicit acknowledgment of what we do not understand.
 
 ---
 
-## 10. Conclusion
+## 9. Conclusion
 
-We have presented **CIRC-RL**, a methodological framework for reinforcement learning that structurally reduces overfitting by:
-
-1. **Exploiting causal structure** to distinguish mechanisms from correlations
-2. **Enforcing invariance** across environment families to ensure robustness
-3. **Penalizing complexity** to prevent memorization
-4. **Satisfying constraints** to encode domain knowledge
-
-We have formalized each component mathematically, established theoretical guarantees where possible, and clearly delineated fundamental limitations.
+We have presented **CIRC-RL v2**, a methodological framework that transforms reinforcement learning from a process of function approximation into a process of scientific discovery.
 
 **Key contributions:**
 
-- **Formal integration** of causal inference, robust optimization, MDL, and constrained optimization into a unified RL framework
-- **Lexicographic objective** that prioritizes safety, robustness, and simplicity over raw performance
-- **Theoretical analysis** connecting causal invariance to generalization guarantees
-- **Practical implementability** via tractable approximations to each component
-- **Epistemic honesty** about what can and cannot be guaranteed
+- **Epistemological shift**: From "optimize a neural network" to "discover structure, derive policy, learn residual"
+- **Explicit hypothesis generation**: Symbolic regression discovers analytic functional forms for dynamics and reward
+- **Systematic falsification**: Hypotheses are tested via cross-environment consistency, OOD prediction, and trajectory prediction before being used for policy derivation
+- **Analytic policy derivation**: Optimal policies are derived as logical consequences of validated hypotheses via classical optimal control methods (LQR, Pontryagin, HJB, MPC)
+- **Bounded residual learning**: Neural networks are used only for unexplained variance, with explicit bounds on their contribution
+- **Diagnostic validation**: Failures are localized to specific hypotheses or derivation steps, enabling targeted correction
+- **Formal integration**: Causal inference, invariance testing, symbolic regression, optimal control, and constrained optimization are unified in a coherent pipeline
 
 **Central thesis:**
 
-While we cannot eliminate overfitting in principle (No Free Lunch Theorem), we can reduce its probability by orders of magnitude by targeting policies that:
-- Work via causal mechanisms (not spurious correlations)
-- Generalize across environments (not memorize specifics)  
-- Maintain minimal complexity (Occam's razor)
-- Satisfy explicit constraints (domain knowledge)
+The optimal policy for a well-understood system is not an object to be learned -- it is a consequence to be derived. Learning enters only where understanding ends. CIRC-RL operationalizes this principle: it automates the cycle from data to causal structure to analytic hypothesis to falsification to derived policy, producing outputs that are falsifiable, interpretable, and diagnosticable at every stage.
 
-This is not a solution to an unsolvable problem, but a **principled framework for navigating unavoidable uncertainty**.
+**The question is not** "*Can we train a neural network to approximate the optimal policy?*" (Usually yes, but without guarantees.)
 
-**Final perspective:**
+**The question is** "*Can we understand the environment well enough to derive the optimal policy?*" (Often yes, and with much stronger guarantees.)
 
-The question is not "*Can we guarantee generalization?*" (No.)
-
-The question is "*Can we do better than naive empirical risk minimization?*" (Yes.)
-
-CIRC-RL is an answer to the latter question—a framework that acknowledges fundamental limits while exploiting every available source of structure to build more robust, interpretable, and trustworthy reinforcement learning systems.
+CIRC-RL is an answer to the latter question -- a framework that prioritizes understanding over approximation, derivation over fitting, and falsifiable structure over opaque performance.
 
 ---
 
 ## Acknowledgments
 
-This framework synthesizes ideas from causal inference (Pearl, Spirtes, Glymour), robust statistics (Huber, Hampel), information theory (Rissanen, Cover, Tishby), robust optimization (Ben-Tal, Nemirovski), safe RL (Altman, Achiam), and domain randomization (Tobin, Sadeghi). We acknowledge these foundational contributions while taking responsibility for any errors or overreach in the synthesis.
+This framework synthesizes ideas from causal inference (Pearl, Spirtes, Glymour), robust statistics (Huber, Hampel), information theory (Rissanen, Cover), robust optimization (Ben-Tal, Nemirovski), safe RL (Altman, Achiam), symbolic regression (Cranmer, Brunton), optimal control (Pontryagin, Bellman, Kalman), philosophy of science (Popper, Lakatos, Kuhn, Peirce), and domain randomization (Tobin, Sadeghi). We acknowledge these foundational contributions while taking responsibility for any errors or overreach in the synthesis.
 
 ---
 
 ## References
 
-*[Standard academic references would be listed here in a full paper format. Key citations include Pearl (2009) on causality, Arjovsky et al. (2019) on IRM, Rissanen (1978) on MDL, Altman (1999) on constrained MDPs, and numerous others mentioned throughout the text.]*
+*[Standard academic references would be listed here in a full paper format. Key citations include: Pearl (2009) on causality, Arjovsky et al. (2019) on IRM, Rissanen (1978) on MDL, Altman (1999) on constrained MDPs, Cranmer (2023) on PySR, Brunton et al. (2016) on SINDy, Popper (1959) on falsificationism, Pontryagin et al. (1962) on optimal control, and numerous others mentioned throughout the text.]*
 
 ---
 
-**Document Status:** Methodological Framework v1.0
+**Document Status:** Methodological Framework v2.0
+
+**Changelog from v1.0:**
+- Replaced neural policy optimization (Phase 3) with scientific hypothesis discovery, falsification, and analytic policy derivation (Phases 3-6)
+- Added symbolic regression as primary tool for hypothesis generation
+- Added explicit falsification protocol (Phase 4) with cross-environment, OOD, and trajectory tests
+- Added diagnostic validation (Phase 7) with localized failure analysis
+- Integrated transition dynamics normalization from Extension 3.7 as a consequence of the analytic framework
+- Revised theoretical results to account for the new pipeline
+- Expanded philosophical foundations to formalize the epistemological shift
 
 **Intended Use:** Foundation for research, implementation, and critical evaluation
 
-**Limitations:** This is a framework, not a complete algorithm. Domain-specific instantiations require additional design choices and validation.
+**Limitations:** This is a framework, not a complete algorithm. Domain-specific instantiations require additional design choices and validation. The framework is most applicable to domains with partially discoverable analytic structure.
 
-**License:** Open methodology for scientific and commercial use with attribution
+**License:** AGPL-3.0 -- Open methodology for scientific and commercial use with attribution and copyleft

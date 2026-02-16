@@ -10,13 +10,14 @@ See ``CIRC-RL_Framework.md`` Section 3.6, Phase 4.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-import torch
 from loguru import logger
 
-from circ_rl.constraints.const_set import ConstraintSet
-from circ_rl.policy.causal_policy import CausalPolicy
-from circ_rl.training.trajectory_buffer import Trajectory
+if TYPE_CHECKING:
+    from circ_rl.constraints.const_set import ConstraintSet
+    from circ_rl.policy.causal_policy import CausalPolicy
+    from circ_rl.training.trajectory_buffer import Trajectory
 
 
 @dataclass(frozen=True)
@@ -75,10 +76,7 @@ class ConstraintVerifier:
         next_states = evaluation_trajectory.next_states
 
         # For constraint evaluation, actions may need reshaping
-        if actions.dim() == 1:
-            actions_for_eval = actions.unsqueeze(-1)
-        else:
-            actions_for_eval = actions
+        actions_for_eval = actions.unsqueeze(-1) if actions.dim() == 1 else actions
 
         violations: dict[str, float] = {}
         margin_violations: list[str] = []

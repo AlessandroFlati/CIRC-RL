@@ -1,0 +1,2 @@
+solver: lqr
+gamma: 0.99

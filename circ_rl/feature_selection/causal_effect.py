@@ -10,11 +10,14 @@ See also ``CIRC-RL_Framework.md`` Section 3.2.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 from loguru import logger
+from scipy import stats
 
-from circ_rl.causal_discovery.causal_graph import CausalGraph
+if TYPE_CHECKING:
+    from circ_rl.causal_discovery.causal_graph import CausalGraph
 
 
 @dataclass(frozen=True)
@@ -111,7 +114,7 @@ class CausalEffectEstimator:
         """
         name_to_idx = {name: i for i, name in enumerate(node_names)}
 
-        for var in [cause, effect] + sorted(adjustment_set):
+        for var in [cause, effect, *sorted(adjustment_set)]:
             if var not in name_to_idx:
                 raise ValueError(
                     f"Variable '{var}' not found in node_names: {node_names}"
@@ -148,6 +151,104 @@ class CausalEffectEstimator:
             adjustment_set=adjustment_set,
             coefficients=coeffs,
         )
+
+    @staticmethod
+    def test_mechanism_invariance(
+        data_a: np.ndarray,
+        data_b: np.ndarray,
+        target_idx: int,
+        predictor_idxs: list[int],
+        poly_degree: int = 2,
+    ) -> float:
+        r"""Chow test with polynomial basis for mechanism invariance.
+
+        Tests :math:`H_0`: the regression surface
+        :math:`\text{target} \sim \text{poly}(\text{predictors})` is the
+        same in both environments. Polynomial expansion captures non-linear
+        mechanisms (e.g., quadratic and interaction effects) that a linear
+        Chow test would miss.
+
+        Uses the F-statistic:
+
+        .. math::
+
+            F = \frac{(\text{SSR}_{\text{pooled}} - \text{SSR}_a - \text{SSR}_b) / k}
+                     {(\text{SSR}_a + \text{SSR}_b) / (n_a + n_b - 2k)}
+
+        where :math:`k` is the number of polynomial regression parameters
+        (including intercept) and SSR is the sum of squared residuals.
+
+        :param data_a: Data from environment A, shape ``(n_a, n_vars)``.
+        :param data_b: Data from environment B, shape ``(n_b, n_vars)``.
+        :param target_idx: Column index of the target variable (e.g., reward).
+        :param predictor_idxs: Column indices of predictor variables
+            (treatment + adjustment set).
+        :param poly_degree: Degree of polynomial expansion (default 2).
+        :returns: p-value of the Chow F-test (high = mechanism invariant).
+        """
+        from sklearn.preprocessing import PolynomialFeatures
+
+        n_a = data_a.shape[0]
+        n_b = data_b.shape[0]
+        min_n = min(n_a, n_b)
+
+        if len(predictor_idxs) == 0:
+            return 1.0
+
+        # Safeguard: reduce poly degree if too many features for sample size
+        degree = poly_degree
+        pf_probe = PolynomialFeatures(degree=degree, include_bias=False)
+        n_raw = len(predictor_idxs)
+        probe_input = np.zeros((1, n_raw))
+        n_poly = pf_probe.fit_transform(probe_input).shape[1]
+        k_with_intercept = n_poly + 1  # +1 for intercept
+
+        while degree > 1 and k_with_intercept > min_n / 5:
+            degree -= 1
+            pf_probe = PolynomialFeatures(degree=degree, include_bias=False)
+            n_poly = pf_probe.fit_transform(probe_input).shape[1]
+            k_with_intercept = n_poly + 1
+
+        pf = PolynomialFeatures(degree=degree, include_bias=False)
+
+        def _poly_residuals(data: np.ndarray) -> np.ndarray:
+            """Compute residuals of target regressed on poly(predictors)."""
+            n = data.shape[0]
+            target = data[:, target_idx]  # (n,)
+            predictors = data[:, predictor_idxs]  # (n, n_predictors)
+            poly_features = pf.fit_transform(predictors)  # (n, n_poly)
+            design = np.column_stack(
+                [np.ones(n), poly_features]
+            )  # (n, k)
+            coeffs, _, _, _ = np.linalg.lstsq(design, target, rcond=None)
+            return target - design @ coeffs  # (n,)
+
+        pooled = np.concatenate([data_a, data_b], axis=0)
+
+        res_pooled = _poly_residuals(pooled)
+        res_a = _poly_residuals(data_a)
+        res_b = _poly_residuals(data_b)
+
+        ssr_pooled = float(np.sum(res_pooled**2))
+        ssr_a = float(np.sum(res_a**2))
+        ssr_b = float(np.sum(res_b**2))
+
+        k = k_with_intercept
+        dof_denom = n_a + n_b - 2 * k
+        if dof_denom <= 0:
+            return 1.0
+
+        numerator = (ssr_pooled - ssr_a - ssr_b) / k
+        denominator = (ssr_a + ssr_b) / dof_denom
+
+        if denominator < 1e-15:
+            return 1.0
+
+        f_stat = numerator / denominator
+        if f_stat < 0:
+            return 1.0
+
+        return float(1.0 - stats.f.cdf(f_stat, k, dof_denom))
 
     def estimate(
         self,

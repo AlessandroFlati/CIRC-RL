@@ -11,10 +11,13 @@ and the Lagrangian penalty:
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from loguru import logger
 
-from circ_rl.constraints.const_set import ConstraintSet
+if TYPE_CHECKING:
+    from circ_rl.constraints.const_set import ConstraintSet
 
 
 class LagrangeMultiplierManager:
@@ -76,7 +79,7 @@ class LagrangeMultiplierManager:
         )
 
         for i, (old, new) in enumerate(
-            zip(self._multipliers.tolist(), new_multipliers.tolist())
+            zip(self._multipliers.tolist(), new_multipliers.tolist(), strict=False)
         ):
             if abs(old - new) > 1e-6:
                 logger.debug(

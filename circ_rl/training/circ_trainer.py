@@ -7,8 +7,8 @@ complexity regularization, and Lagrangian constraint enforcement.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -16,15 +16,19 @@ import torch.nn as nn
 from loguru import logger
 
 from circ_rl.constraints.const_lagrange import LagrangeMultiplierManager
-from circ_rl.constraints.const_set import ConstraintSet
-from circ_rl.environments.env_family import EnvironmentFamily
 from circ_rl.invariance.inv_irm_penalty import IRMPenalty
 from circ_rl.invariance.inv_worst_case import WorstCaseOptimizer
-from circ_rl.policy.causal_policy import CausalPolicy
 from circ_rl.regularization.reg_composite import CompositeRegularizer
 from circ_rl.training.rollout import RolloutWorker
-from circ_rl.training.trajectory_buffer import MultiEnvTrajectoryBuffer
-from circ_rl.utils.logging import MetricsLogger
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from circ_rl.constraints.const_set import ConstraintSet
+    from circ_rl.environments.env_family import EnvironmentFamily
+    from circ_rl.policy.causal_policy import CausalPolicy
+    from circ_rl.training.trajectory_buffer import MultiEnvTrajectoryBuffer
+    from circ_rl.utils.logging import MetricsLogger
 
 
 @dataclass
@@ -44,6 +48,8 @@ class TrainingConfig:
     :param worst_case_variance_weight: Weight for variance penalty.
     :param entropy_coef: Entropy bonus coefficient for exploration.
     :param lagrange_lr: Learning rate for Lagrange multiplier updates.
+    :param dynamics_aux_weight: Weight for the auxiliary dynamics prediction
+        loss. Only used when the policy has dynamics normalization enabled.
     """
 
     n_iterations: int = 100
@@ -59,6 +65,7 @@ class TrainingConfig:
     worst_case_variance_weight: float = 0.1
     entropy_coef: float = 0.0
     lagrange_lr: float = 0.01
+    dynamics_aux_weight: float = 1.0
 
 
 @dataclass
@@ -106,6 +113,9 @@ class CIRCTrainer:
     :param config: Training configuration.
     :param constraint_set: Optional constraint set.
     :param metrics_logger: Optional metrics logger.
+    :param dynamics_scales: Per-environment dynamics scales from
+        ``TransitionAnalyzer``. Maps ``env_idx -> D_e``. Required
+        when the policy uses dynamics normalization.
     """
 
     def __init__(
@@ -117,9 +127,11 @@ class CIRCTrainer:
         metrics_logger: MetricsLogger | None = None,
         n_rollout_workers: int = 1,
         env_param_names: list[str] | None = None,
+        dynamics_scales: dict[int, float] | None = None,
     ) -> None:
         self._policy = policy
         self._env_family = env_family
+        self._dynamics_scales = dynamics_scales
         self._config = config
         self._logger = metrics_logger
 
@@ -337,6 +349,28 @@ class CIRCTrainer:
                     )
                     constraint_penalty = self._lagrange.compute_lagrangian_penalty(costs)
 
+                # Auxiliary dynamics prediction loss
+                dynamics_aux_loss = torch.tensor(0.0, device=self._device)
+                if (
+                    self._dynamics_scales is not None
+                    and self._policy._use_dynamics_norm
+                    and mb_context is not None
+                    and flat.flat_env_ids is not None
+                ):
+                    mb_env_ids = flat.flat_env_ids[mb_idx]  # (batch,) long
+                    target_scales = torch.tensor(
+                        [self._dynamics_scales[int(eid)] for eid in mb_env_ids],
+                        dtype=torch.float32,
+                        device=self._device,
+                    )  # (batch,)
+                    predicted_scale = self._policy._dynamics_predictor(
+                        mb_context
+                    ).squeeze(-1)  # (batch,)
+                    dynamics_aux_loss = (
+                        self._config.dynamics_aux_weight
+                        * nn.functional.mse_loss(predicted_scale, target_scales)
+                    )
+
                 # Entropy bonus for exploration
                 entropy_loss = -self._config.entropy_coef * output.entropy.mean()
 
@@ -348,6 +382,7 @@ class CIRCTrainer:
                     + 0.1 * wc_loss
                     + reg_loss
                     + constraint_penalty
+                    + dynamics_aux_loss
                 )
 
                 # Value loss (separate to avoid gradient scale mismatch)
