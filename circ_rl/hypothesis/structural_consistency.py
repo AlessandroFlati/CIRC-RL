@@ -31,6 +31,8 @@ class StructuralConsistencyResult:
     :param p_value: The p-value of the F-test.
     :param per_env_mse: Per-environment mean squared error.
     :param pooled_mse: MSE from the pooled (hypothesis-constrained) model.
+    :param relative_improvement: Relative MSE improvement from per-env
+        calibration. Values near 0 indicate the functional form is correct.
     """
 
     passed: bool
@@ -38,6 +40,7 @@ class StructuralConsistencyResult:
     p_value: float
     per_env_mse: dict[int, float]
     pooled_mse: float
+    relative_improvement: float = 0.0
 
 
 class StructuralConsistencyTest:
@@ -52,14 +55,25 @@ class StructuralConsistencyTest:
 
     :param p_threshold: Falsification threshold. If the F-test p-value is
         below this threshold, the hypothesis is falsified. Default 0.01.
+    :param min_relative_improvement: Practical significance threshold.
+        If per-env calibration reduces MSE by less than this fraction
+        relative to pooled MSE, the hypothesis passes regardless of
+        p-value. This prevents falsifying expressions with the correct
+        functional form but slightly imprecise numerical coefficients
+        when sample sizes are large. Default 0.01 (1%).
     """
 
-    def __init__(self, p_threshold: float = 0.01) -> None:
+    def __init__(
+        self,
+        p_threshold: float = 0.01,
+        min_relative_improvement: float = 0.01,
+    ) -> None:
         if p_threshold <= 0 or p_threshold >= 1:
             raise ValueError(
                 f"p_threshold must be in (0, 1), got {p_threshold}"
             )
         self._p_threshold = p_threshold
+        self._min_relative_improvement = min_relative_improvement
 
     def test(
         self,
@@ -111,10 +125,14 @@ class StructuralConsistencyTest:
         # Build feature matrix
         x = self._build_features(dataset, variable_names)  # (N, n_vars)
 
-        # Pooled model: evaluate hypothesis on all data
+        n_total = len(targets)
+
+        # Evaluate hypothesis on all data to get h(x) feature
         try:
             func = expression.to_callable(variable_names)
-            y_pred_pooled = func(x)  # (N,)
+            h_x = np.asarray(func(x), dtype=np.float64).ravel()  # (N,)
+            if h_x.shape[0] == 1:
+                h_x = np.broadcast_to(h_x, (n_total,)).copy()
         except (ValueError, Exception) as exc:
             logger.warning(
                 "Failed to evaluate expression: {}", exc,
@@ -124,30 +142,42 @@ class StructuralConsistencyTest:
                 per_env_mse={}, pooled_mse=float("inf"),
             )
 
+        # Pooled model: y = alpha * h(x) + beta (calibrated across all envs)
+        # This allows PySR's numerical coefficients to be rescaled,
+        # testing the FUNCTIONAL FORM rather than exact coefficients.
+        design_pooled = np.column_stack(
+            [np.ones(n_total), h_x],
+        )  # (N, 2)
+        beta_pooled = np.linalg.lstsq(
+            design_pooled, targets, rcond=None,
+        )[0]
+        y_pred_pooled = design_pooled @ beta_pooled  # (N,)
         ss_pooled = float(np.sum((targets - y_pred_pooled) ** 2))
-        n_total = len(targets)
+        n_pooled_params = 2  # alpha + beta
 
-        # Per-environment: independent linear regression on each env
+        # Per-environment: y = alpha_e * h(x) + beta_e (per-env calibration)
         ss_per_env = 0.0
         per_env_mse: dict[int, float] = {}
         total_per_env_params = 0
 
         for env_id in unique_envs:
             mask = dataset.env_ids == env_id
-            x_env = x[mask]  # (n_e, n_vars)
+            h_env = h_x[mask]  # (n_e,)
             y_env = targets[mask]  # (n_e,)
             n_e = int(mask.sum())
 
-            # Fit independent linear model per env
-            design = np.column_stack([np.ones(n_e), x_env])  # (n_e, 1 + n_vars)
-            n_params = design.shape[1]
+            # Fit calibrated model per env: y = alpha_e * h(x) + beta_e
+            design_env = np.column_stack(
+                [np.ones(n_e), h_env],
+            )  # (n_e, 2)
+            n_params = 2
 
             if n_e <= n_params:
                 per_env_mse[env_id] = 0.0
                 continue
 
-            beta = np.linalg.lstsq(design, y_env, rcond=None)[0]
-            y_pred_env = design @ beta
+            beta_env = np.linalg.lstsq(design_env, y_env, rcond=None)[0]
+            y_pred_env = design_env @ beta_env
             ss_env = float(np.sum((y_env - y_pred_env) ** 2))
             ss_per_env += ss_env
             per_env_mse[env_id] = ss_env / n_e
@@ -155,9 +185,10 @@ class StructuralConsistencyTest:
 
         pooled_mse = ss_pooled / n_total if n_total > 0 else 0.0
 
-        # F-test: (SS_pooled - SS_per_env) / extra_params
-        #         vs. SS_per_env / (N - total_per_env_params)
-        n_pooled_params = len(variable_names) + 1  # intercept + features
+        # F-test: does the per-env calibration explain significantly
+        # more variance than the pooled calibration?
+        # H0: one (alpha, beta) is sufficient for all envs.
+        # H1: each env needs its own (alpha_e, beta_e).
         extra_params = total_per_env_params - n_pooled_params
         denom_df = n_total - total_per_env_params
 
@@ -172,11 +203,26 @@ class StructuralConsistencyTest:
         )
         p_value = 1.0 - float(stats.f.cdf(f_stat, extra_params, denom_df))
 
-        passed = p_value >= self._p_threshold
+        # Practical significance: relative MSE improvement from per-env
+        # calibration. If negligible, the functional form is correct even
+        # if the F-test is significant (large-sample power issue).
+        relative_improvement = (
+            (ss_pooled - ss_per_env) / ss_pooled if ss_pooled > 0 else 0.0
+        )
+
+        statistically_significant = p_value < self._p_threshold
+        practically_significant = (
+            relative_improvement >= self._min_relative_improvement
+        )
+
+        # Pass if: not statistically significant, OR statistically
+        # significant but not practically significant (tiny effect).
+        passed = not statistically_significant or not practically_significant
 
         logger.debug(
-            "Structural consistency: F={:.4f}, p={:.6f}, passed={}",
-            f_stat, p_value, passed,
+            "Structural consistency: F={:.4f}, p={:.6f}, "
+            "rel_improvement={:.6f}, passed={}",
+            f_stat, p_value, relative_improvement, passed,
         )
 
         return StructuralConsistencyResult(
@@ -185,6 +231,7 @@ class StructuralConsistencyTest:
             p_value=p_value,
             per_env_mse=per_env_mse,
             pooled_mse=pooled_mse,
+            relative_improvement=relative_improvement,
         )
 
     @staticmethod

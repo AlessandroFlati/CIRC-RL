@@ -11,7 +11,7 @@ Hypothesis Generation).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -34,6 +34,17 @@ class SymbolicRegressionConfig:
     :param timeout_seconds: Maximum wall-clock time for the search.
     :param deterministic: If True, use fixed random state for reproducibility.
     :param random_state: Random seed (used only when deterministic=True).
+    :param nested_constraints: Controls operator nesting depth.
+        E.g., ``{"/": {"+": 0, "-": 0}}`` prevents addition/subtraction
+        inside division, forcing separate additive terms instead of
+        factored forms.
+    :param complexity_of_operators: Custom complexity per operator.
+        E.g., ``{"square": 1, "sin": 2}`` makes ``square`` cheap.
+    :param constraints: Max subtree size per operator argument.
+        E.g., ``{"sin": 10}`` limits what appears inside ``sin``.
+    :param max_samples: Maximum number of samples to use for regression.
+        If the input data has more rows than this, a random subset is
+        selected (seeded by ``random_state``). None means no subsampling.
     """
 
     max_complexity: int = 30
@@ -45,6 +56,10 @@ class SymbolicRegressionConfig:
     timeout_seconds: int = 300
     deterministic: bool = True
     random_state: int = 42
+    nested_constraints: dict[str, dict[str, int]] | None = None
+    complexity_of_operators: dict[str, int | float] | None = None
+    constraints: dict[str, int | tuple[int, int]] | None = None
+    max_samples: int | None = None
 
 
 class SymbolicRegressor:
@@ -101,9 +116,23 @@ class SymbolicRegressor:
                 "Install with: pip install 'circ-rl[symbolic]'"
             ) from exc
 
+        import numpy as np_local
         import sympy
 
         cfg = self._config
+
+        # Subsample if requested and data is large
+        if cfg.max_samples is not None and x.shape[0] > cfg.max_samples:
+            n_original = x.shape[0]
+            rng = np_local.random.default_rng(cfg.random_state)
+            idx = rng.choice(n_original, cfg.max_samples, replace=False)
+            x = x[idx]
+            y = y[idx]
+            logger.info(
+                "Subsampled from {} to {} samples",
+                n_original,
+                cfg.max_samples,
+            )
 
         logger.info(
             "Starting symbolic regression: {} samples, {} features, "
@@ -113,6 +142,14 @@ class SymbolicRegressor:
             cfg.max_complexity,
             cfg.n_iterations,
         )
+
+        extra_kwargs: dict[str, Any] = {}
+        if cfg.nested_constraints is not None:
+            extra_kwargs["nested_constraints"] = cfg.nested_constraints
+        if cfg.complexity_of_operators is not None:
+            extra_kwargs["complexity_of_operators"] = cfg.complexity_of_operators
+        if cfg.constraints is not None:
+            extra_kwargs["constraints"] = cfg.constraints
 
         model = PySRRegressor(
             niterations=cfg.n_iterations,
@@ -127,6 +164,7 @@ class SymbolicRegressor:
             procs=0 if cfg.deterministic else 1,
             multithreading=not cfg.deterministic,
             verbosity=0,
+            **extra_kwargs,
         )
 
         model.fit(x, y, variable_names=variable_names)

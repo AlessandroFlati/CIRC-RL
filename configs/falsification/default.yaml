@@ -1,4 +1,5 @@
 structural_p_threshold: 0.01
+structural_min_relative_improvement: 0.01
 ood_confidence: 0.99
 ood_failure_fraction: 0.2
 trajectory_failure_fraction: 0.2

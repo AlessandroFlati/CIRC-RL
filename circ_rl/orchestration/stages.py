@@ -27,6 +27,7 @@ from circ_rl.orchestration.pipeline import PipelineStage, hash_config
 if TYPE_CHECKING:
     from circ_rl.environments.env_family import EnvironmentFamily
     from circ_rl.hypothesis.expression import SymbolicExpression
+    from circ_rl.hypothesis.symbolic_regressor import SymbolicRegressionConfig
 
 
 class CausalDiscoveryStage(PipelineStage):
@@ -282,11 +283,18 @@ class HypothesisGenerationStage(PipelineStage):
     See ``CIRC-RL_Framework.md`` Section 3.4.
 
     :param include_env_params: Include env params as SR features.
+    :param sr_config: Symbolic regression config for dynamics hypotheses.
+        If None, uses SymbolicRegressionConfig defaults.
+    :param reward_sr_config: Symbolic regression config for reward
+        hypotheses. If None, uses ``sr_config`` (or defaults if both
+        are None).
     """
 
     def __init__(
         self,
         include_env_params: bool = True,
+        sr_config: SymbolicRegressionConfig | None = None,
+        reward_sr_config: SymbolicRegressionConfig | None = None,
     ) -> None:
         super().__init__(
             name="hypothesis_generation",
@@ -297,6 +305,8 @@ class HypothesisGenerationStage(PipelineStage):
             ],
         )
         self._include_env_params = include_env_params
+        self._sr_config = sr_config
+        self._reward_sr_config = reward_sr_config or sr_config
 
     def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Generate dynamics and reward hypotheses.
@@ -347,6 +357,7 @@ class HypothesisGenerationStage(PipelineStage):
 
         # Dynamics hypotheses
         dyn_gen = DynamicsHypothesisGenerator(
+            sr_config=self._sr_config,
             include_env_params=self._include_env_params,
         )
         dyn_ids = dyn_gen.generate(
@@ -361,7 +372,7 @@ class HypothesisGenerationStage(PipelineStage):
         reward_is_invariant = (
             validation_result.is_invariant if validation_result else True
         )
-        reward_gen = RewardHypothesisGenerator()
+        reward_gen = RewardHypothesisGenerator(sr_config=self._reward_sr_config)
         reward_ids = reward_gen.generate(
             dataset=dataset,
             feature_selection_result=fs_result,
@@ -399,8 +410,20 @@ class HypothesisGenerationStage(PipelineStage):
         }
 
     def config_hash(self) -> str:
+        from dataclasses import asdict
+
+        sr_dict = (
+            asdict(self._sr_config) if self._sr_config else None
+        )
+        reward_sr_dict = (
+            asdict(self._reward_sr_config)
+            if self._reward_sr_config
+            else None
+        )
         return hash_config({
             "include_env_params": self._include_env_params,
+            "sr_config": sr_dict,
+            "reward_sr_config": reward_sr_dict,
         })
 
 
@@ -413,6 +436,8 @@ class HypothesisFalsificationStage(PipelineStage):
     See ``CIRC-RL_Framework.md`` Section 3.5.
 
     :param structural_p_threshold: p-value for structural consistency.
+    :param structural_min_relative_improvement: Practical significance
+        threshold for structural consistency. Default 0.01 (1%).
     :param ood_confidence: OOD confidence interval level.
     :param held_out_fraction: Fraction of envs held out for OOD test.
     """
@@ -420,6 +445,7 @@ class HypothesisFalsificationStage(PipelineStage):
     def __init__(
         self,
         structural_p_threshold: float = 0.01,
+        structural_min_relative_improvement: float = 0.01,
         ood_confidence: float = 0.99,
         held_out_fraction: float = 0.2,
     ) -> None:
@@ -428,6 +454,7 @@ class HypothesisFalsificationStage(PipelineStage):
             dependencies=["hypothesis_generation", "causal_discovery"],
         )
         self._structural_p = structural_p_threshold
+        self._structural_min_ri = structural_min_relative_improvement
         self._ood_confidence = ood_confidence
         self._held_out_fraction = held_out_fraction
 
@@ -452,6 +479,7 @@ class HypothesisFalsificationStage(PipelineStage):
 
         config = FalsificationConfig(
             structural_p_threshold=self._structural_p,
+            structural_min_relative_improvement=self._structural_min_ri,
             ood_confidence=self._ood_confidence,
             held_out_fraction=self._held_out_fraction,
         )
@@ -496,6 +524,7 @@ class HypothesisFalsificationStage(PipelineStage):
     def config_hash(self) -> str:
         return hash_config({
             "structural_p": self._structural_p,
+            "structural_min_ri": self._structural_min_ri,
             "ood_confidence": self._ood_confidence,
             "held_out_fraction": self._held_out_fraction,
         })

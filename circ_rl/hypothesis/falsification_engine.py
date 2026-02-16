@@ -48,6 +48,11 @@ class FalsificationConfig:
         Default 0.5.
     :param n_test_trajectories: Number of test trajectories per environment.
         Default 20.
+    :param structural_min_relative_improvement: Practical significance
+        threshold for the structural consistency test. If per-env
+        calibration reduces MSE by less than this fraction relative to
+        pooled MSE, the hypothesis passes regardless of p-value.
+        Default 0.01 (1%).
     """
 
     structural_p_threshold: float = 0.01
@@ -58,6 +63,7 @@ class FalsificationConfig:
     trajectory_horizon: int = 50
     trajectory_divergence_factor: float = 0.5
     n_test_trajectories: int = 20
+    structural_min_relative_improvement: float = 0.01
 
 
 @dataclass(frozen=True)
@@ -129,6 +135,7 @@ class FalsificationEngine:
 
         structural_test = StructuralConsistencyTest(
             p_threshold=cfg.structural_p_threshold,
+            min_relative_improvement=cfg.structural_min_relative_improvement,
         )
         ood_test = OODPredictionTest(
             confidence=cfg.ood_confidence,

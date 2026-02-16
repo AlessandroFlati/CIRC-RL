@@ -1,8 +1,18 @@
 include_env_params: true
 
 symbolic_regression:
-  n_equations: 10
-  max_complexity: 20
-  timeout_seconds: 300
+  max_complexity: 30
+  n_iterations: 80
+  populations: 25
   binary_operators: ["+", "-", "*", "/"]
-  unary_operators: ["sin", "cos", "exp", "sqrt", "abs"]
+  unary_operators: ["square"]
+  parsimony: 0.0005
+  timeout_seconds: 600
+  deterministic: true
+  random_state: 42
+  nested_constraints:
+    "*": {"+": 0, "-": 0}
+    "/": {"+": 0, "-": 0}
+  complexity_of_operators:
+    square: 1
+  max_samples: 10000
