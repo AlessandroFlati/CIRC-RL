@@ -337,7 +337,8 @@ def main() -> None:
     diag_result = diag_output["diagnostic_result"]
     recommended = diag_output["recommended_action"]
 
-    print(f"\n  Premise test:    passed={diag_result.premise_result.passed}")
+    print(f"\n  Premise test:    passed={diag_result.premise_result.passed}"
+          f" (R2={diag_result.premise_result.overall_r2:.4f})")
     if diag_result.derivation_result:
         print(
             f"  Derivation test: passed={diag_result.derivation_result.passed}, "

@@ -600,10 +600,22 @@ class AnalyticPolicyDerivationStage(PipelineStage):
         )
         solver_type = "lqr" if all_linear else "mpc"
 
+        # Warn about missing dynamics dimensions
+        missing_dims = set(range(state_dim)) - set(dynamics_expressions.keys())
+        if missing_dims:
+            missing_names = [state_names[d] for d in sorted(missing_dims)]
+            logger.warning(
+                "Analytic policy: no validated dynamics for dimensions {} "
+                "({}). These will use identity dynamics (delta=0).",
+                sorted(missing_dims),
+                missing_names,
+            )
+
         logger.info(
-            "Analytic policy: solver={}, {} dynamics dimensions",
+            "Analytic policy: solver={}, {}/{} dynamics dimensions covered",
             solver_type,
             len(dynamics_expressions),
+            state_dim,
         )
 
         explained_variance = 0.0
@@ -936,6 +948,8 @@ class DiagnosticValidationStage(PipelineStage):
 
         :returns: Dict with keys: diagnostic_result, recommended_action.
         """
+        import gymnasium as gym
+
         from circ_rl.diagnostics.diagnostic_suite import DiagnosticSuite
 
         apd_output = inputs["analytic_policy_derivation"]
@@ -948,10 +962,84 @@ class DiagnosticValidationStage(PipelineStage):
         dataset = cd_output["dataset"]
         state_names = cd_output["state_names"]
         variable_names = hf_output["variable_names"]
+        best_reward = hf_output["best_reward"]
+
+        # Derive action_names from environment
+        action_space = self._env_family.action_space
+        if isinstance(action_space, gym.spaces.Box):
+            action_dim = int(action_space.shape[0])
+            action_names = (
+                ["action"] if action_dim == 1
+                else [f"action_{i}" for i in range(action_dim)]
+            )
+        else:
+            action_names = ["action"]
+
+        # Check for missing dynamics dimensions -- an incomplete dynamics
+        # model means the premise is fundamentally violated; short-circuit
+        # to RICHER_DYNAMICS without running the full diagnostic suite
+        state_dim = len(state_names)
+        covered_dims = set(dynamics_expressions.keys())
+        all_dims = set(range(state_dim))
+        missing_dims = all_dims - covered_dims
+
+        if missing_dims:
+            from circ_rl.diagnostics.diagnostic_suite import (
+                DiagnosticResult,
+                RecommendedAction,
+            )
+            from circ_rl.diagnostics.premise_test import PremiseTestResult
+
+            missing_names = [state_names[d] for d in sorted(missing_dims)]
+            logger.warning(
+                "Dynamics model is INCOMPLETE: no validated hypotheses for "
+                "dimensions {} ({}). Skipping full diagnostics -- "
+                "recommendation: richer dynamics.",
+                sorted(missing_dims),
+                missing_names,
+            )
+
+            # Build a synthetic premise failure result
+            premise_fail = PremiseTestResult(
+                passed=False,
+                per_env_r2={},
+                overall_r2=0.0,
+                per_env_rmse={},
+            )
+            result = DiagnosticResult(
+                premise_result=premise_fail,
+                derivation_result=None,
+                conclusion_result=None,
+                recommended_action=RecommendedAction.RICHER_DYNAMICS,
+            )
+
+            logger.info(
+                "Diagnostic validation: recommended_action={}",
+                result.recommended_action.value,
+            )
+
+            return {
+                "diagnostic_result": result,
+                "recommended_action": result.recommended_action,
+            }
 
         # Use a subset of envs as test envs
         n_envs = self._env_family.n_envs
         test_env_ids = list(range(n_envs))
+
+        # Compute predicted returns by simulating the policy through
+        # the learned dynamics + reward models from real initial states
+        predicted_returns = _compute_predicted_returns(
+            analytic_policy=analytic_policy,
+            dynamics_expressions=dynamics_expressions,
+            reward_expression=(
+                best_reward.expression if best_reward is not None else None
+            ),
+            state_names=state_names,
+            action_names=action_names,
+            env_family=self._env_family,
+            test_env_ids=test_env_ids,
+        )
 
         suite = DiagnosticSuite(
             premise_r2_threshold=self._premise_r2,
@@ -966,7 +1054,7 @@ class DiagnosticValidationStage(PipelineStage):
             state_feature_names=state_names,
             variable_names=variable_names,
             env_family=self._env_family,
-            predicted_returns={},
+            predicted_returns=predicted_returns,
             test_env_ids=test_env_ids,
         )
 
@@ -1186,6 +1274,99 @@ def _build_reward_fn(
         return float(fn(x)[0])
 
     return reward_fn
+
+
+def _compute_predicted_returns(
+    analytic_policy: Any,
+    dynamics_expressions: dict[int, SymbolicExpression],
+    reward_expression: SymbolicExpression | None,
+    state_names: list[str],
+    action_names: list[str],
+    env_family: EnvironmentFamily,
+    test_env_ids: list[int],
+    n_episodes: int = 5,
+    max_steps: int = 200,
+) -> dict[int, float]:
+    """Compute predicted returns by simulating the policy in the learned model.
+
+    For each test environment, runs episodes using the analytic policy with
+    the learned dynamics and reward models, starting from real initial states
+    (obtained by resetting the actual environment). The total undiscounted
+    return per episode is averaged across episodes.
+
+    :param analytic_policy: The analytic policy (LQR or MPC).
+    :param dynamics_expressions: Per-dim symbolic dynamics expressions.
+    :param reward_expression: Reward symbolic expression (or None).
+    :param state_names: State feature names.
+    :param action_names: Action feature names.
+    :param env_family: Environment family.
+    :param test_env_ids: Environment IDs to simulate.
+    :param n_episodes: Number of episodes per environment.
+    :param max_steps: Maximum steps per episode.
+    :returns: Dict mapping env_id -> mean predicted return.
+    """
+    state_dim = len(state_names)
+    predicted: dict[int, float] = {}
+
+    for env_id in test_env_ids:
+        env_params = env_family.get_env_params(env_id)
+
+        dynamics_fn = _build_dynamics_fn(
+            dynamics_expressions, state_names, action_names,
+            state_dim, env_params,
+        )
+
+        reward_fn = None
+        if reward_expression is not None:
+            reward_fn = _build_reward_fn(
+                reward_expression, state_names, action_names, env_params,
+            )
+
+        env = env_family.make_env(env_id)
+        episode_returns: list[float] = []
+
+        for ep in range(n_episodes):
+            # Use same seed pattern as ConclusionTest for matched comparisons
+            obs, _ = env.reset(seed=env_id * 100 + ep)
+            state = np.asarray(obs, dtype=np.float64)
+            total_reward = 0.0
+
+            for _ in range(max_steps):
+                action = analytic_policy.get_action(
+                    np.asarray(state, dtype=np.float32), env_id,
+                )
+
+                # Predicted reward from the reward model
+                if reward_fn is not None:
+                    r = reward_fn(state, action)
+                else:
+                    r = 0.0
+                total_reward += r
+
+                # Predicted next state from the dynamics model
+                next_state = dynamics_fn(state, action)
+
+                # Safety: clamp to prevent divergence
+                if not np.all(np.isfinite(next_state)):
+                    logger.warning(
+                        "Predicted state diverged at env={}, step; "
+                        "terminating episode early",
+                        env_id,
+                    )
+                    break
+                state = next_state
+
+            episode_returns.append(total_reward)
+
+        env.close()
+        predicted[env_id] = float(np.mean(episode_returns))
+
+        logger.debug(
+            "Predicted return for env {}: {:.2f} (over {} episodes)",
+            env_id, predicted[env_id], n_episodes,
+        )
+
+    return predicted
 
 
 class _MPCAnalyticPolicy:

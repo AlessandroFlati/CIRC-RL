@@ -273,12 +273,18 @@ def main() -> None:
     print(f"  Best per target: {hf_result.best_per_target}")
 
     if best_dynamics:
-        print("\n  --- Best Validated Dynamics ---")
+        covered_targets = set(best_dynamics.keys())
+        all_targets = {f"delta_{s}" for s in state_names}
+        missing = all_targets - covered_targets
+        print(f"\n  --- Best Validated Dynamics ({len(covered_targets)}/{len(all_targets)} dims) ---")
         for target, entry in best_dynamics.items():
             print(
                 f"  [{target}] {entry.expression.expression_str}"
                 f"  (R2={entry.training_r2:.4f}, MDL={entry.mdl_score:.2f})"
             )
+        if missing:
+            print(f"\n  WARNING: No validated hypothesis for: {sorted(missing)}")
+            print("  These dimensions will use identity dynamics (delta=0).")
     else:
         print("\n  WARNING: No validated dynamics hypotheses!")
         print("  This likely means all expressions were falsified.")
@@ -372,7 +378,8 @@ def main() -> None:
     diag_result = diag_output["diagnostic_result"]
     recommended = diag_output["recommended_action"]
 
-    print(f"\n  Premise test:    passed={diag_result.premise_result.passed}")
+    print(f"\n  Premise test:    passed={diag_result.premise_result.passed}"
+          f" (R2={diag_result.premise_result.overall_r2:.4f})")
     if diag_result.derivation_result:
         print(
             f"  Derivation test: passed="
