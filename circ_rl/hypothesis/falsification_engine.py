@@ -25,6 +25,8 @@ from circ_rl.hypothesis.structural_consistency import StructuralConsistencyTest
 from circ_rl.hypothesis.trajectory_prediction import TrajectoryPredictionTest
 
 if TYPE_CHECKING:
+    import numpy as np
+
     from circ_rl.environments.data_collector import ExploratoryDataset
 
 
@@ -112,6 +114,7 @@ class FalsificationEngine:
         dataset: ExploratoryDataset,
         state_feature_names: list[str],
         variable_names: list[str],
+        derived_columns: dict[str, np.ndarray] | None = None,
     ) -> FalsificationResult:
         """Run falsification on all untested hypotheses.
 
@@ -170,6 +173,7 @@ class FalsificationEngine:
             # Test 1: Structural consistency
             struct_result = structural_test.test(
                 expr, dataset, target_dim_idx, variable_names,
+                derived_columns=derived_columns,
             )
             if not struct_result.passed:
                 register.update_status(
@@ -185,6 +189,7 @@ class FalsificationEngine:
             # Test 2: OOD prediction
             ood_result = ood_test.test(
                 expr, dataset, target_dim_idx, variable_names,
+                derived_columns=derived_columns,
             )
             if not ood_result.passed:
                 register.update_status(
@@ -222,6 +227,7 @@ class FalsificationEngine:
             # Score with MDL
             mdl_score = mdl_scorer.score(
                 expr, dataset, target_dim_idx, variable_names,
+                derived_columns=derived_columns,
             )
             register.set_mdl_score(entry.hypothesis_id, mdl_score.total)
 

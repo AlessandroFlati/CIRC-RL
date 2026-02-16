@@ -63,6 +63,7 @@ class RewardHypothesisGenerator:
         register: HypothesisRegister,
         reward_is_invariant: bool,
         env_param_names: list[str] | None = None,
+        derived_columns: dict[str, np.ndarray] | None = None,
     ) -> list[str]:
         """Generate reward hypotheses.
 
@@ -74,6 +75,8 @@ class RewardHypothesisGenerator:
             to be invariant in Phase 2.
         :param env_param_names: Names of environment parameters (raw, not
             ``ep_``-prefixed). Used only when reward is not invariant.
+        :param derived_columns: Pre-computed derived feature arrays
+            (name -> (N,) array) to include as additional SR features.
         :returns: List of hypothesis_ids that were registered.
         """
         logger.info(
@@ -90,6 +93,7 @@ class RewardHypothesisGenerator:
             state_feature_names,
             reward_is_invariant,
             env_param_names,
+            derived_columns,
         )
 
         logger.info(
@@ -114,6 +118,7 @@ class RewardHypothesisGenerator:
         state_feature_names: list[str],
         reward_is_invariant: bool,
         env_param_names: list[str] | None,
+        derived_columns: dict[str, np.ndarray] | None = None,
     ) -> tuple[np.ndarray, np.ndarray, list[str]]:
         """Build input/target arrays for reward symbolic regression.
 
@@ -134,6 +139,8 @@ class RewardHypothesisGenerator:
         feature_arrays = [states, actions_2d]
 
         # Include env params only if reward is NOT invariant
+        # (must come BEFORE derived features to match _build_features
+        # positional env param matching)
         if (
             not reward_is_invariant
             and env_param_names
@@ -141,6 +148,12 @@ class RewardHypothesisGenerator:
         ):
             feature_arrays.append(dataset.env_params)
             var_names.extend(env_param_names)
+
+        # Include derived features LAST (e.g., theta = atan2(s1, s0))
+        if derived_columns:
+            for name, col in derived_columns.items():
+                var_names.append(name)
+                feature_arrays.append(col[:, np.newaxis])
 
         x = np.column_stack(feature_arrays)  # (N, n_features)
         return x, y, var_names

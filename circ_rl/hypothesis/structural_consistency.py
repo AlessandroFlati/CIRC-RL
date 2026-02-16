@@ -81,6 +81,7 @@ class StructuralConsistencyTest:
         dataset: ExploratoryDataset,
         target_dim_idx: int,
         variable_names: list[str],
+        derived_columns: dict[str, np.ndarray] | None = None,
     ) -> StructuralConsistencyResult:
         r"""Test structural consistency of a hypothesis across environments.
 
@@ -123,7 +124,9 @@ class StructuralConsistencyTest:
             targets = dataset.rewards  # (N,)
 
         # Build feature matrix
-        x = self._build_features(dataset, variable_names)  # (N, n_vars)
+        x = self._build_features(
+            dataset, variable_names, derived_columns,
+        )  # (N, n_vars)
 
         n_total = len(targets)
 
@@ -142,15 +145,36 @@ class StructuralConsistencyTest:
                 per_env_mse={}, pooled_mse=float("inf"),
             )
 
+        # Reject expressions producing non-finite values
+        if not np.all(np.isfinite(h_x)):
+            n_bad = int(np.sum(~np.isfinite(h_x)))
+            logger.warning(
+                "Expression produces {} non-finite values out of {}",
+                n_bad, n_total,
+            )
+            return StructuralConsistencyResult(
+                passed=False, f_statistic=float("inf"), p_value=0.0,
+                per_env_mse={}, pooled_mse=float("inf"),
+            )
+
         # Pooled model: y = alpha * h(x) + beta (calibrated across all envs)
         # This allows PySR's numerical coefficients to be rescaled,
         # testing the FUNCTIONAL FORM rather than exact coefficients.
         design_pooled = np.column_stack(
             [np.ones(n_total), h_x],
         )  # (N, 2)
-        beta_pooled = np.linalg.lstsq(
-            design_pooled, targets, rcond=None,
-        )[0]
+        try:
+            beta_pooled = np.linalg.lstsq(
+                design_pooled, targets, rcond=None,
+            )[0]
+        except np.linalg.LinAlgError:
+            logger.warning(
+                "Pooled lstsq failed (SVD did not converge)",
+            )
+            return StructuralConsistencyResult(
+                passed=False, f_statistic=float("inf"), p_value=0.0,
+                per_env_mse={}, pooled_mse=float("inf"),
+            )
         y_pred_pooled = design_pooled @ beta_pooled  # (N,)
         ss_pooled = float(np.sum((targets - y_pred_pooled) ** 2))
         n_pooled_params = 2  # alpha + beta
@@ -176,7 +200,13 @@ class StructuralConsistencyTest:
                 per_env_mse[env_id] = 0.0
                 continue
 
-            beta_env = np.linalg.lstsq(design_env, y_env, rcond=None)[0]
+            try:
+                beta_env = np.linalg.lstsq(
+                    design_env, y_env, rcond=None,
+                )[0]
+            except np.linalg.LinAlgError:
+                per_env_mse[env_id] = float("inf")
+                continue
             y_pred_env = design_env @ beta_env
             ss_env = float(np.sum((y_env - y_pred_env) ** 2))
             ss_per_env += ss_env
@@ -238,13 +268,16 @@ class StructuralConsistencyTest:
     def _build_features(
         dataset: ExploratoryDataset,
         variable_names: list[str],
+        derived_columns: dict[str, np.ndarray] | None = None,
     ) -> np.ndarray:
         """Build feature matrix matching variable_names from dataset.
 
-        Assembles columns from states, actions, and env_params based
-        on variable name conventions (s0..sN, action/action_0..N,
-        raw param names).
+        Assembles columns from states, actions, env_params, and
+        derived features based on variable name conventions
+        (s0..sN, action/action_0..N, raw param names, derived names).
 
+        :param derived_columns: Pre-computed derived feature arrays,
+            keyed by variable name. Each value has shape ``(N,)``.
         :returns: Array of shape ``(N, len(variable_names))``.
         """
         n = dataset.states.shape[0]
@@ -257,8 +290,11 @@ class StructuralConsistencyTest:
 
         columns: list[np.ndarray] = []
         for name in variable_names:
+            # Derived features (checked first for priority)
+            if derived_columns is not None and name in derived_columns:
+                columns.append(derived_columns[name])
             # State features: s0, s1, ...
-            if name.startswith("s") and name[1:].isdigit():
+            elif name.startswith("s") and name[1:].isdigit():
                 idx = int(name[1:])
                 columns.append(dataset.states[:, idx])
             # Action features
@@ -272,21 +308,20 @@ class StructuralConsistencyTest:
                 # Try to find as env param column
                 # env_params columns follow the order of param_names
                 # We don't have param_names here, so use positional
-                # This is a fallback -- proper matching would need param_names
+                # This is a fallback -- proper matching would need
+                # param_names
                 found = False
                 if dataset.env_params is not None:
-                    # Assume env_params columns are in alphabetical order
-                    # of param names -- match by position
                     n_ep = dataset.env_params.shape[1]
                     for _ep_idx in range(n_ep):
-                        # Heuristic: variable_names may contain raw param names
-                        # after state and action names
                         state_action_count = state_dim + action_dim
                         var_idx = variable_names.index(name)
                         if var_idx >= state_action_count:
                             ep_col = var_idx - state_action_count
                             if ep_col < n_ep:
-                                columns.append(dataset.env_params[:, ep_col])
+                                columns.append(
+                                    dataset.env_params[:, ep_col],
+                                )
                                 found = True
                                 break
                 if not found:

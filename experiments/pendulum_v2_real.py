@@ -63,23 +63,31 @@ def main() -> None:
     print("=" * 70)
 
     # -- Configuration --
-    n_envs = 5
-    n_transitions = 2000
+    # 25 envs x 5000 transitions = 125k samples; max_samples=10k for SR
+    # More envs give PySR stronger signal to discover parametric forms
+    n_envs = 25
+    n_transitions = 5000
     seed = 42
 
-    # PySR configuration: moderate budget to discover parametric forms
-    # For delta_s2 the true form is: dt*(-(g/l)*sin(theta) + torque/(m*l^2))
-    # which requires ~15 tree nodes with g, m, l as features
+    # PySR configuration: validated sum-of-products config
+    # Forces flat additive terms (no factored forms like (A+B)*C)
+    # so the calibrated Chow test can assess structural consistency.
     sr_config = SymbolicRegressionConfig(
-        max_complexity=25,
-        n_iterations=40,
-        populations=15,
+        max_complexity=30,
+        n_iterations=80,
+        populations=25,
         binary_operators=("+", "-", "*", "/"),
-        unary_operators=("sin", "cos", "square"),
-        parsimony=0.003,
-        timeout_seconds=180,
+        unary_operators=("square",),
+        parsimony=0.0005,
+        timeout_seconds=600,
         deterministic=True,
         random_state=seed,
+        nested_constraints={
+            "*": {"+": 0, "-": 0},
+            "/": {"+": 0, "-": 0},
+        },
+        complexity_of_operators={"square": 1},
+        max_samples=10000,
     )
 
     t0 = time.time()
@@ -201,7 +209,26 @@ def main() -> None:
     t_sr_dyn = time.time() - t_sr
     print(f"  Dynamics SR: {len(dyn_ids)} hypotheses in {t_sr_dyn:.1f}s")
 
-    # Reward hypotheses
+    # Reward hypotheses -- use theta = atan2(s1, s0) derived feature
+    # so PySR can discover the exact reward form:
+    #   R = -(theta^2 + 0.1*omega^2 + 0.001*torque^2)
+    from circ_rl.hypothesis.derived_features import (
+        DerivedFeatureSpec,
+        compute_derived_columns,
+    )
+
+    reward_derived_specs = [
+        DerivedFeatureSpec(
+            name="theta",
+            source_names=("s1", "s0"),
+            compute_fn=np.arctan2,
+        ),
+    ]
+    reward_derived_cols = compute_derived_columns(
+        reward_derived_specs, dataset.states, state_names,
+    )
+    print(f"  Derived features: {list(reward_derived_cols.keys())}")
+
     validation_result = cd_output.get("validation_result")
     reward_is_invariant = (
         validation_result.is_invariant if validation_result else True
@@ -216,6 +243,7 @@ def main() -> None:
         register=register,
         reward_is_invariant=reward_is_invariant,
         env_param_names=raw_env_param_names,
+        derived_columns=reward_derived_cols,
     )
     t_sr_reward = time.time() - t_sr
     print(f"  Reward SR: {len(reward_ids)} hypotheses in {t_sr_reward:.1f}s")
@@ -239,14 +267,20 @@ def main() -> None:
         else [f"action_{i}" for i in range(action_dim)]
     )
     variable_names = list(state_names) + action_names
+    # Env params BEFORE derived features (to match _build_features
+    # positional env param matching)
     if raw_env_param_names:
         variable_names.extend(raw_env_param_names)
+    # Derived features LAST
+    variable_names.extend(reward_derived_cols.keys())
 
     hg_output = {
         "register": register,
         "variable_names": variable_names,
         "state_names": state_names,
         "action_names": action_names,
+        "derived_columns": reward_derived_cols,
+        "reward_derived_features": reward_derived_specs,
     }
 
     # ====================================================================
@@ -255,6 +289,7 @@ def main() -> None:
     print("\n[6/8] Running hypothesis falsification...")
     hf_stage = HypothesisFalsificationStage(
         structural_p_threshold=0.01,
+        structural_min_relative_improvement=0.01,
         ood_confidence=0.99,
         held_out_fraction=0.2,
     )

@@ -67,6 +67,7 @@ class SymbolicMDLScorer:
         dataset: ExploratoryDataset,
         target_dim_idx: int,
         variable_names: list[str],
+        derived_columns: dict[str, np.ndarray] | None = None,
     ) -> SymbolicMDLScore:
         """Compute the MDL score of a hypothesis on data.
 
@@ -92,7 +93,9 @@ class SymbolicMDLScorer:
             StructuralConsistencyTest,
         )
 
-        x = StructuralConsistencyTest._build_features(dataset, variable_names)
+        x = StructuralConsistencyTest._build_features(
+            dataset, variable_names, derived_columns,
+        )
 
         # Evaluate hypothesis
         try:

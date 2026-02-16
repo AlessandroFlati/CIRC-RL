@@ -79,6 +79,7 @@ class OODPredictionTest:
         variable_names: list[str],
         train_env_ids: list[int] | None = None,
         held_out_env_ids: list[int] | None = None,
+        derived_columns: dict[str, np.ndarray] | None = None,
     ) -> OODPredictionResult:
         """Test OOD prediction of a hypothesis.
 
@@ -124,7 +125,7 @@ class OODPredictionTest:
         )
 
         x = StructuralConsistencyTest._build_features(
-            dataset, variable_names,
+            dataset, variable_names, derived_columns,
         )
 
         # Evaluate hypothesis on held-out envs

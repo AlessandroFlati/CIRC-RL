@@ -26,6 +26,7 @@ from circ_rl.orchestration.pipeline import PipelineStage, hash_config
 
 if TYPE_CHECKING:
     from circ_rl.environments.env_family import EnvironmentFamily
+    from circ_rl.hypothesis.derived_features import DerivedFeatureSpec
     from circ_rl.hypothesis.expression import SymbolicExpression
     from circ_rl.hypothesis.symbolic_regressor import SymbolicRegressionConfig
 
@@ -288,6 +289,10 @@ class HypothesisGenerationStage(PipelineStage):
     :param reward_sr_config: Symbolic regression config for reward
         hypotheses. If None, uses ``sr_config`` (or defaults if both
         are None).
+    :param reward_derived_features: Derived feature specs for reward SR.
+        These features are computed from state variables and included
+        as additional input columns for reward symbolic regression
+        (e.g., ``theta = atan2(s1, s0)``).
     """
 
     def __init__(
@@ -295,6 +300,7 @@ class HypothesisGenerationStage(PipelineStage):
         include_env_params: bool = True,
         sr_config: SymbolicRegressionConfig | None = None,
         reward_sr_config: SymbolicRegressionConfig | None = None,
+        reward_derived_features: list[DerivedFeatureSpec] | None = None,
     ) -> None:
         super().__init__(
             name="hypothesis_generation",
@@ -307,6 +313,7 @@ class HypothesisGenerationStage(PipelineStage):
         self._include_env_params = include_env_params
         self._sr_config = sr_config
         self._reward_sr_config = reward_sr_config or sr_config
+        self._reward_derived_features = reward_derived_features or []
 
     def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Generate dynamics and reward hypotheses.
@@ -372,6 +379,20 @@ class HypothesisGenerationStage(PipelineStage):
         reward_is_invariant = (
             validation_result.is_invariant if validation_result else True
         )
+
+        # Pre-compute derived feature columns for reward SR
+        reward_derived_cols: dict[str, np.ndarray] | None = None
+        if self._reward_derived_features:
+            from circ_rl.hypothesis.derived_features import (
+                compute_derived_columns,
+            )
+
+            reward_derived_cols = compute_derived_columns(
+                self._reward_derived_features,
+                dataset.states,
+                state_names,
+            )
+
         reward_gen = RewardHypothesisGenerator(sr_config=self._reward_sr_config)
         reward_ids = reward_gen.generate(
             dataset=dataset,
@@ -380,6 +401,7 @@ class HypothesisGenerationStage(PipelineStage):
             register=register,
             reward_is_invariant=reward_is_invariant,
             env_param_names=raw_env_param_names,
+            derived_columns=reward_derived_cols,
         )
 
         # Build variable names (shared across hypothesis evaluation)
@@ -393,8 +415,13 @@ class HypothesisGenerationStage(PipelineStage):
             else [f"action_{i}" for i in range(action_dim)]
         )
         variable_names = list(state_names) + action_names
+        # Env params BEFORE derived features (to match _build_features
+        # positional env param matching)
         if raw_env_param_names and self._include_env_params:
             variable_names.extend(raw_env_param_names)
+        # Derived features LAST
+        if reward_derived_cols:
+            variable_names.extend(reward_derived_cols.keys())
 
         logger.info(
             "Hypothesis generation complete: {} dynamics + {} reward hypotheses",
@@ -407,6 +434,8 @@ class HypothesisGenerationStage(PipelineStage):
             "variable_names": variable_names,
             "state_names": state_names,
             "action_names": action_names,
+            "derived_columns": reward_derived_cols,
+            "reward_derived_features": self._reward_derived_features,
         }
 
     def config_hash(self) -> str:
@@ -420,10 +449,14 @@ class HypothesisGenerationStage(PipelineStage):
             if self._reward_sr_config
             else None
         )
+        derived_names = [
+            spec.name for spec in self._reward_derived_features
+        ]
         return hash_config({
             "include_env_params": self._include_env_params,
             "sr_config": sr_dict,
             "reward_sr_config": reward_sr_dict,
+            "reward_derived_features": derived_names,
         })
 
 
@@ -475,6 +508,10 @@ class HypothesisFalsificationStage(PipelineStage):
         register = hg_output["register"]
         variable_names = hg_output["variable_names"]
         state_names = hg_output["state_names"]
+        derived_columns = hg_output.get("derived_columns")
+        reward_derived_features = hg_output.get(
+            "reward_derived_features", [],
+        )
         dataset = cd_output["dataset"]
 
         config = FalsificationConfig(
@@ -489,6 +526,7 @@ class HypothesisFalsificationStage(PipelineStage):
             dataset=dataset,
             state_feature_names=state_names,
             variable_names=variable_names,
+            derived_columns=derived_columns,
         )
 
         # Extract best validated hypotheses
@@ -519,6 +557,7 @@ class HypothesisFalsificationStage(PipelineStage):
             "best_reward": best_reward,
             "variable_names": variable_names,
             "state_names": state_names,
+            "reward_derived_features": reward_derived_features,
         }
 
     def config_hash(self) -> str:
@@ -578,6 +617,9 @@ class AnalyticPolicyDerivationStage(PipelineStage):
         best_dynamics = hf_output["best_dynamics"]
         best_reward = hf_output["best_reward"]
         state_names = hf_output["state_names"]
+        reward_derived_features = hf_output.get(
+            "reward_derived_features", [],
+        )
 
         if not best_dynamics:
             raise ValueError(
@@ -739,6 +781,18 @@ class AnalyticPolicyDerivationStage(PipelineStage):
             # Build per-env MPC policies
             mpc_solutions: dict[int, MPCSolver] = {}
 
+            # Get observation bounds for state clamping
+            _ref_env = self._env_family.make_env(0)
+            obs_low = np.asarray(
+                _ref_env.observation_space.low,  # type: ignore[attr-defined]
+                dtype=np.float64,
+            )
+            obs_high = np.asarray(
+                _ref_env.observation_space.high,  # type: ignore[attr-defined]
+                dtype=np.float64,
+            )
+            _ref_env.close()
+
             for env_idx in range(self._env_family.n_envs):
                 env_params = self._env_family.get_env_params(env_idx)
 
@@ -749,6 +803,8 @@ class AnalyticPolicyDerivationStage(PipelineStage):
                     action_names,
                     state_dim,
                     env_params,
+                    obs_low=obs_low,
+                    obs_high=obs_high,
                 )
 
                 # Build reward callable
@@ -759,6 +815,7 @@ class AnalyticPolicyDerivationStage(PipelineStage):
                         state_names,
                         action_names,
                         env_params,
+                        reward_derived_features,
                     )
 
                 mpc_config = MPCConfig(
@@ -992,6 +1049,9 @@ class DiagnosticValidationStage(PipelineStage):
         state_names = cd_output["state_names"]
         variable_names = hf_output["variable_names"]
         best_reward = hf_output["best_reward"]
+        reward_derived_features = hf_output.get(
+            "reward_derived_features", [],
+        )
 
         # Derive action_names from environment
         action_space = self._env_family.action_space
@@ -1068,6 +1128,7 @@ class DiagnosticValidationStage(PipelineStage):
             action_names=action_names,
             env_family=self._env_family,
             test_env_ids=test_env_ids,
+            reward_derived_features=reward_derived_features,
         )
 
         suite = DiagnosticSuite(
@@ -1239,9 +1300,13 @@ def _build_dynamics_fn(
     action_names: list[str],
     state_dim: int,
     env_params: dict[str, float] | None,
+    obs_low: np.ndarray | None = None,
+    obs_high: np.ndarray | None = None,
 ) -> Any:
     """Build a dynamics callable for MPC from symbolic expressions.
 
+    :param obs_low: Lower observation bounds (clamp output). Optional.
+    :param obs_high: Upper observation bounds (clamp output). Optional.
     :returns: Callable ``(state, action) -> next_state``.
     """
     import sympy
@@ -1270,6 +1335,9 @@ def _build_dynamics_fn(
         for dim_idx, fn in dim_fns.items():
             delta = fn(x)
             next_state[dim_idx] += float(delta[0])
+        # Clamp to observation bounds to prevent polynomial divergence
+        if obs_low is not None and obs_high is not None:
+            np.clip(next_state, obs_low, obs_high, out=next_state)
         return next_state
 
     return dynamics_fn
@@ -1280,9 +1348,12 @@ def _build_reward_fn(
     state_names: list[str],
     action_names: list[str],
     env_params: dict[str, float] | None,
+    derived_feature_specs: list[Any] | None = None,
 ) -> Any:
     """Build a reward callable for MPC from a symbolic expression.
 
+    :param derived_feature_specs: DerivedFeatureSpec list for computing
+        features from the state at runtime (e.g., theta from cos/sin).
     :returns: Callable ``(state, action) -> float``.
     """
     import sympy
@@ -1295,12 +1366,32 @@ def _build_reward_fn(
         sympy_expr = sympy_expr.subs(subs)
 
     var_names = list(state_names) + list(action_names)
+    # Add derived feature names to match the expression's variables
+    if derived_feature_specs:
+        var_names.extend(spec.name for spec in derived_feature_specs)
     compiled = _SE.from_sympy(sympy_expr)
     fn = compiled.to_callable(var_names)
 
-    def reward_fn(state: np.ndarray, action: np.ndarray) -> float:
-        x = np.concatenate([state, action]).reshape(1, -1)
-        return float(fn(x)[0])
+    if derived_feature_specs:
+        from circ_rl.hypothesis.derived_features import (
+            compute_derived_single,
+        )
+
+        def reward_fn(state: np.ndarray, action: np.ndarray) -> float:
+            derived = compute_derived_single(
+                derived_feature_specs, state, state_names,
+            )
+            derived_vals = [
+                derived[spec.name] for spec in derived_feature_specs
+            ]
+            x = np.concatenate(
+                [state, action, derived_vals],
+            ).reshape(1, -1)
+            return float(fn(x)[0])
+    else:
+        def reward_fn(state: np.ndarray, action: np.ndarray) -> float:
+            x = np.concatenate([state, action]).reshape(1, -1)
+            return float(fn(x)[0])
 
     return reward_fn
 
@@ -1315,6 +1406,7 @@ def _compute_predicted_returns(
     test_env_ids: list[int],
     n_episodes: int = 5,
     max_steps: int = 200,
+    reward_derived_features: list[Any] | None = None,
 ) -> dict[int, float]:
     """Compute predicted returns by simulating the policy in the learned model.
 
@@ -1332,6 +1424,7 @@ def _compute_predicted_returns(
     :param test_env_ids: Environment IDs to simulate.
     :param n_episodes: Number of episodes per environment.
     :param max_steps: Maximum steps per episode.
+    :param reward_derived_features: Derived feature specs for reward.
     :returns: Dict mapping env_id -> mean predicted return.
     """
     state_dim = len(state_names)
@@ -1340,18 +1433,29 @@ def _compute_predicted_returns(
     for env_id in test_env_ids:
         env_params = env_family.get_env_params(env_id)
 
+        env = env_family.make_env(env_id)
+        obs_low = np.asarray(
+            env.observation_space.low,  # type: ignore[attr-defined]
+            dtype=np.float64,
+        )
+        obs_high = np.asarray(
+            env.observation_space.high,  # type: ignore[attr-defined]
+            dtype=np.float64,
+        )
+
         dynamics_fn = _build_dynamics_fn(
             dynamics_expressions, state_names, action_names,
             state_dim, env_params,
+            obs_low=obs_low, obs_high=obs_high,
         )
 
         reward_fn = None
         if reward_expression is not None:
             reward_fn = _build_reward_fn(
-                reward_expression, state_names, action_names, env_params,
+                reward_expression, state_names, action_names,
+                env_params, reward_derived_features,
             )
 
-        env = env_family.make_env(env_id)
         episode_returns: list[float] = []
 
         for ep in range(n_episodes):
@@ -1373,9 +1477,10 @@ def _compute_predicted_returns(
                 total_reward += r
 
                 # Predicted next state from the dynamics model
+                # (clamped to obs bounds inside dynamics_fn)
                 next_state = dynamics_fn(state, action)
 
-                # Safety: clamp to prevent divergence
+                # Safety: check for non-finite values
                 if not np.all(np.isfinite(next_state)):
                     logger.warning(
                         "Predicted state diverged at env={}, step; "
