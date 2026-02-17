@@ -111,7 +111,10 @@ def main() -> None:
         p = env_family.get_env_params(i)
         logger.info(
             "Env {}: g={:.2f}, m={:.2f}, l={:.2f}",
-            i, p["g"], p["m"], p["l"],
+            i,
+            p["g"],
+            p["m"],
+            p["l"],
         )
 
     # ====================================================================
@@ -152,70 +155,28 @@ def main() -> None:
     # ====================================================================
     print("\n[4/8] Running transition analysis...")
     ta_stage = TransitionAnalysisStage()
-    ta_output = ta_stage.run({
-        "causal_discovery": cd_output,
-        "feature_selection": fs_output,
-    })
+    ta_output = ta_stage.run(
+        {
+            "causal_discovery": cd_output,
+            "feature_selection": fs_output,
+        }
+    )
     ta_result = ta_output["transition_result"]
     print(f"  Variant dims: {ta_result.variant_dims}")
     print(f"  Invariant dims: {ta_result.invariant_dims}")
-    print(
-        f"  Dynamics scales: "
-        f"{[f'{s:.4f}' for s in ta_result.dynamics_scales]}"
-    )
+    print(f"  Dynamics scales: {[f'{s:.4f}' for s in ta_result.dynamics_scales]}")
 
     # ====================================================================
     # STAGE 5: Hypothesis Generation (REAL PySR)
     # ====================================================================
     print("\n[5/8] Running symbolic regression (PySR)...")
-    print(f"  Config: max_complexity={sr_config.max_complexity}, "
-          f"n_iterations={sr_config.n_iterations}, "
-          f"timeout={sr_config.timeout_seconds}s")
-
-    # Monkey-patch the SR config into the generators
-    # The HypothesisGenerationStage uses default config; we need to
-    # customize it. We'll create the generators directly.
-    from circ_rl.hypothesis.dynamics_hypotheses import DynamicsHypothesisGenerator
-    from circ_rl.hypothesis.hypothesis_register import HypothesisRegister
-    from circ_rl.hypothesis.reward_hypotheses import RewardHypothesisGenerator
-
-    dataset = cd_output["dataset"]
-    env_param_node_names = cd_output.get("env_param_node_names", [])
-
-    from circ_rl.causal_discovery.causal_graph import CausalGraph
-
-    raw_env_param_names = None
-    if env_param_node_names:
-        raw_env_param_names = [
-            name.removeprefix(CausalGraph.ENV_PARAM_PREFIX)
-            for name in env_param_node_names
-        ]
-
-    register = HypothesisRegister()
-
-    # Dynamics hypotheses
-    dyn_gen = DynamicsHypothesisGenerator(
-        sr_config=sr_config,
-        include_env_params=True,
+    print(
+        f"  Config: max_complexity={sr_config.max_complexity}, "
+        f"n_iterations={sr_config.n_iterations}, "
+        f"timeout={sr_config.timeout_seconds}s"
     )
-    t_sr = time.time()
-    dyn_ids = dyn_gen.generate(
-        dataset=dataset,
-        transition_result=ta_result,
-        state_feature_names=state_names,
-        register=register,
-        env_param_names=raw_env_param_names,
-    )
-    t_sr_dyn = time.time() - t_sr
-    print(f"  Dynamics SR: {len(dyn_ids)} hypotheses in {t_sr_dyn:.1f}s")
 
-    # Reward hypotheses -- use theta = atan2(s1, s0) derived feature
-    # so PySR can discover the exact reward form:
-    #   R = -(theta^2 + 0.1*omega^2 + 0.001*torque^2)
-    from circ_rl.hypothesis.derived_features import (
-        DerivedFeatureSpec,
-        compute_derived_columns,
-    )
+    from circ_rl.hypothesis.derived_features import DerivedFeatureSpec
 
     reward_derived_specs = [
         DerivedFeatureSpec(
@@ -224,29 +185,25 @@ def main() -> None:
             compute_fn=np.arctan2,
         ),
     ]
-    reward_derived_cols = compute_derived_columns(
-        reward_derived_specs, dataset.states, state_names,
-    )
-    print(f"  Derived features: {list(reward_derived_cols.keys())}")
 
-    validation_result = cd_output.get("validation_result")
-    reward_is_invariant = (
-        validation_result.is_invariant if validation_result else True
-    )
-
-    reward_gen = RewardHypothesisGenerator(sr_config=sr_config)
     t_sr = time.time()
-    reward_ids = reward_gen.generate(
-        dataset=dataset,
-        feature_selection_result=fs_result,
-        state_feature_names=state_names,
-        register=register,
-        reward_is_invariant=reward_is_invariant,
-        env_param_names=raw_env_param_names,
-        derived_columns=reward_derived_cols,
+    hg_stage = HypothesisGenerationStage(
+        include_env_params=True,
+        sr_config=sr_config,
+        reward_sr_config=sr_config,
+        reward_derived_features=reward_derived_specs,
     )
-    t_sr_reward = time.time() - t_sr
-    print(f"  Reward SR: {len(reward_ids)} hypotheses in {t_sr_reward:.1f}s")
+    hg_output = hg_stage.run(
+        {
+            "causal_discovery": cd_output,
+            "feature_selection": fs_output,
+            "transition_analysis": ta_output,
+        }
+    )
+    t_sr_total = time.time() - t_sr
+
+    register = hg_output["register"]
+    print(f"  {len(register.entries)} hypotheses in {t_sr_total:.1f}s")
 
     # Print all discovered expressions
     print("\n  --- Discovered Hypotheses ---")
@@ -255,33 +212,6 @@ def main() -> None:
             f"  [{entry.target_variable}] {entry.expression.expression_str}"
             f"  (complexity={entry.complexity}, R2={entry.training_r2:.4f})"
         )
-
-    # Build variable_names for downstream stages
-    actions_2d = (
-        dataset.actions if dataset.actions.ndim == 2
-        else dataset.actions[:, np.newaxis]
-    )
-    action_dim = actions_2d.shape[1]
-    action_names = (
-        ["action"] if action_dim == 1
-        else [f"action_{i}" for i in range(action_dim)]
-    )
-    variable_names = list(state_names) + action_names
-    # Env params BEFORE derived features (to match _build_features
-    # positional env param matching)
-    if raw_env_param_names:
-        variable_names.extend(raw_env_param_names)
-    # Derived features LAST
-    variable_names.extend(reward_derived_cols.keys())
-
-    hg_output = {
-        "register": register,
-        "variable_names": variable_names,
-        "state_names": state_names,
-        "action_names": action_names,
-        "derived_columns": reward_derived_cols,
-        "reward_derived_features": reward_derived_specs,
-    }
 
     # ====================================================================
     # STAGE 6: Hypothesis Falsification
@@ -293,10 +223,12 @@ def main() -> None:
         ood_confidence=0.99,
         held_out_fraction=0.2,
     )
-    hf_output = hf_stage.run({
-        "hypothesis_generation": hg_output,
-        "causal_discovery": cd_output,
-    })
+    hf_output = hf_stage.run(
+        {
+            "hypothesis_generation": hg_output,
+            "causal_discovery": cd_output,
+        }
+    )
     hf_result = hf_output["falsification_result"]
     best_dynamics = hf_output["best_dynamics"]
     best_reward = hf_output["best_reward"]
@@ -311,7 +243,9 @@ def main() -> None:
         covered_targets = set(best_dynamics.keys())
         all_targets = {f"delta_{s}" for s in state_names}
         missing = all_targets - covered_targets
-        print(f"\n  --- Best Validated Dynamics ({len(covered_targets)}/{len(all_targets)} dims) ---")
+        n_cov = len(covered_targets)
+        n_all = len(all_targets)
+        print(f"\n  --- Best Validated Dynamics ({n_cov}/{n_all} dims) ---")
         for target, entry in best_dynamics.items():
             print(
                 f"  [{target}] {entry.expression.expression_str}"
@@ -341,10 +275,12 @@ def main() -> None:
         env_family=env_family,
         gamma=0.99,
     )
-    apd_output = apd_stage.run({
-        "hypothesis_falsification": hf_output,
-        "transition_analysis": ta_output,
-    })
+    apd_output = apd_stage.run(
+        {
+            "hypothesis_falsification": hf_output,
+            "transition_analysis": ta_output,
+        }
+    )
     analytic_policy = apd_output["analytic_policy"]
     eta2 = apd_output["explained_variance"]
     solver_type = apd_output["solver_type"]
@@ -353,16 +289,18 @@ def main() -> None:
 
     # Test: get actions for sample states
     sample_states = [
-        np.array([1.0, 0.0, 0.0], dtype=np.float32),   # upright
-        np.array([0.0, 1.0, 0.0], dtype=np.float32),    # horizontal
-        np.array([-1.0, 0.0, 0.0], dtype=np.float32),   # hanging down
+        np.array([1.0, 0.0, 0.0], dtype=np.float32),  # upright
+        np.array([0.0, 1.0, 0.0], dtype=np.float32),  # horizontal
+        np.array([-1.0, 0.0, 0.0], dtype=np.float32),  # hanging down
     ]
     for state in sample_states:
         for env_idx in [0, n_envs - 1]:
             a = analytic_policy.get_action(state, env_idx)
             logger.info(
                 "  Policy(env={}, state={}) -> action={:.4f}",
-                env_idx, state.tolist(), a[0],
+                env_idx,
+                state.tolist(),
+                a[0],
             )
 
     # ====================================================================
@@ -376,10 +314,11 @@ def main() -> None:
         skip_if_eta2_above=0.98,
         abort_if_eta2_below=0.50,
     )
-    rl_output = rl_stage.run({
-        "analytic_policy_derivation": apd_output,
-    })
-    composite = rl_output["composite_policy"]
+    rl_output = rl_stage.run(
+        {
+            "analytic_policy_derivation": apd_output,
+        }
+    )
     skipped = rl_output["skipped"]
     residual_metrics = rl_output["residual_metrics"]
     if skipped:
@@ -404,17 +343,21 @@ def main() -> None:
         derivation_divergence_threshold=2.0,
         conclusion_error_threshold=0.5,
     )
-    diag_output = diag_stage.run({
-        "analytic_policy_derivation": apd_output,
-        "residual_learning": rl_output,
-        "causal_discovery": cd_output,
-        "hypothesis_falsification": hf_output,
-    })
+    diag_output = diag_stage.run(
+        {
+            "analytic_policy_derivation": apd_output,
+            "residual_learning": rl_output,
+            "causal_discovery": cd_output,
+            "hypothesis_falsification": hf_output,
+        }
+    )
     diag_result = diag_output["diagnostic_result"]
     recommended = diag_output["recommended_action"]
 
-    print(f"\n  Premise test:    passed={diag_result.premise_result.passed}"
-          f" (R2={diag_result.premise_result.overall_r2:.4f})")
+    print(
+        f"\n  Premise test:    passed={diag_result.premise_result.passed}"
+        f" (R2={diag_result.premise_result.overall_r2:.4f})"
+    )
     if diag_result.derivation_result:
         print(
             f"  Derivation test: passed="

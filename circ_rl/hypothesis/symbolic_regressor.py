@@ -45,6 +45,12 @@ class SymbolicRegressionConfig:
     :param max_samples: Maximum number of samples to use for regression.
         If the input data has more rows than this, a random subset is
         selected (seeded by ``random_state``). None means no subsampling.
+    :param n_sr_runs: Number of SR runs with different seeds.
+        When > 1, runs PySR multiple times with seeds
+        ``random_state, random_state + 1, ...`` and merges the
+        Pareto fronts by deduplicating expression strings. This
+        combats PySR's stochasticity at the cost of wall-clock time.
+        Default 1 (single run).
     """
 
     max_complexity: int = 30
@@ -60,6 +66,7 @@ class SymbolicRegressionConfig:
     complexity_of_operators: dict[str, int | float] | None = None
     constraints: dict[str, int | tuple[int, int]] | None = None
     max_samples: int | None = None
+    n_sr_runs: int = 1
 
 
 class SymbolicRegressor:
@@ -90,6 +97,10 @@ class SymbolicRegressor:
     ) -> list[SymbolicExpression]:
         """Run symbolic regression to discover analytic expressions.
 
+        When ``n_sr_runs > 1``, runs PySR multiple times with different
+        seeds and merges the Pareto fronts, deduplicating by expression
+        string. This combats PySR's stochasticity.
+
         :param x: Input data of shape ``(n_samples, n_features)``.
         :param y: Target values of shape ``(n_samples,)``.
         :param variable_names: Names of input features (columns of x).
@@ -99,25 +110,14 @@ class SymbolicRegressor:
         :raises ValueError: If input dimensions are inconsistent.
         """
         if x.shape[0] != y.shape[0]:
-            raise ValueError(
-                f"x has {x.shape[0]} samples but y has {y.shape[0]}"
-            )
+            raise ValueError(f"x has {x.shape[0]} samples but y has {y.shape[0]}")
         if x.shape[1] != len(variable_names):
             raise ValueError(
                 f"x has {x.shape[1]} features but {len(variable_names)} "
                 f"variable names provided"
             )
 
-        try:
-            from pysr import PySRRegressor
-        except ImportError as exc:
-            raise ImportError(
-                "PySR is required for symbolic regression. "
-                "Install with: pip install 'circ-rl[symbolic]'"
-            ) from exc
-
         import numpy as np_local
-        import sympy
 
         cfg = self._config
 
@@ -134,13 +134,82 @@ class SymbolicRegressor:
                 cfg.max_samples,
             )
 
+        n_runs = max(1, cfg.n_sr_runs)
+
+        if n_runs == 1:
+            return self._single_run(x, y, variable_names, cfg.random_state)
+
+        # Multi-seed runs: merge Pareto fronts
+        all_expressions: list[SymbolicExpression] = []
+        for run_idx in range(n_runs):
+            seed = cfg.random_state + run_idx
+            logger.info(
+                "Multi-seed SR run {}/{} (seed={})",
+                run_idx + 1,
+                n_runs,
+                seed,
+            )
+            run_expressions = self._single_run(
+                x,
+                y,
+                variable_names,
+                seed,
+            )
+            all_expressions.extend(run_expressions)
+
+        # Sort by complexity and deduplicate
+        all_expressions.sort(key=lambda e: e.complexity)
+        seen: set[str] = set()
+        unique: list[SymbolicExpression] = []
+        for expr in all_expressions:
+            if expr.expression_str not in seen:
+                seen.add(expr.expression_str)
+                unique.append(expr)
+
+        logger.info(
+            "Multi-seed SR complete: {} unique expressions from {} runs",
+            len(unique),
+            n_runs,
+        )
+
+        return unique
+
+    def _single_run(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        variable_names: list[str],
+        seed: int,
+    ) -> list[SymbolicExpression]:
+        """Run a single PySR regression pass.
+
+        :param x: Input data of shape ``(n_samples, n_features)``.
+        :param y: Target values of shape ``(n_samples,)``.
+        :param variable_names: Names of input features.
+        :param seed: Random seed for this run.
+        :returns: Deduplicated Pareto front expressions, sorted by
+            complexity.
+        """
+        try:
+            from pysr import PySRRegressor
+        except ImportError as exc:
+            raise ImportError(
+                "PySR is required for symbolic regression. "
+                "Install with: pip install 'circ-rl[symbolic]'"
+            ) from exc
+
+        import sympy
+
+        cfg = self._config
+
         logger.info(
             "Starting symbolic regression: {} samples, {} features, "
-            "max_complexity={}, n_iterations={}",
+            "max_complexity={}, n_iterations={}, seed={}",
             x.shape[0],
             x.shape[1],
             cfg.max_complexity,
             cfg.n_iterations,
+            seed,
         )
 
         extra_kwargs: dict[str, Any] = {}
@@ -160,9 +229,8 @@ class SymbolicRegressor:
             parsimony=cfg.parsimony,
             timeout_in_seconds=cfg.timeout_seconds,
             deterministic=cfg.deterministic,
-            random_state=cfg.random_state if cfg.deterministic else None,
-            procs=0 if cfg.deterministic else 1,
-            multithreading=not cfg.deterministic,
+            random_state=seed if cfg.deterministic else None,
+            parallelism="serial" if cfg.deterministic else "multithreading",
             verbosity=0,
             **extra_kwargs,
         )
