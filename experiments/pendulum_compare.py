@@ -5,7 +5,7 @@ Evaluates generalization of both approaches to out-of-distribution
 physics parameters (g, m, l) on 50 test environments:
 
 - **v1 (neural)**: CausalPolicy with context conditioning, trained via PPO.
-- **v2 (analytic)**: Symbolic dynamics + MPC, derived from PySR expressions
+- **v2 (analytic)**: Symbolic dynamics + iLQR, derived from PySR expressions
   discovered on 25 training environments.
 
 Produces two 10x5 grid videos and prints comparison statistics.
@@ -29,7 +29,7 @@ import numpy as np
 import torch
 from loguru import logger
 
-from circ_rl.analytic_policy.mpc_solver import MPCConfig, MPCSolver
+from circ_rl.analytic_policy.ilqr_solver import ILQRConfig, ILQRSolver
 from circ_rl.environments.data_collector import DataCollector
 from circ_rl.environments.env_family import EnvironmentFamily
 from circ_rl.feature_selection.transition_analyzer import TransitionAnalyzer
@@ -40,6 +40,7 @@ from circ_rl.orchestration.stages import (
     FeatureSelectionStage,
     HypothesisFalsificationStage,
     HypothesisGenerationStage,
+    ObservationAnalysisStage,
     TransitionAnalysisStage,
 )
 from circ_rl.policy.causal_policy import CausalPolicy
@@ -47,7 +48,9 @@ from circ_rl.policy.causal_policy import CausalPolicy
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from circ_rl.hypothesis.expression import SymbolicExpression
     from circ_rl.hypothesis.hypothesis_register import HypothesisEntry
+    from circ_rl.orchestration.stages import _ILQRAnalyticPolicy
 
 # -- Video recording helpers (adapted from pendulum_record_50.py) --
 
@@ -210,11 +213,12 @@ def _run_v2_pipeline(
     list[str],
     list[DerivedFeatureSpec],
     dict[str, Any],
+    dict[str, Any],
 ]:
-    """Run v2 pipeline stages 1-6 on 25 training envs.
+    """Run v2 pipeline stages 1-7 on 25 training envs.
 
-    :returns: (best_dynamics, best_reward, state_names, action_names,
-        reward_derived_features, hf_output).
+    :returns: (best_dynamics, best_reward, dynamics_state_names,
+        action_names, reward_derived_features, hf_output, oa_output).
     """
     n_envs = 25
     n_transitions = 5000
@@ -246,7 +250,7 @@ def _run_v2_pipeline(
     ]
 
     # Stage 1: Environment family
-    print("\n  [v2 1/6] Creating training environment family...")
+    print("\n  [v2 1/7] Creating training environment family...")
     train_family = EnvironmentFamily.from_gymnasium(
         base_env="Pendulum-v1",
         param_distributions={
@@ -259,7 +263,7 @@ def _run_v2_pipeline(
     )
 
     # Stage 2: Causal discovery
-    print("  [v2 2/6] Running causal discovery...")
+    print("  [v2 2/7] Running causal discovery...")
     cd_stage = CausalDiscoveryStage(
         env_family=train_family,
         n_transitions_per_env=n_transitions,
@@ -274,7 +278,7 @@ def _run_v2_pipeline(
     print(f"    State names: {state_names}")
 
     # Stage 3: Feature selection
-    print("  [v2 3/6] Running feature selection...")
+    print("  [v2 3/7] Running feature selection...")
     fs_stage = FeatureSelectionStage(
         epsilon=0.15,
         min_ate=0.01,
@@ -283,7 +287,7 @@ def _run_v2_pipeline(
     fs_output = fs_stage.run({"causal_discovery": cd_output})
 
     # Stage 4: Transition analysis
-    print("  [v2 4/6] Running transition analysis...")
+    print("  [v2 4/7] Running transition analysis...")
     ta_stage = TransitionAnalysisStage()
     ta_output = ta_stage.run(
         {
@@ -292,8 +296,20 @@ def _run_v2_pipeline(
         }
     )
 
-    # Stage 5: Hypothesis generation (PySR)
-    print("  [v2 5/6] Running symbolic regression (PySR)...")
+    # Stage 5: Observation analysis (constraint detection + canonical coords)
+    print("  [v2 5/7] Running observation analysis...")
+    oa_stage = ObservationAnalysisStage()
+    oa_output = oa_stage.run({"causal_discovery": cd_output})
+    analysis_result = oa_output.get("analysis_result")
+    if analysis_result is not None:
+        print(f"    Canonical coords: {oa_output['canonical_state_names']}")
+        for c in analysis_result.constraints:
+            print(f"    Constraint: {c.constraint_type} on dims {c.involved_dims}")
+    else:
+        print("    No canonical mappings found (dynamics in obs space)")
+
+    # Stage 6: Hypothesis generation (PySR)
+    print("  [v2 6/7] Running symbolic regression (PySR)...")
     hg_stage = HypothesisGenerationStage(
         include_env_params=True,
         sr_config=sr_config,
@@ -305,14 +321,15 @@ def _run_v2_pipeline(
             "causal_discovery": cd_output,
             "feature_selection": fs_output,
             "transition_analysis": ta_output,
+            "observation_analysis": oa_output,
         }
     )
 
     register = hg_output["register"]
     print(f"    Discovered {len(register.entries)} hypotheses")
 
-    # Stage 6: Hypothesis falsification
-    print("  [v2 6/6] Running hypothesis falsification...")
+    # Stage 7: Hypothesis falsification
+    print("  [v2 7/7] Running hypothesis falsification...")
     hf_stage = HypothesisFalsificationStage(
         structural_p_threshold=0.01,
         structural_min_relative_improvement=0.01,
@@ -323,6 +340,7 @@ def _run_v2_pipeline(
         {
             "hypothesis_generation": hg_output,
             "causal_discovery": cd_output,
+            "observation_analysis": oa_output,
         }
     )
 
@@ -350,169 +368,150 @@ def _run_v2_pipeline(
         )
 
     action_names = hg_output.get("action_names", ["action"])
+    dynamics_state_names = hf_output.get("dynamics_state_names", state_names)
 
     return (
         best_dynamics,
         best_reward,
-        state_names,
+        dynamics_state_names,
         action_names,
         reward_derived_features,
         hf_output,
+        oa_output,
     )
 
 
-def _make_dynamics_closure(
-    dim_fns: dict[int, Callable[[np.ndarray], np.ndarray]],
-    obs_low: np.ndarray,
-    obs_high: np.ndarray,
-) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
-    """Create a dynamics callable that closes over per-dim functions."""
-
-    def dynamics_fn(
-        state: np.ndarray,
-        action: np.ndarray,
-    ) -> np.ndarray:
-        next_state = state.copy()
-        x = np.concatenate([state, action]).reshape(1, -1)
-        for d_idx, fn in dim_fns.items():
-            delta = fn(x)
-            next_state[d_idx] += float(delta[0])
-        np.clip(next_state, obs_low, obs_high, out=next_state)
-        return next_state
-
-    return dynamics_fn
-
-
-def _make_reward_closure_derived(
-    r_fn: Callable[[np.ndarray], np.ndarray],
-    specs: list[DerivedFeatureSpec],
-    s_names: list[str],
-) -> Callable[[np.ndarray, np.ndarray], float]:
-    """Create a reward callable with derived features."""
-    from circ_rl.hypothesis.derived_features import compute_derived_single
-
-    def reward_fn(
-        state: np.ndarray,
-        action: np.ndarray,
-    ) -> float:
-        derived = compute_derived_single(specs, state, s_names)
-        derived_vals = [derived[s.name] for s in specs]
-        x = np.concatenate(
-            [state, action, derived_vals],
-        ).reshape(1, -1)
-        return float(r_fn(x)[0])
-
-    return reward_fn
-
-
-def _make_reward_closure_simple(
-    r_fn: Callable[[np.ndarray], np.ndarray],
-) -> Callable[[np.ndarray, np.ndarray], float]:
-    """Create a simple reward callable without derived features."""
-
-    def reward_fn(
-        state: np.ndarray,
-        action: np.ndarray,
-    ) -> float:
-        x = np.concatenate([state, action]).reshape(1, -1)
-        return float(r_fn(x)[0])
-
-    return reward_fn
-
-
-def _build_v2_mpc_solvers(
+def _build_v2_ilqr_policy(
     test_family: EnvironmentFamily,
     best_dynamics: dict[str, HypothesisEntry],
     best_reward: HypothesisEntry | None,
     state_names: list[str],
     action_names: list[str],
     reward_derived_features: list[DerivedFeatureSpec],
+    oa_output: dict[str, Any] | None = None,
     gamma: float = 0.99,
     max_action: float = 2.0,
-) -> dict[int, MPCSolver]:
-    """Build per-env MPC solvers for test environments.
+) -> _ILQRAnalyticPolicy:
+    """Build a stateful iLQR policy for test environments.
 
     Substitutes each test env's (g, m, l) into the validated symbolic
-    expressions to produce parametrically adapted MPC controllers.
+    expressions to produce parametrically adapted iLQR controllers.
+
+    When canonical coordinates are available (from observation analysis),
+    iLQR plans in canonical space and obs_to_canonical_fn converts gym
+    observations before planning.
+
+    :param oa_output: Observation analysis stage output (optional).
+    :returns: An _ILQRAnalyticPolicy with get_action/reset interface.
     """
-    import sympy
-
-    from circ_rl.hypothesis.expression import SymbolicExpression
-
-    # Get observation bounds from a reference env
-    ref_env = test_family.make_env(0)
-    obs_low = np.asarray(
-        ref_env.observation_space.low,  # type: ignore[attr-defined]
-        dtype=np.float64,
+    from circ_rl.orchestration.stages import (
+        _build_dynamics_fn,
+        _build_dynamics_jacobian_fns,
+        _build_reward_fn,
+        _default_reward,
+        _ILQRAnalyticPolicy,
     )
-    obs_high = np.asarray(
-        ref_env.observation_space.high,  # type: ignore[attr-defined]
-        dtype=np.float64,
-    )
-    ref_env.close()
+
+    # Check for canonical space from observation analysis
+    analysis_result = None
+    obs_to_canonical_fn = None
+    canonical_to_obs_fn = None
+    angular_dims: tuple[int, ...] = ()
+    if oa_output is not None:
+        analysis_result = oa_output.get("analysis_result")
+        if analysis_result is not None:
+            obs_to_canonical_fn = analysis_result.obs_to_canonical_fn
+            canonical_to_obs_fn = analysis_result.canonical_to_obs_fn
+            angular_dims = analysis_result.angular_dims
+
+    # When in canonical space, don't clamp to obs bounds
+    # (canonical coords are unbounded, e.g. theta in [-pi, pi])
+    obs_low = None
+    obs_high = None
+    if analysis_result is None:
+        ref_env = test_family.make_env(0)
+        obs_low = np.asarray(
+            ref_env.observation_space.low,  # type: ignore[attr-defined]
+            dtype=np.float64,
+        )
+        obs_high = np.asarray(
+            ref_env.observation_space.high,  # type: ignore[attr-defined]
+            dtype=np.float64,
+        )
+        ref_env.close()
 
     # Parse dynamics expressions by dim index
+    state_dim = len(state_names)
     dynamics_expressions: dict[int, SymbolicExpression] = {}
     for target, entry in best_dynamics.items():
         dim_name = target.removeprefix("delta_")
         dim_idx = state_names.index(dim_name)
         dynamics_expressions[dim_idx] = entry.expression
 
-    mpc_config = MPCConfig(
-        horizon=10,
+    ilqr_config = ILQRConfig(
+        horizon=200,
         gamma=gamma,
         max_action=max_action,
     )
 
-    solvers: dict[int, MPCSolver] = {}
+    ilqr_solvers: dict[int, ILQRSolver] = {}
     for env_idx in range(test_family.n_envs):
         env_params = test_family.get_env_params(env_idx)
-        var_names = list(state_names) + list(action_names)
 
-        # Build per-dim callables with env params substituted
-        dim_fns: dict[int, Callable[[np.ndarray], np.ndarray]] = {}
-        for dim_idx, expr in dynamics_expressions.items():
-            sympy_expr = expr.sympy_expr
-            subs = {sympy.Symbol(k): v for k, v in env_params.items()}
-            sympy_expr = sympy_expr.subs(subs)
-            compiled = SymbolicExpression.from_sympy(sympy_expr)
-            dim_fns[dim_idx] = compiled.to_callable(var_names)
-
-        dynamics_fn = _make_dynamics_closure(
-            dim_fns,
-            obs_low,
-            obs_high,
+        dynamics_fn = _build_dynamics_fn(
+            dynamics_expressions,
+            state_names,
+            action_names,
+            state_dim,
+            env_params,
+            obs_low=obs_low,
+            obs_high=obs_high,
+            angular_dims=angular_dims,
         )
 
-        # Build reward callable
-        reward_fn: Callable[[np.ndarray, np.ndarray], float] | None = None
+        reward_fn = None
         if best_reward is not None:
-            r_expr = best_reward.expression.sympy_expr
-            subs = {sympy.Symbol(k): v for k, v in env_params.items()}
-            r_expr = r_expr.subs(subs)
-            r_compiled = SymbolicExpression.from_sympy(r_expr)
+            reward_fn = _build_reward_fn(
+                best_reward.expression,
+                state_names,
+                action_names,
+                env_params,
+                reward_derived_features if reward_derived_features else None,
+                canonical_to_obs_fn=canonical_to_obs_fn,
+            )
 
-            r_var_names = list(state_names) + list(action_names)
-            if reward_derived_features:
-                r_var_names.extend(spec.name for spec in reward_derived_features)
-            r_fn = r_compiled.to_callable(r_var_names)
-
-            if reward_derived_features:
-                reward_fn = _make_reward_closure_derived(
-                    r_fn,
-                    reward_derived_features,
-                    state_names,
-                )
-            else:
-                reward_fn = _make_reward_closure_simple(r_fn)
-
-        solvers[env_idx] = MPCSolver(
-            config=mpc_config,
-            dynamics_fn=dynamics_fn,
-            reward_fn=reward_fn,
+        jac_state_fn, jac_action_fn = _build_dynamics_jacobian_fns(
+            dynamics_expressions,
+            state_names,
+            action_names,
+            state_dim,
+            env_params,
+            obs_low=obs_low,
+            obs_high=obs_high,
         )
 
-    return solvers
+        ilqr_solvers[env_idx] = ILQRSolver(
+            config=ilqr_config,
+            dynamics_fn=dynamics_fn,
+            reward_fn=reward_fn or _default_reward,
+            dynamics_jac_state_fn=jac_state_fn,
+            dynamics_jac_action_fn=jac_action_fn,
+        )
+
+    first_entry = next(iter(best_dynamics.values()))
+    action_dim = 1
+
+    return _ILQRAnalyticPolicy(
+        dynamics_hypothesis=first_entry,
+        reward_hypothesis=best_reward,
+        state_dim=state_dim,
+        action_dim=action_dim,
+        n_envs=test_family.n_envs,
+        ilqr_solvers=ilqr_solvers,
+        action_low=-max_action * np.ones(action_dim),
+        action_high=max_action * np.ones(action_dim),
+        obs_to_canonical_fn=obs_to_canonical_fn,
+    )
 
 
 # -- v1 policy loader --
@@ -586,15 +585,15 @@ def main() -> None:
     n_test_envs = 50
     max_steps = 400
 
-    # v1 trained with max_torque=100, v2 with standard max_torque=2
+    # Both policies use max_torque=100 for fair comparison
     v1_max_torque = 100.0
-    v2_max_torque = 2.0
+    v2_max_torque = 100.0
 
     print("=" * 70)
     print("CIRC-RL: v1 (NEURAL) vs v2 (ANALYTIC) COMPARISON")
     print("  50 test environments with OOD physics (g, m, l)")
     print(f"  v1: CausalPolicy + PPO (max_torque={v1_max_torque})")
-    print(f"  v2: PySR + MPC (max_torque={v2_max_torque})")
+    print(f"  v2: PySR + iLQR (max_torque={v2_max_torque})")
     print("=" * 70)
 
     t0 = time.time()
@@ -622,10 +621,11 @@ def main() -> None:
     (
         best_dynamics,
         best_reward,
-        state_names,
+        dynamics_state_names,
         action_names,
         reward_derived_features,
         _hf_output,
+        oa_output,
     ) = _run_v2_pipeline(seed=42)
 
     if not best_dynamics:
@@ -633,25 +633,25 @@ def main() -> None:
         print("  Try re-running -- PySR is stochastic.")
         return
 
-    # Build MPC solvers for all 50 test envs
-    print("\n  Building MPC solvers for 50 test envs...")
-    mpc_solvers = _build_v2_mpc_solvers(
+    # Build iLQR policy for all 50 test envs
+    print("\n  Building iLQR solvers for 50 test envs...")
+    v2_policy = _build_v2_ilqr_policy(
         test_family,
         best_dynamics,
         best_reward,
-        state_names,
+        dynamics_state_names,
         action_names,
         reward_derived_features,
+        oa_output=oa_output,
         gamma=0.99,
         max_action=v2_max_torque,
     )
     t_v2_total = time.time() - t_v2
-    print(f"  v2 pipeline + MPC build: {t_v2_total:.1f}s")
+    print(f"  v2 pipeline + iLQR build: {t_v2_total:.1f}s")
 
-    # v2 action function
+    # v2 action function (uses iLQR policy with feedback gains)
     def v2_get_action(obs: np.ndarray, env_idx: int) -> np.ndarray:
-        solver = mpc_solvers[env_idx]
-        action = solver.solve(obs, action_dim=1)
+        action = v2_policy.get_action(obs, env_idx)
         return np.clip(action, -v2_max_torque, v2_max_torque)
 
     # ================================================================
@@ -712,12 +712,14 @@ def main() -> None:
         param_str = f"g={params['g']:.1f} m={params['m']:.1f} l={params['l']:.1f}"
         print(f"  [{env_idx + 1:2d}/50] {param_str}", end="", flush=True)
 
-        # v2 (analytic)
+        # v2 (analytic) -- reset iLQR plan for new episode
+        v2_policy.reset(env_idx)
         v2_frames, v2_ret = _record_episode_generic(
             test_family,
             env_idx,
             v2_get_action,
             max_steps=max_steps,
+            fixed_params={"max_torque": v2_max_torque},
         )
         v2_returns.append(v2_ret)
         v2_all_frames.append(v2_frames)

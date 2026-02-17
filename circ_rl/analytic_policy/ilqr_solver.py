@@ -1,0 +1,716 @@
+r"""Iterative Linear Quadratic Regulator (iLQR) solver.
+
+Solves nonlinear trajectory optimization by iteratively linearizing
+dynamics and quadraticizing cost along a nominal trajectory, then
+solving the resulting LQR sub-problem via dynamic programming.
+
+The algorithm:
+
+1. **Forward pass**: Roll out trajectory under current control sequence.
+2. **Backward pass**: Linearize dynamics (Jacobians :math:`A_t, B_t`)
+   and quadraticize cost at each timestep, then solve the Bellman
+   recursion to get feedforward :math:`k_t` and feedback :math:`K_t`
+   gains.
+3. **Line search**: Apply control update
+   :math:`u_t = \bar{u}_t + \alpha k_t + K_t (x_t - \bar{x}_t)`
+   with backtracking on :math:`\alpha`.
+4. **Regularization**: Levenberg-Marquardt damping on
+   :math:`Q_{uu}` to ensure positive-definiteness.
+5. **Convergence**: Stop when relative cost change falls below
+   threshold.
+
+Internally uses cost-minimization convention (cost = -reward) with
+standard iLQR formulas (Tassa et al. 2012). The public interface
+accepts reward functions and reports total reward.
+
+See ``CIRC-RL_Framework.md`` Section 3.6.2 (Nonlinear Known Dynamics).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+import numpy as np
+from loguru import logger
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+
+@dataclass(frozen=True)
+class ILQRConfig:
+    r"""Configuration for the iLQR solver.
+
+    :param horizon: Planning horizon (number of timesteps).
+    :param max_iterations: Maximum iLQR iterations.
+    :param convergence_tol: Relative cost change threshold for
+        convergence: :math:`|J_{new} - J_{old}| / |J_{old}|`.
+    :param mu_init: Initial Levenberg-Marquardt regularization.
+    :param mu_min: Minimum regularization.
+    :param mu_max: Maximum regularization (triggers early stop).
+    :param mu_factor: Multiplicative factor for regularization
+        adjustment.
+    :param alpha_min: Minimum line search step size.
+    :param alpha_decay: Line search backtracking factor.
+    :param gamma: Discount factor for the cost function.
+    :param max_action: Maximum absolute action value (box constraint).
+    """
+
+    horizon: int = 200
+    max_iterations: int = 50
+    convergence_tol: float = 1e-4
+    mu_init: float = 1.0
+    mu_min: float = 1e-6
+    mu_max: float = 1e6
+    mu_factor: float = 10.0
+    alpha_min: float = 1e-4
+    alpha_decay: float = 0.5
+    gamma: float = 0.99
+    max_action: float = 2.0
+
+
+@dataclass
+class ILQRSolution:
+    r"""Solution from the iLQR solver.
+
+    The optimal closed-loop policy is:
+
+    .. math::
+
+        u_t = \bar{u}_t + k_t + K_t (x_t - \bar{x}_t)
+
+    where :math:`\bar{x}, \bar{u}` are the nominal trajectory,
+    :math:`k_t` are feedforward gains, and :math:`K_t` are feedback
+    gains.
+
+    :param nominal_states: Nominal state trajectory,
+        shape ``(horizon+1, state_dim)``.
+    :param nominal_actions: Nominal action sequence,
+        shape ``(horizon, action_dim)``.
+    :param feedback_gains: Time-varying feedback gain matrices,
+        ``horizon`` elements each of shape ``(action_dim, state_dim)``.
+    :param feedforward_gains: Time-varying feedforward gain vectors,
+        ``horizon`` elements each of shape ``(action_dim,)``.
+    :param total_reward: Total discounted reward of the nominal
+        trajectory.
+    :param converged: Whether the solver converged.
+    :param n_iterations: Number of iLQR iterations performed.
+    """
+
+    nominal_states: np.ndarray
+    nominal_actions: np.ndarray
+    feedback_gains: list[np.ndarray] = field(default_factory=list)
+    feedforward_gains: list[np.ndarray] = field(default_factory=list)
+    total_reward: float = 0.0
+    converged: bool = False
+    n_iterations: int = 0
+
+
+class ILQRSolver:
+    r"""Iterative LQR solver for nonlinear trajectory optimization.
+
+    Given nonlinear dynamics :math:`x_{t+1} = f(x_t, u_t)` and
+    stage reward :math:`r(x_t, u_t)`, finds the control sequence
+    that maximizes the total discounted reward:
+
+    .. math::
+
+        \max_{u_0, \ldots, u_{T-1}} \sum_{t=0}^{T-1} \gamma^t r(x_t, u_t)
+
+    Internally converts to cost minimization (:math:`c = -r`) and
+    applies the standard iLQR algorithm (Tassa et al. 2012).
+
+    Optionally accepts analytic Jacobian functions for the dynamics,
+    computed from symbolic expressions via ``sympy.diff()``. Falls
+    back to finite differences if not provided.
+
+    See ``CIRC-RL_Framework.md`` Section 3.6.2.
+
+    :param config: iLQR configuration.
+    :param dynamics_fn: Callable ``(state, action) -> next_state``.
+    :param reward_fn: Callable ``(state, action) -> float``.
+    :param dynamics_jac_state_fn: Optional callable
+        ``(state, action) -> A``, where ``A`` is the Jacobian
+        :math:`\partial f / \partial x` of shape
+        ``(state_dim, state_dim)``.
+    :param dynamics_jac_action_fn: Optional callable
+        ``(state, action) -> B``, where ``B`` is the Jacobian
+        :math:`\partial f / \partial u` of shape
+        ``(state_dim, action_dim)``.
+    """
+
+    def __init__(
+        self,
+        config: ILQRConfig,
+        dynamics_fn: Callable[[np.ndarray, np.ndarray], np.ndarray],
+        reward_fn: Callable[[np.ndarray, np.ndarray], float],
+        dynamics_jac_state_fn: (
+            Callable[[np.ndarray, np.ndarray], np.ndarray] | None
+        ) = None,
+        dynamics_jac_action_fn: (
+            Callable[[np.ndarray, np.ndarray], np.ndarray] | None
+        ) = None,
+    ) -> None:
+        self._config = config
+        self._dynamics_fn = dynamics_fn
+        self._reward_fn = reward_fn
+        self._jac_state_fn = dynamics_jac_state_fn
+        self._jac_action_fn = dynamics_jac_action_fn
+
+    @property
+    def config(self) -> ILQRConfig:
+        """The iLQR configuration."""
+        return self._config
+
+    def plan(
+        self,
+        initial_state: np.ndarray,
+        action_dim: int,
+        warm_start_actions: np.ndarray | None = None,
+    ) -> ILQRSolution:
+        """Optimize a full trajectory from the given initial state.
+
+        :param initial_state: Starting state, shape ``(state_dim,)``.
+        :param action_dim: Number of action dimensions.
+        :param warm_start_actions: Optional initial action sequence,
+            shape ``(horizon, action_dim)``. Defaults to zeros.
+        :returns: The optimized trajectory with feedback gains.
+        """
+        cfg = self._config
+        state_dim = initial_state.shape[0]
+        horizon = cfg.horizon
+
+        # Initialize action sequence
+        if warm_start_actions is not None:
+            assert warm_start_actions.shape == (horizon, action_dim), (
+                f"Expected warm_start shape ({horizon}, {action_dim}), "
+                f"got {warm_start_actions.shape}"
+            )
+            actions = warm_start_actions.copy()
+        else:
+            actions = np.zeros((horizon, action_dim))
+
+        # Initial forward pass
+        states = self._rollout(initial_state, actions)
+        current_cost = self._total_cost(states, actions)
+
+        mu = cfg.mu_init
+        converged = False
+        n_iter = 0
+
+        # Storage for gains (from last successful backward pass)
+        k_gains: list[np.ndarray] = []
+        big_k_gains: list[np.ndarray] = []
+
+        for iteration in range(cfg.max_iterations):
+            n_iter = iteration + 1
+
+            # Backward pass (cost minimization convention)
+            backward_ok, k_gains, big_k_gains = self._backward_pass(
+                states, actions, state_dim, action_dim, mu,
+            )
+
+            if not backward_ok:
+                # Increase regularization and retry
+                mu = min(mu * cfg.mu_factor, cfg.mu_max)
+                if mu >= cfg.mu_max:
+                    logger.debug(
+                        "iLQR: regularization exceeded mu_max={}, "
+                        "stopping at iteration {}",
+                        cfg.mu_max,
+                        n_iter,
+                    )
+                    break
+                continue
+
+            # Forward pass with line search
+            new_states, new_actions, new_cost = self._line_search(
+                states, actions, k_gains, big_k_gains,
+                current_cost, action_dim,
+            )
+
+            if new_cost < current_cost:
+                # Cost decreased (= reward increased): accept
+                rel_improvement = abs(current_cost - new_cost) / max(
+                    abs(current_cost), 1e-10,
+                )
+
+                states = new_states
+                actions = new_actions
+                current_cost = new_cost
+
+                # Decrease regularization on success
+                mu = max(mu / cfg.mu_factor, cfg.mu_min)
+
+                logger.debug(
+                    "iLQR iter {}: reward={:.2f}, "
+                    "rel_improvement={:.6f}, mu={:.2e}",
+                    n_iter,
+                    -current_cost,
+                    rel_improvement,
+                    mu,
+                )
+
+                if rel_improvement < cfg.convergence_tol:
+                    converged = True
+                    break
+            else:
+                # No improvement: increase regularization
+                mu = min(mu * cfg.mu_factor, cfg.mu_max)
+                if mu >= cfg.mu_max:
+                    logger.debug(
+                        "iLQR: regularization exceeded mu_max at iter {}",
+                        n_iter,
+                    )
+                    break
+
+        total_reward = -current_cost
+
+        logger.info(
+            "iLQR: {} in {} iterations, reward={:.2f}, mu={:.2e}",
+            "converged" if converged else "stopped",
+            n_iter,
+            total_reward,
+            mu,
+        )
+
+        return ILQRSolution(
+            nominal_states=states,
+            nominal_actions=actions,
+            feedback_gains=big_k_gains,
+            feedforward_gains=k_gains,
+            total_reward=total_reward,
+            converged=converged,
+            n_iterations=n_iter,
+        )
+
+    def _rollout(
+        self,
+        initial_state: np.ndarray,
+        actions: np.ndarray,
+    ) -> np.ndarray:
+        """Forward-simulate the dynamics under the given actions.
+
+        :param initial_state: Shape ``(state_dim,)``.
+        :param actions: Shape ``(horizon, action_dim)``.
+        :returns: States, shape ``(horizon+1, state_dim)``.
+        """
+        horizon = actions.shape[0]
+        state_dim = initial_state.shape[0]
+        states = np.zeros((horizon + 1, state_dim))
+        states[0] = initial_state
+
+        for t in range(horizon):
+            states[t + 1] = self._dynamics_fn(states[t], actions[t])
+
+        return states
+
+    def _total_cost(
+        self,
+        states: np.ndarray,
+        actions: np.ndarray,
+    ) -> float:
+        """Compute total discounted cost (= -reward) along a trajectory.
+
+        :param states: Shape ``(horizon+1, state_dim)``.
+        :param actions: Shape ``(horizon, action_dim)``.
+        :returns: Scalar total discounted cost.
+        """
+        gamma = self._config.gamma
+        horizon = actions.shape[0]
+        total = 0.0
+
+        for t in range(horizon):
+            total -= (gamma ** t) * self._reward_fn(states[t], actions[t])
+
+        return total
+
+    def _backward_pass(
+        self,
+        states: np.ndarray,
+        actions: np.ndarray,
+        state_dim: int,
+        action_dim: int,
+        mu: float,
+    ) -> tuple[bool, list[np.ndarray], list[np.ndarray]]:
+        r"""Backward pass: compute feedforward and feedback gains.
+
+        Uses cost-minimization convention (:math:`c = -r`).
+        The Q-function is quadratically approximated at each timestep:
+
+        .. math::
+
+            Q_{uu} = c_{uu} + \gamma B^T V'_{xx} B + \mu I
+
+        where :math:`c_{uu} = -r_{uu}` (positive for concave rewards).
+
+        :param states: Nominal states, shape ``(T+1, state_dim)``.
+        :param actions: Nominal actions, shape ``(T, action_dim)``.
+        :param state_dim: State dimensionality.
+        :param action_dim: Action dimensionality.
+        :param mu: Levenberg-Marquardt regularization parameter.
+        :returns: Tuple of (success, k_gains, K_gains).
+        """
+        gamma = self._config.gamma
+        horizon = actions.shape[0]
+
+        # Terminal value function: V_T = 0 (no terminal cost)
+        v_x = np.zeros(state_dim)  # (state_dim,)
+        v_xx = np.zeros((state_dim, state_dim))  # (state_dim, state_dim)
+
+        k_gains: list[np.ndarray] = [
+            np.zeros(action_dim) for _ in range(horizon)
+        ]
+        big_k_gains: list[np.ndarray] = [
+            np.zeros((action_dim, state_dim)) for _ in range(horizon)
+        ]
+
+        for t in range(horizon - 1, -1, -1):
+            x_t = states[t]
+            u_t = actions[t]
+
+            # Dynamics Jacobians
+            a_mat = self._get_dynamics_jac_state(x_t, u_t, state_dim)
+            b_mat = self._get_dynamics_jac_action(
+                x_t, u_t, state_dim, action_dim,
+            )
+
+            # Cost derivatives (cost = -reward)
+            # c_x = -r_x, c_u = -r_u, c_xx = -r_xx, etc.
+            c_x, c_u, c_xx, c_uu, c_ux = self._cost_derivatives(
+                x_t, u_t, state_dim, action_dim,
+            )
+
+            # Q-function terms (standard cost-minimization iLQR)
+            q_x = c_x + gamma * a_mat.T @ v_x  # (state_dim,)
+            q_u = c_u + gamma * b_mat.T @ v_x  # (action_dim,)
+
+            q_xx = c_xx + gamma * a_mat.T @ v_xx @ a_mat  # (n, n)
+            q_ux = c_ux + gamma * b_mat.T @ v_xx @ a_mat  # (m, n)
+            q_uu = c_uu + gamma * b_mat.T @ v_xx @ b_mat  # (m, m)
+
+            # Regularize Q_uu (must be positive definite for minimum)
+            q_uu_reg = q_uu + mu * np.eye(action_dim)  # (m, m)
+
+            # Check positive-definiteness via Cholesky
+            try:
+                cho = np.linalg.cholesky(q_uu_reg)
+            except np.linalg.LinAlgError:
+                return False, k_gains, big_k_gains
+
+            # Compute gains: k = -Q_uu^{-1} Q_u, K = -Q_uu^{-1} Q_ux
+            # Using Cholesky: solve Q_uu_reg @ k = -Q_u
+            k_t = -np.linalg.solve(
+                cho @ cho.T, q_u,
+            )  # (action_dim,)
+            big_k_t = -np.linalg.solve(
+                cho @ cho.T, q_ux,
+            )  # (action_dim, state_dim)
+
+            k_gains[t] = k_t
+            big_k_gains[t] = big_k_t
+
+            # Update value function (simplified formulas for symmetric
+            # Q_uu):
+            #   V_x = Q_x + K^T Q_u   (= Q_x - Q_ux^T Q_uu^{-1} Q_u)
+            #   V_xx = Q_xx + K^T Q_ux (= Q_xx - Q_ux^T Q_uu^{-1} Q_ux)
+            v_x = q_x + big_k_t.T @ q_u
+            v_xx = q_xx + big_k_t.T @ q_ux
+
+            # Symmetrize V_xx for numerical stability
+            v_xx = 0.5 * (v_xx + v_xx.T)
+
+        return True, k_gains, big_k_gains
+
+    def _line_search(
+        self,
+        states: np.ndarray,
+        actions: np.ndarray,
+        k_gains: list[np.ndarray],
+        big_k_gains: list[np.ndarray],
+        current_cost: float,
+        action_dim: int,
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        """Forward pass with backtracking line search.
+
+        Tries decreasing step sizes until cost improves.
+
+        :param states: Nominal states, shape ``(T+1, n)``.
+        :param actions: Nominal actions, shape ``(T, m)``.
+        :param k_gains: Feedforward gains, T x (m,).
+        :param big_k_gains: Feedback gains, T x (m, n).
+        :param current_cost: Current total cost.
+        :param action_dim: Action dimensionality.
+        :returns: Tuple of (new_states, new_actions, new_cost).
+        """
+        cfg = self._config
+        horizon = actions.shape[0]
+
+        best_states = states
+        best_actions = actions
+        best_cost = current_cost
+
+        alpha = 1.0
+        while alpha >= cfg.alpha_min:
+            new_states = np.zeros_like(states)
+            new_actions = np.zeros_like(actions)
+            new_states[0] = states[0]
+
+            for t in range(horizon):
+                dx = new_states[t] - states[t]  # (state_dim,)
+                new_actions[t] = (
+                    actions[t]
+                    + alpha * k_gains[t]
+                    + big_k_gains[t] @ dx
+                )
+
+                # Clip to action bounds
+                np.clip(
+                    new_actions[t],
+                    -cfg.max_action,
+                    cfg.max_action,
+                    out=new_actions[t],
+                )
+
+                new_states[t + 1] = self._dynamics_fn(
+                    new_states[t], new_actions[t],
+                )
+
+            new_cost = self._total_cost(new_states, new_actions)
+
+            if new_cost < best_cost:
+                best_states = new_states
+                best_actions = new_actions
+                best_cost = new_cost
+                break
+
+            alpha *= cfg.alpha_decay
+
+        return best_states, best_actions, best_cost
+
+    def _get_dynamics_jac_state(
+        self,
+        state: np.ndarray,
+        action: np.ndarray,
+        state_dim: int,
+    ) -> np.ndarray:
+        r"""Get the dynamics Jacobian :math:`\partial f / \partial x`.
+
+        Uses analytic Jacobian if available, otherwise finite differences.
+
+        :returns: Shape ``(state_dim, state_dim)``.
+        """
+        if self._jac_state_fn is not None:
+            return self._jac_state_fn(state, action)
+
+        return _finite_diff_jac_state(
+            self._dynamics_fn, state, action, state_dim,
+        )
+
+    def _get_dynamics_jac_action(
+        self,
+        state: np.ndarray,
+        action: np.ndarray,
+        state_dim: int,
+        action_dim: int,
+    ) -> np.ndarray:
+        r"""Get the dynamics Jacobian :math:`\partial f / \partial u`.
+
+        Uses analytic Jacobian if available, otherwise finite differences.
+
+        :returns: Shape ``(state_dim, action_dim)``.
+        """
+        if self._jac_action_fn is not None:
+            return self._jac_action_fn(state, action)
+
+        return _finite_diff_jac_action(
+            self._dynamics_fn, state, action, state_dim, action_dim,
+        )
+
+    def _cost_derivatives(
+        self,
+        state: np.ndarray,
+        action: np.ndarray,
+        state_dim: int,
+        action_dim: int,
+        eps: float = 1e-5,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        r"""Compute cost derivatives via finite differences.
+
+        Cost is defined as :math:`c = -r` (negated reward). Returns
+        the gradient and Hessian of the cost function.
+
+        :returns: Tuple ``(c_x, c_u, c_xx, c_uu, c_ux)`` where
+            ``c_x`` has shape ``(state_dim,)``,
+            ``c_u`` has shape ``(action_dim,)``,
+            ``c_xx`` has shape ``(state_dim, state_dim)``,
+            ``c_uu`` has shape ``(action_dim, action_dim)``,
+            ``c_ux`` has shape ``(action_dim, state_dim)``.
+        """
+        r0 = self._reward_fn(state, action)
+
+        # Gradient w.r.t. state: c_x = -r_x
+        c_x = np.zeros(state_dim)
+        for i in range(state_dim):
+            s_plus = state.copy()
+            s_minus = state.copy()
+            s_plus[i] += eps
+            s_minus[i] -= eps
+            c_x[i] = -(
+                self._reward_fn(s_plus, action)
+                - self._reward_fn(s_minus, action)
+            ) / (2 * eps)
+
+        # Gradient w.r.t. action: c_u = -r_u
+        c_u = np.zeros(action_dim)
+        for i in range(action_dim):
+            a_plus = action.copy()
+            a_minus = action.copy()
+            a_plus[i] += eps
+            a_minus[i] -= eps
+            c_u[i] = -(
+                self._reward_fn(state, a_plus)
+                - self._reward_fn(state, a_minus)
+            ) / (2 * eps)
+
+        # Hessian w.r.t. state: c_xx = -r_xx
+        c_xx = np.zeros((state_dim, state_dim))
+        for i in range(state_dim):
+            for j in range(i, state_dim):
+                if i == j:
+                    s_plus = state.copy()
+                    s_minus = state.copy()
+                    s_plus[i] += eps
+                    s_minus[i] -= eps
+                    c_xx[i, i] = -(
+                        self._reward_fn(s_plus, action)
+                        - 2 * r0
+                        + self._reward_fn(s_minus, action)
+                    ) / (eps ** 2)
+                else:
+                    s_pp = state.copy()
+                    s_pm = state.copy()
+                    s_mp = state.copy()
+                    s_mm = state.copy()
+                    s_pp[i] += eps
+                    s_pp[j] += eps
+                    s_pm[i] += eps
+                    s_pm[j] -= eps
+                    s_mp[i] -= eps
+                    s_mp[j] += eps
+                    s_mm[i] -= eps
+                    s_mm[j] -= eps
+                    c_xx[i, j] = -(
+                        self._reward_fn(s_pp, action)
+                        - self._reward_fn(s_pm, action)
+                        - self._reward_fn(s_mp, action)
+                        + self._reward_fn(s_mm, action)
+                    ) / (4 * eps ** 2)
+                    c_xx[j, i] = c_xx[i, j]
+
+        # Hessian w.r.t. action: c_uu = -r_uu
+        c_uu = np.zeros((action_dim, action_dim))
+        for i in range(action_dim):
+            for j in range(i, action_dim):
+                if i == j:
+                    a_plus = action.copy()
+                    a_minus = action.copy()
+                    a_plus[i] += eps
+                    a_minus[i] -= eps
+                    c_uu[i, i] = -(
+                        self._reward_fn(state, a_plus)
+                        - 2 * r0
+                        + self._reward_fn(state, a_minus)
+                    ) / (eps ** 2)
+                else:
+                    a_pp = action.copy()
+                    a_pm = action.copy()
+                    a_mp = action.copy()
+                    a_mm = action.copy()
+                    a_pp[i] += eps
+                    a_pp[j] += eps
+                    a_pm[i] += eps
+                    a_pm[j] -= eps
+                    a_mp[i] -= eps
+                    a_mp[j] += eps
+                    a_mm[i] -= eps
+                    a_mm[j] -= eps
+                    c_uu[i, j] = -(
+                        self._reward_fn(state, a_pp)
+                        - self._reward_fn(state, a_pm)
+                        - self._reward_fn(state, a_mp)
+                        + self._reward_fn(state, a_mm)
+                    ) / (4 * eps ** 2)
+                    c_uu[j, i] = c_uu[i, j]
+
+        # Cross-Hessian: c_ux = -r_ux
+        c_ux = np.zeros((action_dim, state_dim))
+        for i in range(action_dim):
+            for j in range(state_dim):
+                s_plus = state.copy()
+                s_minus = state.copy()
+                a_plus = action.copy()
+                a_minus = action.copy()
+                s_plus[j] += eps
+                s_minus[j] -= eps
+                a_plus[i] += eps
+                a_minus[i] -= eps
+
+                c_ux[i, j] = -(
+                    self._reward_fn(s_plus, a_plus)
+                    - self._reward_fn(s_plus, a_minus)
+                    - self._reward_fn(s_minus, a_plus)
+                    + self._reward_fn(s_minus, a_minus)
+                ) / (4 * eps ** 2)
+
+        return c_x, c_u, c_xx, c_uu, c_ux
+
+
+def _finite_diff_jac_state(
+    dynamics_fn: Callable[[np.ndarray, np.ndarray], np.ndarray],
+    state: np.ndarray,
+    action: np.ndarray,
+    state_dim: int,
+    eps: float = 1e-5,
+) -> np.ndarray:
+    r"""Compute :math:`\partial f / \partial x` via central differences.
+
+    :returns: Jacobian, shape ``(state_dim, state_dim)``.
+    """
+    jac = np.zeros((state_dim, state_dim))
+    for i in range(state_dim):
+        s_plus = state.copy()
+        s_minus = state.copy()
+        s_plus[i] += eps
+        s_minus[i] -= eps
+        jac[:, i] = (
+            dynamics_fn(s_plus, action)
+            - dynamics_fn(s_minus, action)
+        ) / (2 * eps)
+    return jac
+
+
+def _finite_diff_jac_action(
+    dynamics_fn: Callable[[np.ndarray, np.ndarray], np.ndarray],
+    state: np.ndarray,
+    action: np.ndarray,
+    state_dim: int,
+    action_dim: int,
+    eps: float = 1e-5,
+) -> np.ndarray:
+    r"""Compute :math:`\partial f / \partial u` via central differences.
+
+    :returns: Jacobian, shape ``(state_dim, action_dim)``.
+    """
+    jac = np.zeros((state_dim, action_dim))
+    for i in range(action_dim):
+        a_plus = action.copy()
+        a_minus = action.copy()
+        a_plus[i] += eps
+        a_minus[i] -= eps
+        jac[:, i] = (
+            dynamics_fn(state, a_plus)
+            - dynamics_fn(state, a_minus)
+        ) / (2 * eps)
+    return jac

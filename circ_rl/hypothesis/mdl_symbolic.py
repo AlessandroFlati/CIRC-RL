@@ -68,6 +68,7 @@ class SymbolicMDLScorer:
         target_dim_idx: int,
         variable_names: list[str],
         derived_columns: dict[str, np.ndarray] | None = None,
+        wrap_angular: bool = False,
     ) -> SymbolicMDLScore:
         """Compute the MDL score of a hypothesis on data.
 
@@ -75,6 +76,7 @@ class SymbolicMDLScorer:
         :param dataset: Multi-environment data.
         :param target_dim_idx: Target dimension index (-1 for reward).
         :param variable_names: Variable names for expression evaluation.
+        :param wrap_angular: If True, wrap target delta via atan2(sin, cos).
         :returns: SymbolicMDLScore.
         """
         # Build targets
@@ -83,6 +85,8 @@ class SymbolicMDLScorer:
                 dataset.next_states[:, target_dim_idx]
                 - dataset.states[:, target_dim_idx]
             )
+            if wrap_angular:
+                targets = np.arctan2(np.sin(targets), np.cos(targets))
         else:
             targets = dataset.rewards
 

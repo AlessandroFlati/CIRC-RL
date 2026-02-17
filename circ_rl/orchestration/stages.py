@@ -25,9 +25,11 @@ from circ_rl.feature_selection.inv_feature_selector import InvFeatureSelector
 from circ_rl.orchestration.pipeline import PipelineStage, hash_config
 
 if TYPE_CHECKING:
+    from circ_rl.analytic_policy.ilqr_solver import ILQRSolution, ILQRSolver
     from circ_rl.environments.env_family import EnvironmentFamily
     from circ_rl.hypothesis.derived_features import DerivedFeatureSpec
     from circ_rl.hypothesis.expression import SymbolicExpression
+    from circ_rl.hypothesis.hypothesis_register import HypothesisEntry
     from circ_rl.hypothesis.symbolic_regressor import SymbolicRegressionConfig
 
 
@@ -275,6 +277,90 @@ class TransitionAnalysisStage(PipelineStage):
         })
 
 
+class ObservationAnalysisStage(PipelineStage):
+    """Phase 2.6: Analyze observation space for algebraic constraints.
+
+    Detects algebraic constraints among observation dimensions
+    (e.g., ``s0^2 + s1^2 = 1`` for cos/sin encodings) and builds
+    canonical coordinate mappings (e.g., ``theta = atan2(s1, s0)``).
+
+    When constraints are found and mapped to canonical coordinates,
+    downstream dynamics SR operates in the lower-dimensional canonical
+    space where dynamics are typically simpler and more exact.
+
+    :param singular_value_threshold: SVD threshold for constraint detection.
+    :param circle_tolerance: Tolerance for circle manifold classification.
+    """
+
+    def __init__(
+        self,
+        singular_value_threshold: float = 1e-3,
+        circle_tolerance: float = 0.1,
+    ) -> None:
+        super().__init__(
+            name="observation_analysis",
+            dependencies=["causal_discovery"],
+        )
+        self._sv_threshold = singular_value_threshold
+        self._circle_tolerance = circle_tolerance
+
+    def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Run observation space analysis.
+
+        :returns: Dict with keys: analysis_result, canonical_dataset,
+            canonical_state_names. If no mappable constraints are found,
+            analysis_result is None and no canonical dataset is produced.
+        """
+        from circ_rl.environments.data_collector import ExploratoryDataset
+        from circ_rl.observation_analysis.observation_analyzer import (
+            ObservationAnalysisConfig,
+            ObservationAnalyzer,
+        )
+
+        cd_output = inputs["causal_discovery"]
+        dataset = cd_output["dataset"]
+        state_names: list[str] = cd_output["state_names"]
+
+        config = ObservationAnalysisConfig(
+            singular_value_threshold=self._sv_threshold,
+            circle_tolerance=self._circle_tolerance,
+        )
+        analyzer = ObservationAnalyzer(config)
+        result = analyzer.analyze(dataset, state_names)
+
+        if not result.mappings:
+            logger.info("No canonical mappings found; dynamics will use obs space")
+            return {"analysis_result": None}
+
+        logger.info(
+            "Observation analysis: {} mapping(s), canonical dims: {}",
+            len(result.mappings),
+            result.canonical_state_names,
+        )
+
+        # Build canonical dataset for downstream dynamics SR
+        canonical_dataset = ExploratoryDataset(
+            states=result.canonical_states,
+            actions=dataset.actions,
+            next_states=result.canonical_next_states,
+            rewards=dataset.rewards,
+            env_ids=dataset.env_ids,
+            env_params=dataset.env_params,
+        )
+
+        return {
+            "analysis_result": result,
+            "canonical_dataset": canonical_dataset,
+            "canonical_state_names": result.canonical_state_names,
+        }
+
+    def config_hash(self) -> str:
+        return hash_config({
+            "sv_threshold": self._sv_threshold,
+            "circle_tolerance": self._circle_tolerance,
+        })
+
+
 class HypothesisGenerationStage(PipelineStage):
     """Phase 3: Generate symbolic hypotheses via symbolic regression.
 
@@ -318,7 +404,13 @@ class HypothesisGenerationStage(PipelineStage):
     def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Generate dynamics and reward hypotheses.
 
-        :returns: Dict with keys: register, variable_names.
+        When ``observation_analysis`` output is present with canonical
+        mappings, dynamics SR runs in the canonical coordinate space
+        (simpler dynamics). Reward SR always runs in observation space.
+
+        :returns: Dict with keys: register, variable_names,
+            dynamics_variable_names, dynamics_state_names, state_names,
+            action_names, derived_columns, reward_derived_features.
         """
         from circ_rl.hypothesis.dynamics_hypotheses import DynamicsHypothesisGenerator
         from circ_rl.hypothesis.hypothesis_register import HypothesisRegister
@@ -360,22 +452,42 @@ class HypothesisGenerationStage(PipelineStage):
                 for name in env_param_node_names
             ]
 
+        # Check for observation analysis: canonical space for dynamics
+        oa_output = inputs.get("observation_analysis", {})
+        analysis_result = oa_output.get("analysis_result")
+
+        dynamics_angular_dims: tuple[int, ...] = ()
+        if analysis_result is not None:
+            dynamics_dataset = oa_output["canonical_dataset"]
+            dynamics_state_names = oa_output["canonical_state_names"]
+            dynamics_angular_dims = analysis_result.angular_dims
+            logger.info(
+                "Using canonical coordinates for dynamics SR: {} "
+                "(angular_dims={})",
+                dynamics_state_names,
+                dynamics_angular_dims,
+            )
+        else:
+            dynamics_dataset = dataset
+            dynamics_state_names = state_names
+
         register = HypothesisRegister()
 
-        # Dynamics hypotheses
+        # Dynamics hypotheses (in canonical space if available)
         dyn_gen = DynamicsHypothesisGenerator(
             sr_config=self._sr_config,
             include_env_params=self._include_env_params,
         )
         dyn_ids = dyn_gen.generate(
-            dataset=dataset,
+            dataset=dynamics_dataset,
             transition_result=transition_result,
-            state_feature_names=state_names,
+            state_feature_names=dynamics_state_names,
             register=register,
             env_param_names=raw_env_param_names,
+            angular_dims=dynamics_angular_dims,
         )
 
-        # Reward hypotheses
+        # Reward hypotheses (always in observation space)
         reward_is_invariant = (
             validation_result.is_invariant if validation_result else True
         )
@@ -404,7 +516,7 @@ class HypothesisGenerationStage(PipelineStage):
             derived_columns=reward_derived_cols,
         )
 
-        # Build variable names (shared across hypothesis evaluation)
+        # Build variable names for reward (observation space)
         actions_2d = (
             dataset.actions if dataset.actions.ndim == 2
             else dataset.actions[:, np.newaxis]
@@ -423,6 +535,11 @@ class HypothesisGenerationStage(PipelineStage):
         if reward_derived_cols:
             variable_names.extend(reward_derived_cols.keys())
 
+        # Build dynamics variable names (canonical space if available)
+        dynamics_variable_names = list(dynamics_state_names) + action_names
+        if raw_env_param_names and self._include_env_params:
+            dynamics_variable_names.extend(raw_env_param_names)
+
         logger.info(
             "Hypothesis generation complete: {} dynamics + {} reward hypotheses",
             len(dyn_ids),
@@ -432,6 +549,8 @@ class HypothesisGenerationStage(PipelineStage):
         return {
             "register": register,
             "variable_names": variable_names,
+            "dynamics_variable_names": dynamics_variable_names,
+            "dynamics_state_names": dynamics_state_names,
             "state_names": state_names,
             "action_names": action_names,
             "derived_columns": reward_derived_cols,
@@ -494,8 +613,12 @@ class HypothesisFalsificationStage(PipelineStage):
     def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Run falsification on all hypotheses.
 
+        When observation analysis produced canonical coordinates,
+        dynamics hypotheses are tested against canonical data while
+        reward hypotheses are tested against observation-space data.
+
         :returns: Dict with keys: register, falsification_result,
-            best_dynamics, best_reward.
+            best_dynamics, best_reward, dynamics_state_names.
         """
         from circ_rl.hypothesis.falsification_engine import (
             FalsificationConfig,
@@ -508,11 +631,27 @@ class HypothesisFalsificationStage(PipelineStage):
         register = hg_output["register"]
         variable_names = hg_output["variable_names"]
         state_names = hg_output["state_names"]
+        dynamics_state_names = hg_output.get("dynamics_state_names", state_names)
+        dynamics_variable_names = hg_output.get(
+            "dynamics_variable_names", variable_names,
+        )
         derived_columns = hg_output.get("derived_columns")
         reward_derived_features = hg_output.get(
             "reward_derived_features", [],
         )
         dataset = cd_output["dataset"]
+
+        # Check if canonical dataset is available for dynamics
+        oa_output = inputs.get("observation_analysis", {})
+        canonical_dataset = oa_output.get("canonical_dataset")
+        analysis_result = oa_output.get("analysis_result")
+        use_canonical = (
+            canonical_dataset is not None
+            and dynamics_state_names != state_names
+        )
+        canonical_angular_dims: tuple[int, ...] = ()
+        if analysis_result is not None:
+            canonical_angular_dims = analysis_result.angular_dims
 
         config = FalsificationConfig(
             structural_p_threshold=self._structural_p,
@@ -521,31 +660,89 @@ class HypothesisFalsificationStage(PipelineStage):
             held_out_fraction=self._held_out_fraction,
         )
         engine = FalsificationEngine(config)
-        result = engine.run(
-            register=register,
-            dataset=dataset,
-            state_feature_names=state_names,
-            variable_names=variable_names,
-            derived_columns=derived_columns,
-        )
 
-        # Extract best validated hypotheses
+        if use_canonical:
+            # Dynamics hypotheses use canonical data.
+            # Build derived_columns so _build_features can resolve canonical
+            # state names (e.g. "phi_0", "s2") to the correct columns in the
+            # canonical dataset -- the sN naming convention doesn't match
+            # canonical column indices.
+            canonical_derived: dict[str, np.ndarray] = {}
+            for i, cname in enumerate(dynamics_state_names):
+                canonical_derived[cname] = canonical_dataset.states[:, i]
+
+            logger.info(
+                "Running falsification with canonical data for dynamics "
+                "(state_names={})",
+                dynamics_state_names,
+            )
+            result = engine.run(
+                register=register,
+                dataset=canonical_dataset,
+                state_feature_names=dynamics_state_names,
+                variable_names=dynamics_variable_names,
+                derived_columns=canonical_derived,
+                angular_dims=canonical_angular_dims,
+            )
+            # Reward hypotheses use observation-space data
+            # (run a second pass for any remaining untested reward hypotheses)
+            result_reward = engine.run(
+                register=register,
+                dataset=dataset,
+                state_feature_names=state_names,
+                variable_names=variable_names,
+                derived_columns=derived_columns,
+            )
+            # Merge results: combine counts from both passes
+            total_tested = result.n_tested + result_reward.n_tested
+            total_validated = result.n_validated + result_reward.n_validated
+            total_falsified = result.n_falsified + result_reward.n_falsified
+        else:
+            result = engine.run(
+                register=register,
+                dataset=dataset,
+                state_feature_names=state_names,
+                variable_names=variable_names,
+                derived_columns=derived_columns,
+            )
+            result_reward = result
+            total_tested = result.n_tested
+            total_validated = result.n_validated
+            total_falsified = result.n_falsified
+
+        # Extract best validated hypotheses (from both passes)
         best_dynamics: dict[str, Any] = {}
         best_reward = None
+
+        # Dynamics from first result
         for target, hyp_id in result.best_per_target.items():
-            if hyp_id is None:
-                continue
-            entry = register.get(hyp_id)
             if target == "reward":
-                best_reward = entry
-            else:
-                best_dynamics[target] = entry
+                continue
+            if hyp_id is None:
+                fallback_id = result.best_effort_per_target.get(target)
+                if fallback_id is not None:
+                    entry = register.get(fallback_id)
+                    best_dynamics[target] = entry
+                    logger.warning(
+                        "Using best-effort (unvalidated) hypothesis for "
+                        "'{}': {} (R2={:.4f})",
+                        target,
+                        entry.hypothesis_id,
+                        entry.training_r2,
+                    )
+                continue
+            best_dynamics[target] = register.get(hyp_id)
+
+        # Reward from second result (or same if no canonical)
+        reward_target = result_reward.best_per_target.get("reward")
+        if reward_target is not None:
+            best_reward = register.get(reward_target)
 
         logger.info(
             "Falsification complete: {}/{} validated, best_dynamics={}, "
             "best_reward={}",
-            result.n_validated,
-            result.n_tested,
+            total_validated,
+            total_tested,
             list(best_dynamics.keys()),
             best_reward.hypothesis_id if best_reward else None,
         )
@@ -556,6 +753,8 @@ class HypothesisFalsificationStage(PipelineStage):
             "best_dynamics": best_dynamics,
             "best_reward": best_reward,
             "variable_names": variable_names,
+            "dynamics_variable_names": dynamics_variable_names,
+            "dynamics_state_names": dynamics_state_names,
             "state_names": state_names,
             "reward_derived_features": reward_derived_features,
         }
@@ -617,9 +816,28 @@ class AnalyticPolicyDerivationStage(PipelineStage):
         best_dynamics = hf_output["best_dynamics"]
         best_reward = hf_output["best_reward"]
         state_names = hf_output["state_names"]
+        dynamics_state_names = hf_output.get(
+            "dynamics_state_names", state_names,
+        )
         reward_derived_features = hf_output.get(
             "reward_derived_features", [],
         )
+
+        # Check for observation analysis (canonical space)
+        oa_output = inputs.get("observation_analysis", {})
+        analysis_result = oa_output.get("analysis_result")
+        obs_to_canonical_fn = None
+        canonical_to_obs_fn = None
+        angular_dims: tuple[int, ...] = ()
+        if analysis_result is not None:
+            obs_to_canonical_fn = analysis_result.obs_to_canonical_fn
+            canonical_to_obs_fn = analysis_result.canonical_to_obs_fn
+            angular_dims = analysis_result.angular_dims
+            logger.info(
+                "iLQR will plan in canonical space: {} (angular={})",
+                dynamics_state_names,
+                angular_dims,
+            )
 
         if not best_dynamics:
             raise ValueError(
@@ -647,7 +865,9 @@ class AnalyticPolicyDerivationStage(PipelineStage):
                 f"action space, got {type(action_space)}"
             )
 
-        state_dim = len(state_names)
+        # Use canonical state names for dynamics if available
+        effective_state_names = dynamics_state_names
+        state_dim = len(effective_state_names)
 
         # Classify dynamics and derive policy
         classifier = HypothesisClassifier()
@@ -655,16 +875,16 @@ class AnalyticPolicyDerivationStage(PipelineStage):
         # Collect validated dynamics expressions by dim index
         dynamics_expressions: dict[int, SymbolicExpression] = {}
         for target, entry in best_dynamics.items():
-            # target = "delta_sN" -> dim_idx = N
+            # target = "delta_<dim_name>" -> dim_idx
             dim_name = target.removeprefix("delta_")
-            dim_idx = state_names.index(dim_name)
+            dim_idx = effective_state_names.index(dim_name)
             dynamics_expressions[dim_idx] = entry.expression
 
         # Determine solver type from all expressions
         all_linear = all(
             classifier.classify(
                 entry.expression.sympy_expr,
-                state_names,
+                effective_state_names,
                 action_names,
             ) == "lqr"
             for entry in best_dynamics.values()
@@ -674,7 +894,9 @@ class AnalyticPolicyDerivationStage(PipelineStage):
         # Warn about missing dynamics dimensions
         missing_dims = set(range(state_dim)) - set(dynamics_expressions.keys())
         if missing_dims:
-            missing_names = [state_names[d] for d in sorted(missing_dims)]
+            missing_names = [
+                effective_state_names[d] for d in sorted(missing_dims)
+            ]
             logger.warning(
                 "Analytic policy: no validated dynamics for dimensions {} "
                 "({}). These will use identity dynamics (delta=0).",
@@ -709,7 +931,7 @@ class AnalyticPolicyDerivationStage(PipelineStage):
                     if dim_idx in dynamics_expressions:
                         ld = extract_linear_dynamics(
                             dynamics_expressions[dim_idx],
-                            state_names,
+                            effective_state_names,
                             action_names,
                             env_params=env_params if env_params else None,
                         )
@@ -773,41 +995,48 @@ class AnalyticPolicyDerivationStage(PipelineStage):
             explained_variance = float(np.mean(r2_values))
 
         else:
-            # MPC solver for nonlinear dynamics
-            from circ_rl.analytic_policy.mpc_solver import MPCConfig
+            # iLQR solver for nonlinear dynamics
+            from circ_rl.analytic_policy.ilqr_solver import (
+                ILQRConfig,
+                ILQRSolver,
+            )
 
             first_entry = next(iter(best_dynamics.values()))
 
-            # Build per-env MPC policies
-            mpc_solutions: dict[int, MPCSolver] = {}
+            # Build per-env iLQR solvers
+            ilqr_solvers: dict[int, ILQRSolver] = {}
 
-            # Get observation bounds for state clamping
-            _ref_env = self._env_family.make_env(0)
-            obs_low = np.asarray(
-                _ref_env.observation_space.low,  # type: ignore[attr-defined]
-                dtype=np.float64,
-            )
-            obs_high = np.asarray(
-                _ref_env.observation_space.high,  # type: ignore[attr-defined]
-                dtype=np.float64,
-            )
-            _ref_env.close()
+            # Obs bounds only used when NOT in canonical space
+            obs_low_clamp: np.ndarray | None = None
+            obs_high_clamp: np.ndarray | None = None
+            if obs_to_canonical_fn is None:
+                _ref_env = self._env_family.make_env(0)
+                obs_low_clamp = np.asarray(
+                    _ref_env.observation_space.low,  # type: ignore[attr-defined]
+                    dtype=np.float64,
+                )
+                obs_high_clamp = np.asarray(
+                    _ref_env.observation_space.high,  # type: ignore[attr-defined]
+                    dtype=np.float64,
+                )
+                _ref_env.close()
 
             for env_idx in range(self._env_family.n_envs):
                 env_params = self._env_family.get_env_params(env_idx)
 
-                # Build dynamics callable: state + action -> next_state
+                # Build dynamics callable in effective (canonical) space
                 dynamics_fn = _build_dynamics_fn(
                     dynamics_expressions,
-                    state_names,
+                    effective_state_names,
                     action_names,
                     state_dim,
                     env_params,
-                    obs_low=obs_low,
-                    obs_high=obs_high,
+                    obs_low=obs_low_clamp,
+                    obs_high=obs_high_clamp,
+                    angular_dims=angular_dims,
                 )
 
-                # Build reward callable
+                # Build reward callable (always in obs space)
                 reward_fn = None
                 if best_reward is not None:
                     reward_fn = _build_reward_fn(
@@ -816,34 +1045,46 @@ class AnalyticPolicyDerivationStage(PipelineStage):
                         action_names,
                         env_params,
                         reward_derived_features,
+                        canonical_to_obs_fn=canonical_to_obs_fn,
                     )
 
-                mpc_config = MPCConfig(
-                    horizon=10,
+                # Build analytic Jacobians in effective (canonical) space
+                jac_state_fn, jac_action_fn = _build_dynamics_jacobian_fns(
+                    dynamics_expressions,
+                    effective_state_names,
+                    action_names,
+                    state_dim,
+                    env_params,
+                )
+
+                ilqr_config = ILQRConfig(
+                    horizon=200,
                     gamma=self._gamma,
                     max_action=float(action_high[0]),
                 )
-                from circ_rl.analytic_policy.mpc_solver import MPCSolver
 
-                mpc_solutions[env_idx] = MPCSolver(
-                    config=mpc_config,
+                ilqr_solvers[env_idx] = ILQRSolver(
+                    config=ilqr_config,
                     dynamics_fn=dynamics_fn,
-                    reward_fn=reward_fn,
+                    reward_fn=reward_fn or _default_reward,
+                    dynamics_jac_state_fn=jac_state_fn,
+                    dynamics_jac_action_fn=jac_action_fn,
                 )
 
-            # Wrap the per-env MPC solvers in AnalyticPolicy
-            # We store them and override get_action per env
-            analytic_policy = _MPCAnalyticPolicy(
+            # Wrap the per-env iLQR solvers
+            analytic_policy = _ILQRAnalyticPolicy(
                 dynamics_hypothesis=first_entry,
                 reward_hypothesis=best_reward,
                 state_dim=state_dim,
                 action_dim=action_dim,
                 n_envs=self._env_family.n_envs,
-                mpc_solvers=mpc_solutions,
+                ilqr_solvers=ilqr_solvers,
                 action_low=action_low,
                 action_high=action_high,
+                obs_to_canonical_fn=obs_to_canonical_fn,
             )
 
+            solver_type = "ilqr"
             r2_values = [e.training_r2 for e in best_dynamics.values()]
             explained_variance = float(np.mean(r2_values))
 
@@ -1302,11 +1543,14 @@ def _build_dynamics_fn(
     env_params: dict[str, float] | None,
     obs_low: np.ndarray | None = None,
     obs_high: np.ndarray | None = None,
+    angular_dims: tuple[int, ...] = (),
 ) -> Any:
-    """Build a dynamics callable for MPC from symbolic expressions.
+    """Build a dynamics callable from symbolic expressions.
 
     :param obs_low: Lower observation bounds (clamp output). Optional.
     :param obs_high: Upper observation bounds (clamp output). Optional.
+    :param angular_dims: State dimensions that are angular coordinates.
+        After adding deltas, these are wrapped to ``[-pi, pi]``.
     :returns: Callable ``(state, action) -> next_state``.
     """
     import sympy
@@ -1335,6 +1579,11 @@ def _build_dynamics_fn(
         for dim_idx, fn in dim_fns.items():
             delta = fn(x)
             next_state[dim_idx] += float(delta[0])
+        # Wrap angular dimensions to [-pi, pi]
+        for d in angular_dims:
+            next_state[d] = float(
+                np.arctan2(np.sin(next_state[d]), np.cos(next_state[d]))
+            )
         # Clamp to observation bounds to prevent polynomial divergence
         if obs_low is not None and obs_high is not None:
             np.clip(next_state, obs_low, obs_high, out=next_state)
@@ -1349,11 +1598,15 @@ def _build_reward_fn(
     action_names: list[str],
     env_params: dict[str, float] | None,
     derived_feature_specs: list[Any] | None = None,
+    canonical_to_obs_fn: Any | None = None,
 ) -> Any:
-    """Build a reward callable for MPC from a symbolic expression.
+    """Build a reward callable from a symbolic expression.
 
     :param derived_feature_specs: DerivedFeatureSpec list for computing
         features from the state at runtime (e.g., theta from cos/sin).
+    :param canonical_to_obs_fn: If set, the callable receives canonical
+        state but reward is expressed in observation space. This function
+        converts canonical -> obs before evaluation.
     :returns: Callable ``(state, action) -> float``.
     """
     import sympy
@@ -1378,22 +1631,133 @@ def _build_reward_fn(
         )
 
         def reward_fn(state: np.ndarray, action: np.ndarray) -> float:
+            obs_state = (
+                canonical_to_obs_fn(state)
+                if canonical_to_obs_fn is not None
+                else state
+            )
             derived = compute_derived_single(
-                derived_feature_specs, state, state_names,
+                derived_feature_specs, obs_state, state_names,
             )
             derived_vals = [
                 derived[spec.name] for spec in derived_feature_specs
             ]
             x = np.concatenate(
-                [state, action, derived_vals],
+                [obs_state, action, derived_vals],
             ).reshape(1, -1)
             return float(fn(x)[0])
     else:
         def reward_fn(state: np.ndarray, action: np.ndarray) -> float:
-            x = np.concatenate([state, action]).reshape(1, -1)
+            obs_state = (
+                canonical_to_obs_fn(state)
+                if canonical_to_obs_fn is not None
+                else state
+            )
+            x = np.concatenate([obs_state, action]).reshape(1, -1)
             return float(fn(x)[0])
 
     return reward_fn
+
+
+def _default_reward(state: np.ndarray, action: np.ndarray) -> float:
+    """Default cost: negative squared state + action norm."""
+    return -float(np.sum(state ** 2) + 0.01 * np.sum(action ** 2))
+
+
+def _build_dynamics_jacobian_fns(
+    dynamics_expressions: dict[int, SymbolicExpression],
+    state_names: list[str],
+    action_names: list[str],
+    state_dim: int,
+    env_params: dict[str, float] | None,
+    obs_low: np.ndarray | None = None,
+    obs_high: np.ndarray | None = None,
+) -> tuple[Any, Any]:
+    r"""Build analytic Jacobian callables from symbolic expressions.
+
+    Uses ``sympy.diff()`` on each dynamics expression to compute
+    exact partial derivatives, then compiles them via ``lambdify``.
+
+    The full dynamics are :math:`x_{t+1} = x_t + \Delta x_t`, so:
+
+    - :math:`A = I + [\partial \Delta x_i / \partial x_j]_{i,j}`
+    - :math:`B = [\partial \Delta x_i / \partial u_j]_{i,j}`
+
+    :param dynamics_expressions: Per-dim symbolic delta expressions.
+    :param state_names: State variable names.
+    :param action_names: Action variable names.
+    :param state_dim: State dimensionality.
+    :param env_params: Environment parameters to substitute.
+    :param obs_low: Observation lower bounds (unused, for API compat).
+    :param obs_high: Observation upper bounds (unused, for API compat).
+    :returns: Tuple ``(jac_state_fn, jac_action_fn)`` where each is
+        a callable ``(state, action) -> matrix``.
+    """
+    import sympy as sp
+
+    all_var_names = list(state_names) + list(action_names)
+    all_symbols = [sp.Symbol(n) for n in all_var_names]
+
+    # Pre-compute substitution dict for env params
+    param_subs: dict[sp.Symbol, float] = {}
+    if env_params:
+        param_subs = {sp.Symbol(k): v for k, v in env_params.items()}
+
+    # Build symbolic Jacobian entries and compile to callables
+    # A_entries[i][j] = compiled callable for d(delta_x_i)/d(x_j)
+    # B_entries[i][j] = compiled callable for d(delta_x_i)/d(u_j)
+    action_dim = len(action_names)
+    state_syms = [sp.Symbol(n) for n in state_names]
+    action_syms = [sp.Symbol(n) for n in action_names]
+
+    # For each dim with an expression, differentiate symbolically
+    a_fns: dict[tuple[int, int], Any] = {}
+    b_fns: dict[tuple[int, int], Any] = {}
+
+    for dim_idx, expr in dynamics_expressions.items():
+        sympy_expr = expr.sympy_expr
+        if param_subs:
+            sympy_expr = sympy_expr.subs(param_subs)
+
+        # Derivatives w.r.t. state variables
+        for j, s_sym in enumerate(state_syms):
+            deriv = sp.diff(sympy_expr, s_sym)
+            deriv_simplified = sp.simplify(deriv)
+            if deriv_simplified != 0:
+                a_fns[(dim_idx, j)] = sp.lambdify(
+                    all_symbols, deriv_simplified, modules=["numpy"],
+                )
+
+        # Derivatives w.r.t. action variables
+        for j, a_sym in enumerate(action_syms):
+            deriv = sp.diff(sympy_expr, a_sym)
+            deriv_simplified = sp.simplify(deriv)
+            if deriv_simplified != 0:
+                b_fns[(dim_idx, j)] = sp.lambdify(
+                    all_symbols, deriv_simplified, modules=["numpy"],
+                )
+
+    def jac_state_fn(
+        state: np.ndarray, action: np.ndarray,
+    ) -> np.ndarray:
+        """Evaluate df/dx at (state, action). Shape (n, n)."""
+        a_mat = np.eye(state_dim)  # Identity for x_{t+1} = x_t + delta
+        args = [*state, *action]
+        for (di, dj), fn in a_fns.items():
+            a_mat[di, dj] += float(fn(*args))
+        return a_mat
+
+    def jac_action_fn(
+        state: np.ndarray, action: np.ndarray,
+    ) -> np.ndarray:
+        """Evaluate df/du at (state, action). Shape (n, m)."""
+        b_mat = np.zeros((state_dim, action_dim))
+        args = [*state, *action]
+        for (di, dj), fn in b_fns.items():
+            b_mat[di, dj] = float(fn(*args))
+        return b_mat
+
+    return jac_state_fn, jac_action_fn
 
 
 def _compute_predicted_returns(
@@ -1503,46 +1867,58 @@ def _compute_predicted_returns(
     return predicted
 
 
-class _MPCAnalyticPolicy:
-    """AnalyticPolicy wrapper for per-env MPC solvers.
+class _ILQRAnalyticPolicy:
+    """Stateful policy wrapper for per-env iLQR solvers.
 
-    Implements the same get_action(state, env_idx) interface as
-    AnalyticPolicy but dispatches to per-env MPC solvers.
+    Plans a full trajectory on first call per env (or when the
+    step counter exceeds the horizon), then executes using the
+    time-varying feedback gains for closed-loop correction:
+
+        u_t = u*_t + K_t @ (x_t - x*_t)
+
+    Call ``reset(env_idx)`` before each new episode to clear
+    cached plans.
     """
 
     def __init__(
         self,
-        dynamics_hypothesis: Any,
-        reward_hypothesis: Any,
+        dynamics_hypothesis: HypothesisEntry,
+        reward_hypothesis: HypothesisEntry | None,
         state_dim: int,
         action_dim: int,
         n_envs: int,
-        mpc_solvers: dict[int, Any],
+        ilqr_solvers: dict[int, ILQRSolver],
         action_low: np.ndarray | None = None,
         action_high: np.ndarray | None = None,
+        obs_to_canonical_fn: Any | None = None,
     ) -> None:
         self._dynamics_hypothesis = dynamics_hypothesis
         self._reward_hypothesis = reward_hypothesis
         self._state_dim = state_dim
         self._action_dim = action_dim
         self._n_envs = n_envs
-        self._mpc_solvers = mpc_solvers
+        self._ilqr_solvers = ilqr_solvers
         self._action_low = action_low
         self._action_high = action_high
-        self.solver_type = "mpc"
+        self._obs_to_canonical_fn = obs_to_canonical_fn
+        self.solver_type = "ilqr"
+
+        # Stateful: cached plans and step counters per env
+        self._solutions: dict[int, ILQRSolution] = {}
+        self._steps: dict[int, int] = {}
 
     @property
     def n_free_parameters(self) -> int:
-        """MPC has no learned parameters."""
+        """iLQR has no learned parameters."""
         return 0
 
     @property
     def complexity(self) -> int:
         """Symbolic complexity of the underlying hypothesis."""
-        from circ_rl.hypothesis.expression import SymbolicExpression as _SE
+        from circ_rl.hypothesis.expression import SymbolicExpression
 
         expr = self._dynamics_hypothesis.expression
-        if isinstance(expr, _SE):
+        if isinstance(expr, SymbolicExpression):
             return expr.complexity
         return self._dynamics_hypothesis.complexity
 
@@ -1551,19 +1927,68 @@ class _MPCAnalyticPolicy:
         state: np.ndarray,
         env_idx: int,
     ) -> np.ndarray:
-        """Compute the optimal action via MPC.
+        """Compute the optimal action via iLQR trajectory + feedback.
 
-        :param state: Current state, shape ``(state_dim,)``.
+        On first call for a given env_idx (or after reset), plans
+        a full trajectory. Subsequent calls use the cached plan with
+        feedback correction.
+
+        When ``obs_to_canonical_fn`` is set, the input ``state`` is
+        an observation-space vector which is converted to canonical
+        coordinates before planning and feedback computation.
+
+        :param state: Current state in observation space,
+            shape ``(obs_dim,)``.
         :param env_idx: Environment index.
         :returns: Optimal action, shape ``(action_dim,)``.
         """
-        solver = self._mpc_solvers.get(env_idx)
+        # Convert obs -> canonical if needed
+        if self._obs_to_canonical_fn is not None:
+            canonical_state = self._obs_to_canonical_fn(
+                np.asarray(state, dtype=np.float64),
+            )
+        else:
+            canonical_state = np.asarray(state, dtype=np.float64)
+
+        solver = self._ilqr_solvers.get(env_idx)
         if solver is None:
-            solver = next(iter(self._mpc_solvers.values()))
+            solver = next(iter(self._ilqr_solvers.values()))
 
-        action = solver.solve(state, self._action_dim)
+        horizon = solver.config.horizon
 
+        # Plan if needed: first call or step exceeds horizon
+        needs_plan = (
+            env_idx not in self._solutions
+            or self._steps[env_idx] >= horizon
+        )
+
+        if needs_plan:
+            sol = solver.plan(canonical_state, self._action_dim)
+            self._solutions[env_idx] = sol
+            self._steps[env_idx] = 0
+
+        sol = self._solutions[env_idx]
+        t = self._steps[env_idx]
+
+        # Closed-loop: nominal + feedback correction
+        dx = canonical_state - sol.nominal_states[t]  # (state_dim,)
+        action = sol.nominal_actions[t] + sol.feedback_gains[t] @ dx
+
+        # Clip to action bounds
         if self._action_low is not None and self._action_high is not None:
             action = np.clip(action, self._action_low, self._action_high)
 
+        self._steps[env_idx] = t + 1
         return action
+
+    def reset(self, env_idx: int | None = None) -> None:
+        """Clear cached plan for re-planning.
+
+        :param env_idx: Specific env to reset, or None to reset all.
+        """
+        if env_idx is None:
+            self._solutions.clear()
+            self._steps.clear()
+        else:
+            self._solutions.pop(env_idx, None)
+            self._steps.pop(env_idx, None)

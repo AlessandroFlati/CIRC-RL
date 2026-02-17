@@ -82,6 +82,7 @@ class StructuralConsistencyTest:
         target_dim_idx: int,
         variable_names: list[str],
         derived_columns: dict[str, np.ndarray] | None = None,
+        wrap_angular: bool = False,
     ) -> StructuralConsistencyResult:
         r"""Test structural consistency of a hypothesis across environments.
 
@@ -99,6 +100,7 @@ class StructuralConsistencyTest:
             (for dynamics hypotheses) or -1 for reward.
         :param variable_names: Variable names matching the expression's
             free symbols.
+        :param wrap_angular: If True, wrap target delta via atan2(sin, cos).
         :returns: StructuralConsistencyResult.
         """
         unique_envs = sorted(set(dataset.env_ids.tolist()))
@@ -120,6 +122,8 @@ class StructuralConsistencyTest:
                 dataset.next_states[:, target_dim_idx]
                 - dataset.states[:, target_dim_idx]
             )  # (N,)
+            if wrap_angular:
+                targets = np.arctan2(np.sin(targets), np.cos(targets))
         else:
             targets = dataset.rewards  # (N,)
 

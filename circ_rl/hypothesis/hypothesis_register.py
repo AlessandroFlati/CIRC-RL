@@ -212,6 +212,25 @@ class HypothesisRegister:
 
         return pareto
 
+    def select_best_effort(
+        self,
+        target_variable: str,
+    ) -> HypothesisEntry | None:
+        """Select the best hypothesis regardless of validation status.
+
+        Returns the hypothesis with the highest training :math:`R^2`
+        among ALL hypotheses for the target variable, including
+        falsified ones. Use this as a fallback when no validated
+        hypothesis exists.
+
+        :param target_variable: The target variable.
+        :returns: The best hypothesis by R2, or None if no hypotheses exist.
+        """
+        all_entries = self.get_by_target(target_variable)
+        if not all_entries:
+            return None
+        return max(all_entries, key=lambda e: e.training_r2)
+
     def select_best(
         self,
         target_variable: str,

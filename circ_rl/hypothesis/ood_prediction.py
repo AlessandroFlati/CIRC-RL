@@ -80,6 +80,7 @@ class OODPredictionTest:
         train_env_ids: list[int] | None = None,
         held_out_env_ids: list[int] | None = None,
         derived_columns: dict[str, np.ndarray] | None = None,
+        wrap_angular: bool = False,
     ) -> OODPredictionResult:
         """Test OOD prediction of a hypothesis.
 
@@ -92,6 +93,7 @@ class OODPredictionTest:
             automatically using held_out_fraction.
         :param held_out_env_ids: Held-out environment IDs. If None, split
             automatically.
+        :param wrap_angular: If True, wrap target delta via atan2(sin, cos).
         :returns: OODPredictionResult.
         """
         unique_envs = sorted(set(dataset.env_ids.tolist()))
@@ -116,6 +118,10 @@ class OODPredictionTest:
                 dataset.next_states[:, target_dim_idx]
                 - dataset.states[:, target_dim_idx]
             )
+            if wrap_angular:
+                all_targets = np.arctan2(
+                    np.sin(all_targets), np.cos(all_targets),
+                )
         else:
             all_targets = dataset.rewards
 

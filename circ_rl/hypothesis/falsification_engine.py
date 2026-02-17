@@ -9,6 +9,7 @@ Falsification).
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -77,12 +78,19 @@ class FalsificationResult:
     :param n_falsified: Number that failed at least one test.
     :param best_per_target: Best validated hypothesis ID per target
         variable, or None if no survivors.
+    :param best_effort_per_target: Best hypothesis by training R2
+        regardless of validation status, for targets with no
+        validated hypothesis. Only populated for targets where
+        ``best_per_target`` is None.
     """
 
     n_tested: int
     n_validated: int
     n_falsified: int
     best_per_target: dict[str, str | None]
+    best_effort_per_target: dict[str, str] = dataclasses.field(
+        default_factory=dict,
+    )
 
 
 class FalsificationEngine:
@@ -115,6 +123,7 @@ class FalsificationEngine:
         state_feature_names: list[str],
         variable_names: list[str],
         derived_columns: dict[str, np.ndarray] | None = None,
+        angular_dims: tuple[int, ...] = (),
     ) -> FalsificationResult:
         """Run falsification on all untested hypotheses.
 
@@ -122,6 +131,8 @@ class FalsificationEngine:
         :param dataset: Multi-environment data.
         :param state_feature_names: Names of state features.
         :param variable_names: Variable names for expression evaluation.
+        :param angular_dims: Indices of angular dimensions (deltas wrapped
+            via atan2 to avoid discontinuities).
         :returns: FalsificationResult summary.
         """
         cfg = self._config
@@ -170,10 +181,16 @@ class FalsificationEngine:
                 entry.target_variable, state_feature_names,
             )
 
+            # Check if target is angular (needs delta wrapping)
+            wrap_target = (
+                target_dim_idx >= 0 and target_dim_idx in angular_dims
+            )
+
             # Test 1: Structural consistency
             struct_result = structural_test.test(
                 expr, dataset, target_dim_idx, variable_names,
                 derived_columns=derived_columns,
+                wrap_angular=wrap_target,
             )
             if not struct_result.passed:
                 register.update_status(
@@ -190,6 +207,7 @@ class FalsificationEngine:
             ood_result = ood_test.test(
                 expr, dataset, target_dim_idx, variable_names,
                 derived_columns=derived_columns,
+                wrap_angular=wrap_target,
             )
             if not ood_result.passed:
                 register.update_status(
@@ -228,16 +246,35 @@ class FalsificationEngine:
             mdl_score = mdl_scorer.score(
                 expr, dataset, target_dim_idx, variable_names,
                 derived_columns=derived_columns,
+                wrap_angular=wrap_target,
             )
             register.set_mdl_score(entry.hypothesis_id, mdl_score.total)
 
         # Select best per target
         best_per_target: dict[str, str | None] = {}
+        best_effort_per_target: dict[str, str] = {}
         for target in register.target_variables:
             best = register.select_best(target)
             best_per_target[target] = (
                 best.hypothesis_id if best is not None else None
             )
+
+            # For targets with no validated hypothesis, track best-effort
+            if best is None:
+                best_effort = register.select_best_effort(target)
+                if best_effort is not None:
+                    best_effort_per_target[target] = (
+                        best_effort.hypothesis_id
+                    )
+                    logger.warning(
+                        "No validated hypothesis for '{}'. "
+                        "Best-effort fallback: '{}' (R2={:.4f}, "
+                        "reason: {})",
+                        target,
+                        best_effort.hypothesis_id,
+                        best_effort.training_r2,
+                        best_effort.falsification_reason,
+                    )
 
         logger.info(
             "Falsification complete: {}/{} validated, {}/{} falsified, "
@@ -252,6 +289,7 @@ class FalsificationEngine:
             n_validated=n_validated,
             n_falsified=n_falsified,
             best_per_target=best_per_target,
+            best_effort_per_target=best_effort_per_target,
         )
 
     @staticmethod

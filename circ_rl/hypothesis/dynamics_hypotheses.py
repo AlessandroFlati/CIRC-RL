@@ -65,6 +65,7 @@ class DynamicsHypothesisGenerator:
         state_feature_names: list[str],
         register: HypothesisRegister,
         env_param_names: list[str] | None = None,
+        angular_dims: tuple[int, ...] = (),
     ) -> list[str]:
         """Generate dynamics hypotheses for all state dimensions.
 
@@ -82,6 +83,9 @@ class DynamicsHypothesisGenerator:
         :param env_param_names: Names of environment parameters (raw, not
             ``ep_``-prefixed). Required if include_env_params=True and
             dataset has env_params.
+        :param angular_dims: Indices of canonical dimensions that represent
+            angular coordinates. Deltas for these dimensions are wrapped
+            via ``atan2(sin(d), cos(d))`` to avoid discontinuities.
         :returns: List of hypothesis_ids that were registered.
         """
         variant_dims = set(transition_result.variant_dims)
@@ -111,8 +115,10 @@ class DynamicsHypothesisGenerator:
             dim_env_params = env_param_names
 
             # Build input features and target
+            is_angular = dim_idx in angular_dims
             x, y, var_names = self._build_regression_data(
                 dataset, dim_idx, state_feature_names, dim_env_params,
+                wrap_angular=is_angular,
             )
 
             logger.info(
@@ -143,9 +149,12 @@ class DynamicsHypothesisGenerator:
         dim_idx: int,
         state_feature_names: list[str],
         env_param_names: list[str] | None,
+        wrap_angular: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, list[str]]:
         """Build input/target arrays for symbolic regression.
 
+        :param wrap_angular: If True, wrap the delta via atan2(sin, cos)
+            to handle angular discontinuities at +/-pi.
         :returns: Tuple of (x, y, variable_names).
         """
         states = dataset.states  # (N, state_dim)
@@ -154,6 +163,8 @@ class DynamicsHypothesisGenerator:
 
         # Target: delta_s_i = next_states[:, i] - states[:, i]
         y = next_states[:, dim_idx] - states[:, dim_idx]  # (N,)
+        if wrap_angular:
+            y = np.arctan2(np.sin(y), np.cos(y))  # (N,)
 
         # Input features: [states, actions, env_params (optional)]
         actions_2d = actions if actions.ndim == 2 else actions[:, np.newaxis]
