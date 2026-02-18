@@ -593,7 +593,7 @@ def main() -> None:
     os.makedirs(output_dir, exist_ok=True)
 
     n_test_envs = 50
-    max_steps = 400
+    max_steps = 600
 
     # Both policies use max_torque=100 for fair comparison
     v1_max_torque = 100.0
@@ -765,7 +765,7 @@ def main() -> None:
         v2_all_frames,
         v2_labels,
         v2_video_path,
-        fps=20,
+        fps=60,
         n_cols=10,
     )
     print(f"  v2 video: {v2_video_path}")
@@ -777,7 +777,7 @@ def main() -> None:
             v1_all_frames,
             v1_labels,
             v1_video_path,
-            fps=20,
+            fps=60,
             n_cols=10,
         )
         print(f"  v1 video: {v1_video_path}")

@@ -192,6 +192,28 @@ Lexicographic ordering means: we only consider priority $k+1$ among policies tha
 
 The dynamics scale $D_e$ quantifies how much one unit of action affects state transitions in environment $e$. The ratio $r_e = D_e / D_{\text{ref}}$ will be used in the analytic policy derivation (Phase 5) to normalize actions across environments.
 
+### 3.3b Phase 2b: Observation Analysis and Canonical Reparametrization
+
+Before hypothesis generation, the raw observation space may contain **algebraic constraints** that reduce the effective dimensionality. Detecting and exploiting these constraints is critical for symbolic regression: redundant coordinates inflate the search space, and trigonometric identities (e.g., $\cos^2\theta + \sin^2\theta = 1$) create degenerate features that confuse SR.
+
+**Constraint Detection.** For each pair of observation dimensions $(s_i, s_j)$:
+1. Compute $r_{ij} = s_i^2 + s_j^2$ across all samples
+2. If $\text{std}(r_{ij}) / \text{mean}(r_{ij}) < \epsilon$ (e.g., $\epsilon = 0.001$), identify a **circle constraint**: $(s_i, s_j)$ are the cosine and sine of some underlying angle
+
+**Canonical Reparametrization.** When a circle constraint is detected on $(s_i, s_j)$:
+1. Compute the canonical angle: $\phi = \text{atan2}(s_j, s_i)$
+2. Replace the two constrained dimensions with a single angular dimension $\phi$
+3. Build a canonical dataset where states are represented as $(\phi, s_{\text{remaining}})$
+
+This reduces the state dimensionality (e.g., from 3 to 2 for the pendulum: $(\cos\theta, \sin\theta, \dot\theta) \to (\phi_0, s_2)$) and provides physically meaningful coordinates for symbolic regression.
+
+**Coordinate-Aware Pipeline.** When canonical coordinates are available:
+- Dynamics hypotheses are generated and tested in **canonical space** (Phase 3-4)
+- Reward hypotheses are generated in **observation space** (since the reward function is defined over raw observations)
+- The analytic policy (Phase 5) plans in canonical space, with bidirectional mappings between canonical and observation spaces
+
+**Derived Features.** Observation-space features may be pre-computed from canonical coordinates for use in reward hypothesis generation. For example, $\theta = \text{atan2}(\sin\theta, \cos\theta)$ is a derived feature enabling compact reward expressions like $R = -(\theta^2 + 0.1\dot\theta^2 + 0.001 a^2)$.
+
 ### 3.4 Phase 3: Structural Hypothesis Generation
 
 **This phase replaces the neural policy optimization of classical RL with scientific hypothesis generation.** The goal is to discover explicit, analytic functional forms for the environment dynamics and reward mechanism.
@@ -205,9 +227,10 @@ $$\Delta s_i = h_i(s, a; \theta_e)$$
 where $\theta_e$ are the environment parameters. The tool is **symbolic regression** (e.g., PySR, SINDy), which takes as input $(s, a, \theta_e)$ and target $\Delta s_i$, and proposes candidate analytic expressions ordered by complexity and accuracy -- a Pareto front of explicit hypotheses.
 
 **Procedure:**
-1. Pool exploration data from all training environments
-2. Run symbolic regression with complexity penalty, generating a Pareto front of candidate expressions $\lbrace h_i^{(1)}, h_i^{(2)}, \ldots, h_i^{(K)}\rbrace$ ordered from simplest to most complex
+1. Pool exploration data from all training environments (using canonical coordinates when available from Phase 2b)
+2. Run symbolic regression with complexity penalty across **multiple random seeds** (e.g., 3 runs with different seeds), generating a Pareto front of candidate expressions $\lbrace h_i^{(1)}, h_i^{(2)}, \ldots, h_i^{(K)}\rbrace$ ordered from simplest to most complex. Multi-seed runs mitigate the stochasticity of SR search and increase Pareto front coverage.
 3. Each candidate is an **explicit, falsifiable hypothesis** about the functional form of the dynamics
+4. **Operator constraints** prevent degenerate expressions: nested constraints (e.g., $\sin(\sin(\cdot))$ forbidden) and complexity caps on operator arguments keep the search space tractable
 
 **Example (Inverted Pendulum).** Symbolic regression on angular velocity data might return:
 - $h^{(1)}$: $\Delta\omega \approx c_1 \cdot a$ (too simple, ignores gravity)
@@ -227,7 +250,9 @@ $$R = g(s, a)$$
 
 with no dependence on $\theta_e$. If not invariant, seek $R = g(s, a; \theta_e)$ with explicit parametric dependence.
 
-The same symbolic regression approach applies. In many domains, the reward function is **designer-specified** (not learned), in which case this step is trivial: the reward hypothesis is the reward function itself.
+The same symbolic regression approach applies, but reward hypotheses are generated in **observation space** (not canonical space), since the reward function is typically defined over raw observations. Derived features from Phase 2b (e.g., $\theta = \text{atan2}(\sin\theta, \cos\theta)$) are included as additional SR features to enable compact reward expressions.
+
+In many domains, the reward function is **designer-specified** (not learned), in which case this step is trivial: the reward hypothesis is the reward function itself.
 
 #### 3.4.3 The Hypothesis Register
 
@@ -240,6 +265,12 @@ Each candidate hypothesis is formally registered with:
 ### 3.5 Phase 4: Hypothesis Falsification
 
 **This is the core Popperian step.** Each hypothesis from Phase 3 is subjected to systematic falsification. A hypothesis that survives all tests is provisionally accepted; one that fails any test is rejected.
+
+**Coordinate-Aware Falsification.** When canonical coordinates are used (Phase 2b), the falsification engine runs in two passes:
+1. **Dynamics pass**: tests dynamics hypotheses with canonical variable names and canonical data
+2. **Reward pass**: tests reward hypotheses with observation-space variable names and original data
+
+This separation is critical because dynamics and reward hypotheses live in different coordinate systems. Without it, reward hypotheses using observation-space names (e.g., $\theta$) would be incorrectly falsified against canonical names (e.g., $\phi_0$).
 
 #### 3.5.1 Cross-Environment Structural Consistency
 
@@ -278,11 +309,17 @@ The most stringent test: use the hypothesis to simulate trajectories forward in 
 
 #### 3.5.4 Selection Among Surviving Hypotheses
 
-Among hypotheses that survive all falsification tests, select using the **Minimum Description Length** (MDL) principle or equivalently the **Bayesian Information Criterion** (BIC):
+Among hypotheses that survive all falsification tests, select using the **Pareto front with $R^2$ threshold** method:
 
-$$\text{MDL}(h) = -\log P(D | h) + C_{\text{sym}}(h) \cdot \log(n)$$
+1. Construct the Pareto front of validated hypotheses in (complexity, $R^2$) space, sorted from simplest to most complex
+2. Walk the front from simplest to most complex; return the **first hypothesis whose training $R^2 \geq \tau$** (default $\tau = 0.999$)
+3. If no hypothesis meets the threshold, fall back to the highest-$R^2$ hypothesis on the Pareto front
 
-where $D$ is the data, $C_{\text{sym}}(h)$ is the symbolic complexity, and $n$ is the sample size. This selects the simplest hypothesis compatible with the data.
+This replaces pure MDL/BIC scoring, which exhibits a pathology on large datasets: the $O(n)$ data-fit term dominates the $O(\log n)$ complexity penalty, causing selection of overly complex expressions that overfit to noise.
+
+**Best-effort fallback.** When no validated hypothesis exists for a target variable (all were falsified), the system selects the hypothesis with the highest training $R^2$ regardless of validation status, logged as a best-effort fallback. This preserves usability even when falsification is overly strict, while clearly marking the hypothesis as unvalidated.
+
+For reference, the MDL score $\text{MDL}(h) = -\log P(D | h) + C_{\text{sym}}(h) \cdot \log(n)$ is still computed and stored in the hypothesis register for diagnostic purposes.
 
 ### 3.6 Phase 5: Analytic Policy Derivation
 
@@ -324,11 +361,28 @@ $$V^*(s) = \max_a \left[ R(s, a) + \gamma \mathbb{E}[V^*(h(s, a; \theta_e) + \si
 
 For specific functional forms of $h$, this PDE may have closed-form solutions or efficient numerical solutions (e.g., via spectral methods, finite differences).
 
+**Iterative LQR (iLQR).** For nonlinear dynamics with a known analytic form, the **iterative Linear-Quadratic Regulator** (Tassa et al. 2012) provides an efficient trajectory optimization method:
+
+1. **Forward pass**: roll out the trajectory under the current action sequence
+2. **Backward pass**: linearize dynamics (Jacobians $A_t, B_t$) and quadraticize cost at each timestep, then solve the Riccati recursion to obtain feedforward $k_t$ and feedback $K_t$ gains
+3. **Line search**: apply the control update $u_t = \bar{u}_t + \alpha k_t + K_t(x_t - \bar{x}_t)$ with backtracking on $\alpha$
+4. **Regularization**: Levenberg-Marquardt damping on $Q_{uu}$ ensures positive-definiteness
+
+The closed-loop policy uses time-varying feedback gains: $a_t = \bar{a}_t + K_t (s_t - \bar{s}_t)$, providing robustness to perturbations from the nominal trajectory.
+
+**Multi-start optimization.** iLQR is a local optimizer that converges to the nearest local optimum. For systems with non-convex cost landscapes (e.g., pendulum swing-up), the zero-initialized action sequence may converge to a poor local minimum. Multi-start optimization runs iLQR from $N$ random action initializations $u^{(i)} \sim \mathcal{U}[-u_{\max}, u_{\max}]$ in addition to the default (zero or warm-start), returning the best solution:
+
+$$\bar{u}^* = \arg\max_{i \in \{0, \ldots, N\}} J\bigl(\text{iLQR}(s_0, u^{(i)})\bigr)$$
+
+This is embarrassingly parallel and dramatically improves performance on high-inertia systems where the swing-up requires multi-swing energy pumping that a single zero-init run cannot discover.
+
+When analytic Jacobians are available (computed symbolically via $\partial h / \partial s$ and $\partial h / \partial a$ from the validated hypothesis), iLQR avoids finite-difference approximation and gains both speed and numerical accuracy.
+
 **Model Predictive Control.** For complex nonlinear dynamics where closed-form solutions are unavailable, solve the optimization problem online over a receding horizon:
 
 $$a^*_t = \arg\max_{a_t, \ldots, a_{t+H}} \sum_{k=0}^{H} \gamma^k R(s_{t+k}, a_{t+k}) \quad \text{s.t.} \quad s_{t+k+1} = h(s_{t+k}, a_{t+k}; \theta_e)$$
 
-The validated dynamics hypothesis serves as the **model** in model predictive control, but unlike learned neural world models, this model is an explicit analytic expression with known error bounds from the falsification phase.
+The validated dynamics hypothesis serves as the **model** in model predictive control, but unlike learned neural world models, this model is an explicit analytic expression with known error bounds from the falsification phase. iLQR is the default MPC solver in CIRC-RL: the planning horizon equals the episode length, and replanning occurs at regular intervals with the previous solution as warm-start.
 
 #### 3.6.3 Action Normalization for Varying Dynamics
 
@@ -568,9 +622,10 @@ This diagnostic capability is **impossible** with neural network policies, where
 |-------|--------------|----------|
 | Phase 1 (Causal Discovery) | PC algorithm, GES, FCI | Domain expert elicitation |
 | Phase 2 (Invariance Testing) | LOEO $R^2$, linear regression | Nonparametric tests |
-| Phase 3 (Hypothesis Generation) | PySR (symbolic regression), SINDy | Manual hypothesis formulation from domain knowledge |
-| Phase 4 (Falsification) | Statistical testing (F-test, $\chi^2$), bootstrap CI | Cross-validation |
-| Phase 5 (Policy Derivation) | LQR/DARE solvers, CasADi (optimal control), MPC solvers | Shooting methods |
+| Phase 2b (Observation Analysis) | Circle constraint detection, atan2 reparametrization | Manual coordinate identification |
+| Phase 3 (Hypothesis Generation) | PySR (multi-seed symbolic regression), SINDy | Manual hypothesis formulation from domain knowledge |
+| Phase 4 (Falsification) | Coordinate-aware two-pass falsification, Pareto $R^2$ threshold selection | Cross-validation, MDL/BIC scoring |
+| Phase 5 (Policy Derivation) | LQR/DARE solvers, iLQR with multi-start optimization, MPC | Shooting methods, CasADi |
 | Phase 6 (Residual Learning) | PPO with bounded correction | SAC, TD3 |
 | Phase 7 (Validation) | Trajectory simulation, statistical comparison | Monte Carlo testing |
 
