@@ -2,7 +2,7 @@
 
 Stores, queries, and manages candidate hypotheses through their lifecycle
 (untested -> validated / falsified). Supports Pareto front extraction
-and MDL-based selection.
+and MDL-based or Pareto-threshold-based selection.
 
 See ``CIRC-RL_Framework.md`` Section 3.4.3 (The Hypothesis Register)
 and Section 3.5.4 (Selection Among Surviving Hypotheses).
@@ -230,6 +230,57 @@ class HypothesisRegister:
         if not all_entries:
             return None
         return max(all_entries, key=lambda e: e.training_r2)
+
+    def select_best_pareto(
+        self,
+        target_variable: str,
+        r2_threshold: float = 0.999,
+    ) -> HypothesisEntry | None:
+        r"""Select the simplest validated hypothesis exceeding an R2 threshold.
+
+        Walks the Pareto front (complexity vs :math:`R^2`) of validated
+        hypotheses from simplest to most complex. Returns the first
+        hypothesis whose training :math:`R^2 \geq` ``r2_threshold``.
+        If none exceed the threshold, falls back to the hypothesis with
+        the highest :math:`R^2` on the Pareto front.
+
+        This avoids the MDL pathology where :math:`O(n)` data-fit dominates
+        :math:`O(\log n)` complexity penalty for large datasets, causing
+        selection of overly complex expressions.
+
+        See ``CIRC-RL_Framework.md`` Section 3.5.4.
+
+        :param target_variable: The target variable.
+        :param r2_threshold: Minimum :math:`R^2` threshold. Default 0.999.
+        :returns: The selected hypothesis, or None if no validated
+            hypotheses exist.
+        """
+        pareto = self.pareto_front(
+            target_variable, status_filter=HypothesisStatus.VALIDATED,
+        )
+        if not pareto:
+            return None
+
+        # Walk from simplest to most complex
+        for entry in pareto:
+            if entry.training_r2 >= r2_threshold:
+                logger.info(
+                    "Pareto selection for '{}': '{}' "
+                    "(complexity={}, R2={:.6f}, threshold={})",
+                    target_variable, entry.hypothesis_id,
+                    entry.complexity, entry.training_r2, r2_threshold,
+                )
+                return entry
+
+        # No entry meets threshold -> pick highest R2 on Pareto front
+        best = max(pareto, key=lambda e: e.training_r2)
+        logger.info(
+            "Pareto selection for '{}': no entry meets R2>={}, "
+            "falling back to best R2: '{}' (complexity={}, R2={:.6f})",
+            target_variable, r2_threshold,
+            best.hypothesis_id, best.complexity, best.training_r2,
+        )
+        return best
 
     def select_best(
         self,

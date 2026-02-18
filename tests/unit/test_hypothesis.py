@@ -237,3 +237,62 @@ class TestHypothesisRegister:
         validated = reg.get_by_status(HypothesisStatus.VALIDATED)
         assert len(validated) == 1
         assert validated[0].hypothesis_id == "h1"
+
+    def test_select_best_pareto_threshold_met_by_simplest(self):
+        """When simplest Pareto entry meets R2 threshold, select it."""
+        reg = HypothesisRegister()
+        reg.register(_make_entry("h1", complexity=3, r2=0.999))
+        reg.register(_make_entry("h2", complexity=7, r2=0.9995))
+        reg.register(_make_entry("h3", complexity=15, r2=0.99999))
+
+        for hid in ("h1", "h2", "h3"):
+            reg.update_status(hid, HypothesisStatus.VALIDATED)
+
+        best = reg.select_best_pareto("delta_s0", r2_threshold=0.999)
+        assert best is not None
+        assert best.hypothesis_id == "h1"
+
+    def test_select_best_pareto_threshold_met_by_middle(self):
+        """When simplest doesn't meet threshold, skip to next on Pareto front."""
+        reg = HypothesisRegister()
+        reg.register(_make_entry("h1", complexity=3, r2=0.99))
+        reg.register(_make_entry("h2", complexity=7, r2=0.9995))
+        reg.register(_make_entry("h3", complexity=15, r2=0.99999))
+
+        for hid in ("h1", "h2", "h3"):
+            reg.update_status(hid, HypothesisStatus.VALIDATED)
+
+        best = reg.select_best_pareto("delta_s0", r2_threshold=0.999)
+        assert best is not None
+        assert best.hypothesis_id == "h2"
+
+    def test_select_best_pareto_no_threshold_met_fallback(self):
+        """When no Pareto entry meets threshold, fall back to highest R2."""
+        reg = HypothesisRegister()
+        reg.register(_make_entry("h1", complexity=3, r2=0.9))
+        reg.register(_make_entry("h2", complexity=7, r2=0.95))
+        reg.register(_make_entry("h3", complexity=15, r2=0.97))
+
+        for hid in ("h1", "h2", "h3"):
+            reg.update_status(hid, HypothesisStatus.VALIDATED)
+
+        best = reg.select_best_pareto("delta_s0", r2_threshold=0.999)
+        assert best is not None
+        assert best.hypothesis_id == "h3"
+
+    def test_select_best_pareto_no_validated(self):
+        """Returns None when no validated hypotheses exist."""
+        reg = HypothesisRegister()
+        reg.register(_make_entry("h1", complexity=3, r2=0.999))
+        assert reg.select_best_pareto("delta_s0") is None
+
+    def test_select_best_pareto_single_validated(self):
+        """Single validated hypothesis is returned regardless of threshold."""
+        reg = HypothesisRegister()
+        reg.register(_make_entry("h1", complexity=5, r2=0.8))
+        reg.update_status("h1", HypothesisStatus.VALIDATED)
+
+        # R2=0.8 < threshold=0.999, but it's the only one -> fallback
+        best = reg.select_best_pareto("delta_s0", r2_threshold=0.999)
+        assert best is not None
+        assert best.hypothesis_id == "h1"

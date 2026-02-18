@@ -360,3 +360,44 @@ class TestILQRSolver:
         # The optimal action should be near zero
         assert abs(sol.nominal_actions[0, 0]) < 0.5
         assert sol.total_reward > -1.0
+
+    def test_random_restarts_improve_or_match(self):
+        """Multi-start iLQR should match or beat zero-init."""
+        config_zero = ILQRConfig(
+            horizon=30,
+            max_iterations=30,
+            gamma=0.99,
+            max_action=5.0,
+            n_random_restarts=0,
+        )
+        config_multi = ILQRConfig(
+            horizon=30,
+            max_iterations=30,
+            gamma=0.99,
+            max_action=5.0,
+            n_random_restarts=3,
+        )
+
+        solver_zero = ILQRSolver(
+            config=config_zero,
+            dynamics_fn=_nonlinear_dynamics,
+            reward_fn=_nonlinear_reward,
+        )
+        solver_multi = ILQRSolver(
+            config=config_multi,
+            dynamics_fn=_nonlinear_dynamics,
+            reward_fn=_nonlinear_reward,
+        )
+
+        initial_state = np.array([2.0])
+        sol_zero = solver_zero.plan(initial_state, action_dim=1)
+        sol_multi = solver_multi.plan(initial_state, action_dim=1)
+
+        # Multi-start should be at least as good as zero-init
+        assert sol_multi.total_reward >= sol_zero.total_reward - 1e-6
+
+        # Solution shapes should be correct
+        assert sol_multi.nominal_states.shape == (31, 1)
+        assert sol_multi.nominal_actions.shape == (30, 1)
+        assert len(sol_multi.feedback_gains) == 30
+        assert len(sol_multi.feedforward_gains) == 30

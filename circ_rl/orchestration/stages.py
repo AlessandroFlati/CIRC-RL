@@ -624,6 +624,7 @@ class HypothesisFalsificationStage(PipelineStage):
             FalsificationConfig,
             FalsificationEngine,
         )
+        from circ_rl.hypothesis.hypothesis_register import HypothesisStatus
 
         hg_output = inputs["hypothesis_generation"]
         cd_output = inputs["causal_discovery"]
@@ -671,10 +672,20 @@ class HypothesisFalsificationStage(PipelineStage):
             for i, cname in enumerate(dynamics_state_names):
                 canonical_derived[cname] = canonical_dataset.states[:, i]
 
+            # Separate dynamics vs reward targets so the first pass
+            # (canonical variable names) doesn't falsify reward hypotheses
+            # that use observation-space variable names.
+            dynamics_targets = {
+                e.target_variable
+                for e in register.get_by_status(HypothesisStatus.UNTESTED)
+                if e.target_variable != "reward"
+            }
+
             logger.info(
                 "Running falsification with canonical data for dynamics "
-                "(state_names={})",
+                "(state_names={}, targets={})",
                 dynamics_state_names,
+                dynamics_targets,
             )
             result = engine.run(
                 register=register,
@@ -683,6 +694,7 @@ class HypothesisFalsificationStage(PipelineStage):
                 variable_names=dynamics_variable_names,
                 derived_columns=canonical_derived,
                 angular_dims=canonical_angular_dims,
+                target_filter=dynamics_targets,
             )
             # Reward hypotheses use observation-space data
             # (run a second pass for any remaining untested reward hypotheses)
@@ -692,6 +704,7 @@ class HypothesisFalsificationStage(PipelineStage):
                 state_feature_names=state_names,
                 variable_names=variable_names,
                 derived_columns=derived_columns,
+                target_filter={"reward"},
             )
             # Merge results: combine counts from both passes
             total_tested = result.n_tested + result_reward.n_tested
@@ -1599,6 +1612,7 @@ def _build_reward_fn(
     env_params: dict[str, float] | None,
     derived_feature_specs: list[Any] | None = None,
     canonical_to_obs_fn: Any | None = None,
+    obs_state_names: list[str] | None = None,
 ) -> Any:
     """Build a reward callable from a symbolic expression.
 
@@ -1607,18 +1621,27 @@ def _build_reward_fn(
     :param canonical_to_obs_fn: If set, the callable receives canonical
         state but reward is expressed in observation space. This function
         converts canonical -> obs before evaluation.
+    :param obs_state_names: Observation-space state names, required when
+        ``canonical_to_obs_fn`` is set. Reward expressions and derived
+        features use these names, not the canonical state names.
     :returns: Callable ``(state, action) -> float``.
     """
     import sympy
 
     from circ_rl.hypothesis.expression import SymbolicExpression as _SE
 
+    # When canonical_to_obs_fn is set, the reward expression is in
+    # observation space, so variable names must match obs-space names.
+    eval_state_names = (
+        obs_state_names if obs_state_names is not None else state_names
+    )
+
     sympy_expr = reward_expression.sympy_expr
     if env_params:
         subs = {sympy.Symbol(k): v for k, v in env_params.items()}
         sympy_expr = sympy_expr.subs(subs)
 
-    var_names = list(state_names) + list(action_names)
+    var_names = list(eval_state_names) + list(action_names)
     # Add derived feature names to match the expression's variables
     if derived_feature_specs:
         var_names.extend(spec.name for spec in derived_feature_specs)
@@ -1637,7 +1660,7 @@ def _build_reward_fn(
                 else state
             )
             derived = compute_derived_single(
-                derived_feature_specs, obs_state, state_names,
+                derived_feature_specs, obs_state, eval_state_names,
             )
             derived_vals = [
                 derived[spec.name] for spec in derived_feature_specs

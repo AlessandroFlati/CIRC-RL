@@ -56,6 +56,10 @@ class FalsificationConfig:
         calibration reduces MSE by less than this fraction relative to
         pooled MSE, the hypothesis passes regardless of p-value.
         Default 0.01 (1%).
+    :param r2_threshold: Minimum :math:`R^2` threshold for Pareto-based
+        hypothesis selection. The simplest validated hypothesis on the
+        Pareto front whose training :math:`R^2 \\geq` this threshold is
+        selected. Default 0.999.
     """
 
     structural_p_threshold: float = 0.01
@@ -67,6 +71,7 @@ class FalsificationConfig:
     trajectory_divergence_factor: float = 0.5
     n_test_trajectories: int = 20
     structural_min_relative_improvement: float = 0.01
+    r2_threshold: float = 0.999
 
 
 @dataclass(frozen=True)
@@ -124,6 +129,7 @@ class FalsificationEngine:
         variable_names: list[str],
         derived_columns: dict[str, np.ndarray] | None = None,
         angular_dims: tuple[int, ...] = (),
+        target_filter: set[str] | None = None,
     ) -> FalsificationResult:
         """Run falsification on all untested hypotheses.
 
@@ -133,10 +139,18 @@ class FalsificationEngine:
         :param variable_names: Variable names for expression evaluation.
         :param angular_dims: Indices of angular dimensions (deltas wrapped
             via atan2 to avoid discontinuities).
+        :param target_filter: If provided, only test hypotheses whose
+            ``target_variable`` is in this set. Hypotheses targeting
+            other variables are left untouched (still UNTESTED).
         :returns: FalsificationResult summary.
         """
         cfg = self._config
         untested = register.get_by_status(HypothesisStatus.UNTESTED)
+
+        if target_filter is not None:
+            untested = [
+                e for e in untested if e.target_variable in target_filter
+            ]
 
         if not untested:
             logger.info("No untested hypotheses to falsify")
@@ -250,11 +264,11 @@ class FalsificationEngine:
             )
             register.set_mdl_score(entry.hypothesis_id, mdl_score.total)
 
-        # Select best per target
+        # Select best per target (Pareto + R2 threshold)
         best_per_target: dict[str, str | None] = {}
         best_effort_per_target: dict[str, str] = {}
         for target in register.target_variables:
-            best = register.select_best(target)
+            best = register.select_best_pareto(target, cfg.r2_threshold)
             best_per_target[target] = (
                 best.hypothesis_id if best is not None else None
             )

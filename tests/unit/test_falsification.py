@@ -308,3 +308,76 @@ class TestFalsificationEngine:
         best = register.select_best("delta_s0")
         assert best is not None
         assert best.hypothesis_id == "dyn_delta_s0_good"
+
+    def test_target_filter_skips_non_matching(self):
+        """target_filter restricts which hypotheses are tested."""
+        dataset, state_names = _make_linear_dataset(
+            n_envs=6, n_per_env=300, coeff=2.0, noise_std=0.05,
+        )
+        var_names = ["s0", "s1", "action"]
+
+        register = HypothesisRegister()
+
+        # Two dynamics hypotheses
+        dyn_expr = _make_expression("2.0 * action")
+        register.register(HypothesisEntry(
+            hypothesis_id="dyn_delta_s0_a",
+            target_variable="delta_s0",
+            expression=dyn_expr,
+            complexity=dyn_expr.complexity,
+            training_r2=0.99,
+            training_mse=0.01,
+        ))
+        register.register(HypothesisEntry(
+            hypothesis_id="dyn_delta_s0_b",
+            target_variable="delta_s0",
+            expression=dyn_expr,
+            complexity=dyn_expr.complexity,
+            training_r2=0.98,
+            training_mse=0.02,
+        ))
+
+        # One reward hypothesis
+        reward_expr = _make_expression("s0 + action")
+        register.register(HypothesisEntry(
+            hypothesis_id="reward_h1",
+            target_variable="reward",
+            expression=reward_expr,
+            complexity=reward_expr.complexity,
+            training_r2=0.95,
+            training_mse=0.05,
+        ))
+
+        config = FalsificationConfig(
+            structural_p_threshold=0.01,
+            ood_confidence=0.99,
+            ood_failure_fraction=0.5,
+            trajectory_failure_fraction=0.5,
+            held_out_fraction=0.2,
+            trajectory_horizon=10,
+            trajectory_divergence_factor=1.0,
+            n_test_trajectories=5,
+        )
+        engine = FalsificationEngine(config)
+
+        # First pass: only dynamics
+        result_dyn = engine.run(
+            register, dataset, state_names, var_names,
+            target_filter={"delta_s0"},
+        )
+        assert result_dyn.n_tested == 2
+
+        # Reward should still be UNTESTED
+        reward_entry = register.get("reward_h1")
+        assert reward_entry.status == HypothesisStatus.UNTESTED
+
+        # Second pass: only reward
+        result_rew = engine.run(
+            register, dataset, state_names, var_names,
+            target_filter={"reward"},
+        )
+        assert result_rew.n_tested == 1
+
+        # Reward should now be tested (validated or falsified)
+        reward_entry = register.get("reward_h1")
+        assert reward_entry.status != HypothesisStatus.UNTESTED

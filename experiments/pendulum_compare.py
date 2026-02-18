@@ -228,7 +228,7 @@ def _run_v2_pipeline(
         n_iterations=80,
         populations=25,
         binary_operators=("+", "-", "*", "/"),
-        unary_operators=("square",),
+        unary_operators=("sin", "cos", "square", "sqrt", "abs"),
         parsimony=0.0005,
         timeout_seconds=600,
         deterministic=True,
@@ -236,9 +236,13 @@ def _run_v2_pipeline(
         nested_constraints={
             "*": {"+": 0, "-": 0},
             "/": {"+": 0, "-": 0},
+            "sin": {"sin": 0, "cos": 0},
+            "cos": {"sin": 0, "cos": 0},
         },
-        complexity_of_operators={"square": 1},
+        complexity_of_operators={"square": 1, "sin": 2, "cos": 2},
+        constraints={"sin": 5, "cos": 5},
         max_samples=10000,
+        n_sr_runs=3,
     )
 
     reward_derived_specs = [
@@ -378,6 +382,7 @@ def _run_v2_pipeline(
         reward_derived_features,
         hf_output,
         oa_output,
+        state_names,  # observation-space state names (for reward eval)
     )
 
 
@@ -391,6 +396,7 @@ def _build_v2_ilqr_policy(
     oa_output: dict[str, Any] | None = None,
     gamma: float = 0.99,
     max_action: float = 2.0,
+    obs_state_names: list[str] | None = None,
 ) -> _ILQRAnalyticPolicy:
     """Build a stateful iLQR policy for test environments.
 
@@ -402,6 +408,8 @@ def _build_v2_ilqr_policy(
     observations before planning.
 
     :param oa_output: Observation analysis stage output (optional).
+    :param obs_state_names: Observation-space state names, used for
+        reward evaluation when canonical coordinates are active.
     :returns: An _ILQRAnalyticPolicy with get_action/reset interface.
     """
     from circ_rl.orchestration.stages import (
@@ -452,6 +460,7 @@ def _build_v2_ilqr_policy(
         horizon=200,
         gamma=gamma,
         max_action=max_action,
+        n_random_restarts=5,
     )
 
     ilqr_solvers: dict[int, ILQRSolver] = {}
@@ -478,6 +487,7 @@ def _build_v2_ilqr_policy(
                 env_params,
                 reward_derived_features if reward_derived_features else None,
                 canonical_to_obs_fn=canonical_to_obs_fn,
+                obs_state_names=obs_state_names,
             )
 
         jac_state_fn, jac_action_fn = _build_dynamics_jacobian_fns(
@@ -626,6 +636,7 @@ def main() -> None:
         reward_derived_features,
         _hf_output,
         oa_output,
+        obs_state_names,
     ) = _run_v2_pipeline(seed=42)
 
     if not best_dynamics:
@@ -645,6 +656,7 @@ def main() -> None:
         oa_output=oa_output,
         gamma=0.99,
         max_action=v2_max_torque,
+        obs_state_names=obs_state_names,
     )
     t_v2_total = time.time() - t_v2
     print(f"  v2 pipeline + iLQR build: {t_v2_total:.1f}s")

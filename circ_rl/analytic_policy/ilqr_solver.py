@@ -55,6 +55,9 @@ class ILQRConfig:
     :param alpha_decay: Line search backtracking factor.
     :param gamma: Discount factor for the cost function.
     :param max_action: Maximum absolute action value (box constraint).
+    :param n_random_restarts: Number of random action initializations
+        to try in addition to the default (zero or warm-start). The best
+        solution across all runs is returned. 0 disables multi-start.
     """
 
     horizon: int = 200
@@ -68,6 +71,7 @@ class ILQRConfig:
     alpha_decay: float = 0.5
     gamma: float = 0.99
     max_action: float = 2.0
+    n_random_restarts: int = 0
 
 
 @dataclass
@@ -171,6 +175,56 @@ class ILQRSolver:
     ) -> ILQRSolution:
         """Optimize a full trajectory from the given initial state.
 
+        When ``n_random_restarts > 0``, runs the optimization multiple
+        times with random action initializations and returns the best
+        solution. The first run uses the provided ``warm_start_actions``
+        (or zeros); subsequent runs use uniform random actions.
+
+        :param initial_state: Starting state, shape ``(state_dim,)``.
+        :param action_dim: Number of action dimensions.
+        :param warm_start_actions: Optional initial action sequence,
+            shape ``(horizon, action_dim)``. Defaults to zeros.
+        :returns: The optimized trajectory with feedback gains.
+        """
+        cfg = self._config
+
+        if cfg.n_random_restarts <= 0:
+            return self._plan_single(
+                initial_state, action_dim, warm_start_actions,
+            )
+
+        # Multi-start: run default + n_random_restarts random inits
+        best_sol = self._plan_single(
+            initial_state, action_dim, warm_start_actions,
+        )
+        rng = np.random.default_rng()
+
+        for _ in range(cfg.n_random_restarts):
+            random_actions = rng.uniform(
+                -cfg.max_action, cfg.max_action,
+                size=(cfg.horizon, action_dim),
+            )
+            sol = self._plan_single(
+                initial_state, action_dim, random_actions,
+            )
+            if sol.total_reward > best_sol.total_reward:
+                best_sol = sol
+
+        logger.info(
+            "iLQR multi-start: best of {} runs, reward={:.2f}",
+            1 + cfg.n_random_restarts,
+            best_sol.total_reward,
+        )
+        return best_sol
+
+    def _plan_single(
+        self,
+        initial_state: np.ndarray,
+        action_dim: int,
+        warm_start_actions: np.ndarray | None = None,
+    ) -> ILQRSolution:
+        """Run a single iLQR optimization from the given initialization.
+
         :param initial_state: Starting state, shape ``(state_dim,)``.
         :param action_dim: Number of action dimensions.
         :param warm_start_actions: Optional initial action sequence,
@@ -180,6 +234,7 @@ class ILQRSolver:
         cfg = self._config
         state_dim = initial_state.shape[0]
         horizon = cfg.horizon
+        multi_start = cfg.n_random_restarts > 0
 
         # Initialize action sequence
         if warm_start_actions is not None:
@@ -267,7 +322,9 @@ class ILQRSolver:
 
         total_reward = -current_cost
 
-        logger.info(
+        # Use debug logging for individual runs during multi-start
+        log_fn = logger.debug if multi_start else logger.info
+        log_fn(
             "iLQR: {} in {} iterations, reward={:.2f}, mu={:.2e}",
             "converged" if converged else "stopped",
             n_iter,
