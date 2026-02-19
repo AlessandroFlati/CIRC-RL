@@ -10,6 +10,8 @@ Hypothesis Generation).
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -19,6 +21,23 @@ from circ_rl.hypothesis.expression import SymbolicExpression
 
 if TYPE_CHECKING:
     import numpy as np
+
+
+def _sr_worker(
+    config: SymbolicRegressionConfig,
+    x: np.ndarray,
+    y: np.ndarray,
+    variable_names: list[str],
+    seed: int,
+) -> list[SymbolicExpression]:
+    """Top-level worker function for parallel SR seeds.
+
+    Must be top-level (not a method) for pickling by ProcessPoolExecutor.
+    Sets ``_CIRC_SR_SUBPROCESS=1`` to prevent nested parallelism.
+    """
+    os.environ["_CIRC_SR_SUBPROCESS"] = "1"
+    regressor = SymbolicRegressor(config)
+    return regressor._single_run(x, y, variable_names, seed)
 
 
 @dataclass(frozen=True)
@@ -51,6 +70,14 @@ class SymbolicRegressionConfig:
         Pareto fronts by deduplicating expression strings. This
         combats PySR's stochasticity at the cost of wall-clock time.
         Default 1 (single run).
+    :param parallel_seeds: If True and ``n_sr_runs > 1``, run seeds
+        in parallel using ``ProcessPoolExecutor``. Each PySR process
+        gets its own Julia runtime. Disabled automatically when
+        running inside a subprocess (to avoid nested parallelism).
+    :param early_stop_r2: If set, stop multi-seed runs early when
+        any expression achieves training R2 >= this threshold.
+        Only used when ``n_sr_runs > 1``. None means no early
+        stopping.
     """
 
     max_complexity: int = 30
@@ -67,6 +94,8 @@ class SymbolicRegressionConfig:
     constraints: dict[str, int | tuple[int, int]] | None = None
     max_samples: int | None = None
     n_sr_runs: int = 1
+    parallel_seeds: bool = True
+    early_stop_r2: float | None = None
 
 
 class SymbolicRegressor:
@@ -139,23 +168,26 @@ class SymbolicRegressor:
         if n_runs == 1:
             return self._single_run(x, y, variable_names, cfg.random_state)
 
-        # Multi-seed runs: merge Pareto fronts
+        seeds = [cfg.random_state + i for i in range(n_runs)]
+
+        # Decide whether to parallelize: only if requested AND not
+        # already inside a subprocess (prevents nested parallelism)
+        use_parallel = (
+            cfg.parallel_seeds
+            and n_runs > 1
+            and os.environ.get("_CIRC_SR_SUBPROCESS") != "1"
+        )
+
         all_expressions: list[SymbolicExpression] = []
-        for run_idx in range(n_runs):
-            seed = cfg.random_state + run_idx
-            logger.info(
-                "Multi-seed SR run {}/{} (seed={})",
-                run_idx + 1,
-                n_runs,
-                seed,
+
+        if use_parallel:
+            all_expressions = self._run_seeds_parallel(
+                x, y, variable_names, seeds, cfg.early_stop_r2,
             )
-            run_expressions = self._single_run(
-                x,
-                y,
-                variable_names,
-                seed,
+        else:
+            all_expressions = self._run_seeds_sequential(
+                x, y, variable_names, seeds, cfg.early_stop_r2,
             )
-            all_expressions.extend(run_expressions)
 
         # Sort by complexity and deduplicate
         all_expressions.sort(key=lambda e: e.complexity)
@@ -173,6 +205,123 @@ class SymbolicRegressor:
         )
 
         return unique
+
+    def _run_seeds_sequential(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        variable_names: list[str],
+        seeds: list[int],
+        early_stop_r2: float | None,
+    ) -> list[SymbolicExpression]:
+        """Run multi-seed SR sequentially with optional early stopping."""
+        import numpy as np_local
+
+        all_expressions: list[SymbolicExpression] = []
+        for run_idx, seed in enumerate(seeds):
+            logger.info(
+                "Multi-seed SR run {}/{} (seed={})",
+                run_idx + 1,
+                len(seeds),
+                seed,
+            )
+            run_expressions = self._single_run(x, y, variable_names, seed)
+            all_expressions.extend(run_expressions)
+
+            if early_stop_r2 is not None and run_expressions:
+                best_r2 = self._best_r2(run_expressions, x, y, variable_names)
+                if best_r2 >= early_stop_r2:
+                    logger.info(
+                        "Early stop: R2={:.6f} >= {:.6f} after seed {}",
+                        best_r2,
+                        early_stop_r2,
+                        seed,
+                    )
+                    break
+
+        return all_expressions
+
+    def _run_seeds_parallel(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        variable_names: list[str],
+        seeds: list[int],
+        early_stop_r2: float | None,
+    ) -> list[SymbolicExpression]:
+        """Run multi-seed SR in parallel using ProcessPoolExecutor."""
+        import numpy as np_local
+
+        all_expressions: list[SymbolicExpression] = []
+
+        logger.info(
+            "Running {} SR seeds in parallel",
+            len(seeds),
+        )
+
+        with ProcessPoolExecutor(max_workers=len(seeds)) as pool:
+            futures = {
+                pool.submit(
+                    _sr_worker,
+                    self._config,
+                    x,
+                    y,
+                    variable_names,
+                    seed,
+                ): seed
+                for seed in seeds
+            }
+
+            for future in as_completed(futures):
+                seed = futures[future]
+                run_expressions = future.result()
+                all_expressions.extend(run_expressions)
+                logger.info(
+                    "Parallel SR seed {} complete: {} expressions",
+                    seed,
+                    len(run_expressions),
+                )
+
+                if early_stop_r2 is not None and run_expressions:
+                    best_r2 = self._best_r2(
+                        run_expressions, x, y, variable_names,
+                    )
+                    if best_r2 >= early_stop_r2:
+                        logger.info(
+                            "Early stop: R2={:.6f} >= {:.6f}, "
+                            "cancelling remaining seeds",
+                            best_r2,
+                            early_stop_r2,
+                        )
+                        for f in futures:
+                            f.cancel()
+                        break
+
+        return all_expressions
+
+    @staticmethod
+    def _best_r2(
+        expressions: list[SymbolicExpression],
+        x: np.ndarray,
+        y: np.ndarray,
+        variable_names: list[str],
+    ) -> float:
+        """Compute the best R2 among a list of expressions."""
+        import numpy as np_local
+
+        best = -float("inf")
+        for expr in expressions:
+            try:
+                fn = expr.to_callable(variable_names)
+                y_pred = fn(x)
+                ss_res = float(np_local.sum((y - y_pred) ** 2))
+                ss_tot = float(np_local.sum((y - y.mean()) ** 2))
+                r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+                if r2 > best:
+                    best = r2
+            except Exception:
+                continue
+        return best
 
     def _single_run(
         self,

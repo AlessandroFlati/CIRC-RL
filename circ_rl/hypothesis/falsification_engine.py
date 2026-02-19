@@ -217,6 +217,15 @@ class FalsificationEngine:
                 n_falsified += 1
                 continue
 
+            # Store calibration coefficients from structural consistency
+            if struct_result.per_env_coefficients:
+                entry.calibration_coefficients = (
+                    struct_result.per_env_coefficients
+                )
+                entry.pooled_calibration = (
+                    struct_result.pooled_coefficients
+                )
+
             # Test 2: OOD prediction
             ood_result = ood_test.test(
                 expr, dataset, target_dim_idx, variable_names,

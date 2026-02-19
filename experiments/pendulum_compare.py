@@ -19,9 +19,11 @@ Requires PySR: ``pip install 'circ-rl[symbolic]'``
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
 import gymnasium as gym
@@ -29,7 +31,11 @@ import numpy as np
 import torch
 from loguru import logger
 
-from circ_rl.analytic_policy.ilqr_solver import ILQRConfig, ILQRSolver
+from circ_rl.analytic_policy.ilqr_solver import (
+    ILQRConfig,
+    ILQRSolver,
+    make_quadratic_terminal_cost,
+)
 from circ_rl.environments.data_collector import DataCollector
 from circ_rl.environments.env_family import EnvironmentFamily
 from circ_rl.feature_selection.transition_analyzer import TransitionAnalyzer
@@ -201,6 +207,90 @@ def _record_episode_generic(
     return frames, total_reward
 
 
+def _quick_eval_env(
+    env_family: EnvironmentFamily,
+    env_idx: int,
+    get_action_fn: Callable[[np.ndarray, int], np.ndarray],
+    max_steps: int = 100,
+    fixed_params: dict[str, float] | None = None,
+) -> float:
+    """Quickly evaluate one episode without video recording.
+
+    Creates a gym env without render mode, runs the episode, and
+    returns only the total reward. Suitable for fast screening before
+    full evaluation with video recording.
+
+    :param max_steps: Number of steps for quick evaluation (default 100).
+    :returns: Total reward for the episode.
+    """
+    params = env_family.get_env_params(env_idx)
+    env = gym.make(
+        "Pendulum-v1",
+        max_episode_steps=max_steps,
+    )
+    unwrapped = env.unwrapped
+    if fixed_params:
+        for attr, value in fixed_params.items():
+            setattr(unwrapped, attr, value)
+    for attr, value in params.items():
+        setattr(unwrapped, attr, value)
+
+    obs, _ = env.reset(seed=42)
+    total_reward = 0.0
+
+    for _ in range(max_steps):
+        action_np = get_action_fn(obs, env_idx)
+        obs, reward, terminated, _truncated, _ = env.step(action_np)
+        total_reward += float(reward)
+        if terminated:
+            break
+
+    env.close()
+    return total_reward
+
+
+def _quick_evaluate_parallel(
+    env_family: EnvironmentFamily,
+    env_indices: list[int],
+    get_action_fn: Callable[[np.ndarray, int], np.ndarray],
+    reset_fn: Callable[[int], None] | None,
+    max_steps: int = 100,
+    fixed_params: dict[str, float] | None = None,
+    max_workers: int | None = None,
+) -> dict[int, float]:
+    """Evaluate multiple environments in parallel without video.
+
+    Uses ThreadPoolExecutor for concurrent evaluation. Each thread
+    creates its own gym environment instance.
+
+    :param env_indices: Which environment indices to evaluate.
+    :param get_action_fn: ``(obs, env_idx) -> action``.
+    :param reset_fn: Optional callable to reset policy state for an env
+        (e.g., ``v2_policy.reset(env_idx)``).
+    :param max_workers: Thread pool size. Defaults to ``min(len(env_indices), cpu_count)``.
+    :returns: Dict mapping ``env_idx -> total_reward``.
+    """
+    if max_workers is None:
+        max_workers = min(len(env_indices), os.cpu_count() or 4)
+
+    def _worker(env_idx: int) -> tuple[int, float]:
+        if reset_fn is not None:
+            reset_fn(env_idx)
+        ret = _quick_eval_env(
+            env_family, env_idx, get_action_fn,
+            max_steps=max_steps, fixed_params=fixed_params,
+        )
+        return env_idx, ret
+
+    results: dict[int, float] = {}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for env_idx, reward in pool.map(_worker, env_indices):
+            results[env_idx] = reward
+
+    return results
+
+
 # -- v2 pipeline runner --
 
 
@@ -214,6 +304,8 @@ def _run_v2_pipeline(
     list[DerivedFeatureSpec],
     dict[str, Any],
     dict[str, Any],
+    list[str],
+    dict[str, Any],
 ]:
     """Run v2 pipeline stages 1-7 on 25 training envs.
 
@@ -224,12 +316,12 @@ def _run_v2_pipeline(
     n_transitions = 5000
 
     sr_config = SymbolicRegressionConfig(
-        max_complexity=30,
-        n_iterations=80,
-        populations=25,
+        max_complexity=40,
+        n_iterations=120,
+        populations=30,
         binary_operators=("+", "-", "*", "/"),
         unary_operators=("sin", "cos", "square", "sqrt", "abs"),
-        parsimony=0.0005,
+        parsimony=0.0002,
         timeout_seconds=600,
         deterministic=True,
         random_state=seed,
@@ -241,15 +333,18 @@ def _run_v2_pipeline(
         },
         complexity_of_operators={"square": 1, "sin": 2, "cos": 2},
         constraints={"sin": 5, "cos": 5},
-        max_samples=10000,
+        max_samples=25000,
         n_sr_runs=3,
     )
+
+    import sympy as sp
 
     reward_derived_specs = [
         DerivedFeatureSpec(
             name="theta",
             source_names=("s1", "s0"),
             compute_fn=np.arctan2,
+            sympy_fn=sp.atan2,
         ),
     ]
 
@@ -383,6 +478,7 @@ def _run_v2_pipeline(
         hf_output,
         oa_output,
         state_names,  # observation-space state names (for reward eval)
+        cd_output,  # needed for spurious detection dataset
     )
 
 
@@ -397,11 +493,19 @@ def _build_v2_ilqr_policy(
     gamma: float = 0.99,
     max_action: float = 2.0,
     obs_state_names: list[str] | None = None,
+    cd_output: dict[str, Any] | None = None,
+    adaptive_replan_multiplier: float = 3.0,
+    min_replan_interval: int = 3,
 ) -> _ILQRAnalyticPolicy:
     """Build a stateful iLQR policy for test environments.
 
     Substitutes each test env's (g, m, l) into the validated symbolic
     expressions to produce parametrically adapted iLQR controllers.
+
+    Includes Section 7.2 improvements:
+    - Spurious term detection and pruning (via ``cd_output`` dataset)
+    - Coefficient calibration (pooled alpha/beta from structural consistency)
+    - Adaptive replanning (MSE-based prediction-error threshold)
 
     When canonical coordinates are available (from observation analysis),
     iLQR plans in canonical space and obs_to_canonical_fn converts gym
@@ -410,11 +514,16 @@ def _build_v2_ilqr_policy(
     :param oa_output: Observation analysis stage output (optional).
     :param obs_state_names: Observation-space state names, used for
         reward evaluation when canonical coordinates are active.
+    :param cd_output: Causal discovery output (for spurious detection).
+    :param adaptive_replan_multiplier: Multiplier for adaptive replan
+        threshold (tau = multiplier * sqrt(sum_mse)).
+    :param min_replan_interval: Minimum steps between adaptive replans.
     :returns: An _ILQRAnalyticPolicy with get_action/reset interface.
     """
     from circ_rl.orchestration.stages import (
         _build_dynamics_fn,
         _build_dynamics_jacobian_fns,
+        _build_reward_derivative_fns,
         _build_reward_fn,
         _default_reward,
         _ILQRAnalyticPolicy,
@@ -456,11 +565,78 @@ def _build_v2_ilqr_policy(
         dim_idx = state_names.index(dim_name)
         dynamics_expressions[dim_idx] = entry.expression
 
+    # -- Section 7.2: Spurious term detection --
+    spurious_dataset = cd_output.get("dataset") if cd_output is not None else None
+    if spurious_dataset is not None:
+        from circ_rl.hypothesis.spurious_detection import SpuriousTermDetector
+
+        detector = SpuriousTermDetector(r2_contribution_threshold=0.005)
+        spvar_names = list(state_names) + list(action_names)
+        if test_family.param_names:
+            spvar_names.extend(test_family.param_names)
+
+        sp_dataset = spurious_dataset
+        if oa_output is not None:
+            oa_canonical = oa_output.get("canonical_dataset")
+            if oa_canonical is not None:
+                sp_dataset = oa_canonical
+
+        for dim_idx, expr in list(dynamics_expressions.items()):
+            try:
+                sp_result = detector.detect(
+                    expr, sp_dataset, dim_idx, spvar_names,
+                    wrap_angular=(dim_idx in angular_dims),
+                )
+                if sp_result.n_spurious > 0:
+                    from circ_rl.hypothesis.expression import (
+                        SymbolicExpression as _SPE,
+                    )
+                    dynamics_expressions[dim_idx] = _SPE.from_sympy(
+                        sp_result.pruned_expr,
+                    )
+                    print(
+                        f"    Pruned {sp_result.n_spurious} spurious terms "
+                        f"from dim {dim_idx} "
+                        f"(R2: {sp_result.original_r2:.6f} -> "
+                        f"{sp_result.pruned_r2:.6f})"
+                    )
+            except Exception:
+                logger.debug(
+                    "Spurious detection skipped for dim {} "
+                    "(evaluation error)",
+                    dim_idx,
+                )
+
+    # -- Section 7.2: Coefficient calibration (pooled) --
+    # For test envs we use pooled (alpha, beta) since per-env
+    # calibration is only available for training env indices.
+    pooled_cal: dict[int, tuple[float, float]] = {}
+    for target, entry in best_dynamics.items():
+        dim_name = target.removeprefix("delta_")
+        dim_idx = state_names.index(dim_name)
+        if entry.pooled_calibration is not None:
+            pooled_cal[dim_idx] = entry.pooled_calibration
+    cal_arg = pooled_cal or None
+    if cal_arg:
+        print(f"    Calibration: {len(cal_arg)} dims with pooled (alpha, beta)")
+
+    # -- Section 7.2: Adaptive replanning threshold --
+    dynamics_mse_sum = sum(e.training_mse for e in best_dynamics.values())
+    adaptive_tau: float | None = None
+    if dynamics_mse_sum > 0:
+        adaptive_tau = adaptive_replan_multiplier * np.sqrt(dynamics_mse_sum)
+    if adaptive_tau is not None:
+        print(f"    Adaptive replan threshold: tau={adaptive_tau:.4f}")
+
     ilqr_config = ILQRConfig(
-        horizon=200,
+        horizon=100,
         gamma=gamma,
         max_action=max_action,
-        n_random_restarts=5,
+        n_random_restarts=8,
+        restart_scale=0.3,
+        replan_interval=10,
+        adaptive_replan_threshold=adaptive_tau,
+        min_replan_interval=min_replan_interval,
     )
 
     ilqr_solvers: dict[int, ILQRSolver] = {}
@@ -476,6 +652,7 @@ def _build_v2_ilqr_policy(
             obs_low=obs_low,
             obs_high=obs_high,
             angular_dims=angular_dims,
+            calibration_coefficients=cal_arg,
         )
 
         reward_fn = None
@@ -498,14 +675,38 @@ def _build_v2_ilqr_policy(
             env_params,
             obs_low=obs_low,
             obs_high=obs_high,
+            calibration_coefficients=cal_arg,
+        )
+
+        # Build analytic reward derivatives if possible
+        reward_deriv_fn = None
+        if best_reward is not None:
+            reward_deriv_fn = _build_reward_derivative_fns(
+                best_reward.expression,
+                state_names,
+                action_names,
+                env_params,
+                reward_derived_features or None,
+                obs_state_names=obs_state_names,
+            )
+
+        effective_reward = reward_fn or _default_reward
+        terminal_cost_fn = make_quadratic_terminal_cost(
+            reward_fn=effective_reward,
+            action_dim=1,
+            gamma=gamma,
+            state_dim=state_dim,
+            scale_override=10.0,
         )
 
         ilqr_solvers[env_idx] = ILQRSolver(
             config=ilqr_config,
             dynamics_fn=dynamics_fn,
-            reward_fn=reward_fn or _default_reward,
+            reward_fn=effective_reward,
             dynamics_jac_state_fn=jac_state_fn,
             dynamics_jac_action_fn=jac_action_fn,
+            terminal_cost_fn=terminal_cost_fn,
+            reward_derivatives_fn=reward_deriv_fn,
         )
 
     first_entry = next(iter(best_dynamics.values()))
@@ -583,8 +784,46 @@ def _load_v1_policy(
     return policy, env_param_names
 
 
+def _parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="v1 (neural) vs v2 (analytic) comparison on 50 pendulum envs",
+    )
+    parser.add_argument(
+        "--eval-mode",
+        choices=["full", "adaptive"],
+        default="full",
+        help=(
+            "'full': record video for all 50 envs (original behavior). "
+            "'adaptive': quick-screen all envs, then full video on worst "
+            "15 + random 10 (faster)."
+        ),
+    )
+    parser.add_argument(
+        "--quick-steps",
+        type=int,
+        default=100,
+        help="Steps per env in adaptive quick-screening phase (default: 100).",
+    )
+    parser.add_argument(
+        "--n-video-worst",
+        type=int,
+        default=15,
+        help="Number of worst-performing envs to record full video (default: 15).",
+    )
+    parser.add_argument(
+        "--n-video-random",
+        type=int,
+        default=10,
+        help="Number of random easy envs to record full video (default: 10).",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
     """Run v1 vs v2 comparison on 50 diverse environments."""
+    args = _parse_args()
+
     logger.remove()
     logger.add(sys.stderr, level="INFO")
     os.environ["SDL_VIDEODRIVER"] = "dummy"
@@ -599,11 +838,14 @@ def main() -> None:
     v1_max_torque = 100.0
     v2_max_torque = 100.0
 
+    eval_mode = args.eval_mode
+
     print("=" * 70)
     print("CIRC-RL: v1 (NEURAL) vs v2 (ANALYTIC) COMPARISON")
     print("  50 test environments with OOD physics (g, m, l)")
     print(f"  v1: CausalPolicy + PPO (max_torque={v1_max_torque})")
     print(f"  v2: PySR + iLQR (max_torque={v2_max_torque})")
+    print(f"  Eval mode: {eval_mode}")
     print("=" * 70)
 
     t0 = time.time()
@@ -637,6 +879,7 @@ def main() -> None:
         _hf_output,
         oa_output,
         obs_state_names,
+        cd_output,
     ) = _run_v2_pipeline(seed=42)
 
     if not best_dynamics:
@@ -644,7 +887,7 @@ def main() -> None:
         print("  Try re-running -- PySR is stochastic.")
         return
 
-    # Build iLQR policy for all 50 test envs
+    # Build iLQR policy for all 50 test envs (with Section 7.2 improvements)
     print("\n  Building iLQR solvers for 50 test envs...")
     v2_policy = _build_v2_ilqr_policy(
         test_family,
@@ -657,6 +900,7 @@ def main() -> None:
         gamma=0.99,
         max_action=v2_max_torque,
         obs_state_names=obs_state_names,
+        cd_output=cd_output,
     )
     t_v2_total = time.time() - t_v2
     print(f"  v2 pipeline + iLQR build: {t_v2_total:.1f}s")
@@ -717,12 +961,59 @@ def main() -> None:
     v1_labels: list[str] = []
     v2_labels: list[str] = []
 
-    print(f"\n[4/5] Recording {n_test_envs} episodes per policy...")
+    # Determine which envs get full video recording
+    if eval_mode == "adaptive":
+        # Phase 1: Quick parallel screening of all envs
+        print(f"\n[4/6] Quick screening {n_test_envs} envs "
+              f"({args.quick_steps} steps, parallel)...")
+        t_quick = time.time()
+        quick_returns = _quick_evaluate_parallel(
+            test_family,
+            list(range(n_test_envs)),
+            v2_get_action,
+            reset_fn=v2_policy.reset,
+            max_steps=args.quick_steps,
+            fixed_params={"max_torque": v2_max_torque},
+        )
+        t_quick_elapsed = time.time() - t_quick
+        print(f"  Quick screening done in {t_quick_elapsed:.1f}s")
 
-    for env_idx in range(n_test_envs):
+        # Rank envs by return (worst first)
+        sorted_envs = sorted(quick_returns.keys(), key=lambda i: quick_returns[i])
+        quick_arr = np.array([quick_returns[i] for i in range(n_test_envs)])
+        print(f"  Quick returns: mean={quick_arr.mean():.1f}, "
+              f"min={quick_arr.min():.1f}, max={quick_arr.max():.1f}")
+
+        # Select subset for full video: worst N + random from the rest
+        n_worst = min(args.n_video_worst, n_test_envs)
+        worst_envs = set(sorted_envs[:n_worst])
+        remaining = [i for i in sorted_envs[n_worst:]]
+        rng = np.random.default_rng(42)
+        n_rand = min(args.n_video_random, len(remaining))
+        random_envs = set(rng.choice(remaining, size=n_rand, replace=False))
+        video_envs = sorted(worst_envs | random_envs)
+
+        print(f"  Full video: {len(video_envs)} envs "
+              f"({n_worst} worst + {n_rand} random)")
+
+        # Store quick returns for all envs (used in final summary)
+        for env_idx in range(n_test_envs):
+            v2_returns.append(quick_returns[env_idx])
+
+        # Phase 2: Full recording on selected subset
+        step_label = "[5/6]"
+    else:
+        # Full mode: record all envs
+        video_envs = list(range(n_test_envs))
+        step_label = "[4/5]"
+
+    print(f"\n{step_label} Recording {len(video_envs)} episodes per policy...")
+
+    for i, env_idx in enumerate(video_envs):
         params = test_family.get_env_params(env_idx)
         param_str = f"g={params['g']:.1f} m={params['m']:.1f} l={params['l']:.1f}"
-        print(f"  [{env_idx + 1:2d}/50] {param_str}", end="", flush=True)
+        print(f"  [{i + 1:2d}/{len(video_envs)}] env {env_idx} {param_str}",
+              end="", flush=True)
 
         # v2 (analytic) -- reset iLQR plan for new episode
         v2_policy.reset(env_idx)
@@ -733,7 +1024,8 @@ def main() -> None:
             max_steps=max_steps,
             fixed_params={"max_torque": v2_max_torque},
         )
-        v2_returns.append(v2_ret)
+        if eval_mode == "full":
+            v2_returns.append(v2_ret)
         v2_all_frames.append(v2_frames)
         v2_labels.append(f"R={v2_ret:.0f}")
         print(f"  v2={v2_ret:.0f}", end="", flush=True)
@@ -757,7 +1049,8 @@ def main() -> None:
     # ================================================================
     # Summary + videos
     # ================================================================
-    print("\n[5/5] Generating videos...")
+    summary_step = "[6/6]" if eval_mode == "adaptive" else "[5/5]"
+    print(f"\n{summary_step} Generating videos...")
 
     v2_arr = np.array(v2_returns)
     v2_video_path = os.path.join(output_dir, "pendulum_v2_50env.mp4")
@@ -785,8 +1078,12 @@ def main() -> None:
     elapsed = time.time() - t0
 
     # Print comparison table
+    n_v2_eval = len(v2_returns)
     print(f"\n{'=' * 70}")
     print("COMPARISON RESULTS")
+    if eval_mode == "adaptive":
+        print(f"  (v2 stats from {args.quick_steps}-step quick screening "
+              f"of {n_v2_eval} envs; video on {len(video_envs)} envs)")
     print(f"{'=' * 70}")
     print(f"  {'Metric':<20} {'v2 (analytic)':>15}", end="")
     if v1_policy is not None and v1_returns:

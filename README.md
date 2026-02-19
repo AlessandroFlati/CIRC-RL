@@ -2,7 +2,7 @@
 
 **Causal Invariant Regularized Constrained Reinforcement Learning**
 
-A framework for building RL agents that generalize beyond their training distribution by exploiting causal structure, enforcing cross-environment invariance, penalizing complexity, and satisfying safety constraints.
+A framework for building RL agents that generalize beyond their training distribution by discovering causal structure, deriving symbolic dynamics via falsifiable scientific hypotheses, and computing analytic policies as consequences of validated models.
 
 ---
 
@@ -23,66 +23,92 @@ This leads to policies that:
 
 ## The Solution
 
-CIRC-RL addresses these failure modes through four integrated components organized as a lexicographic multi-objective optimization:
+CIRC-RL treats policy optimization as a scientific discovery problem: instead of fitting a neural network to reward signals, it discovers the symbolic equations governing the environment, validates them through falsification, and derives the optimal policy analytically. The key insight is that **the optimal policy for a well-understood system is not an object to be learned -- it is a consequence to be derived**.
 
-1. **Causal Policy Learning** -- Learn policies that maximize interventional effects (do-calculus) rather than observational correlations, distinguishing true mechanisms from spurious associations.
+The framework operates through an 8-stage pipeline:
 
-2. **Invariant Risk Minimization** -- Train across environment families and optimize for worst-case performance, ensuring policies exploit mechanisms that are stable under distributional shifts.
+1. **Causal Discovery** -- Infer the causal graph from multi-environment data (PC algorithm with environment-parameter augmentation)
+2. **Feature Selection** -- Identify causally invariant features via mechanism invariance testing
+3. **Transition Analysis** -- Quantify per-environment dynamics scales and identify variant/invariant dimensions
+4. **Hypothesis Generation** -- Discover symbolic dynamics and reward expressions via PySR symbolic regression
+5. **Hypothesis Falsification** -- Rigorously test hypotheses via structural consistency (Chow test), OOD prediction, and trajectory prediction
+6. **Analytic Policy Derivation** -- Derive optimal control via iLQR/MPC from validated symbolic models, with coefficient calibration, spurious term pruning, adaptive replanning, and robust scenario planning
+7. **Residual Learning** -- Bounded neural network correction for unmodeled dynamics (skipped when analytic policy explains >98% of variance)
+8. **Diagnostic Validation** -- Premise/derivation/conclusion tests that localize failures to specific pipeline components
 
-3. **Complexity Regularization** -- Penalize parametric, functional, and path complexity (MDL principle / Occam's razor), preventing memorization of environment-specific patterns.
+## Benchmark Results (Pendulum-v1)
 
-4. **Constrained Optimization** -- Enforce domain-specific safety constraints via Lagrangian methods or projection, encoding prior knowledge about unacceptable behaviors.
+Evaluated on **50 out-of-distribution test environments** with extreme physics parameters (g=5--15, m=0.3--3.0, l=0.3--2.0):
+
+| Metric | v2 (Analytic iLQR) | v1 (Neural PPO) | Improvement |
+|--------|------------------:|----------------:|------------:|
+| Mean return | **-43.7** | -1967.3 | **45x** |
+| Median return | **-30.7** | -355.9 | **12x** |
+| Worst return | **-222.8** | -6875.8 | **31x** |
+| Std return | **41.3** | 2413.9 | **58x** |
+
+The symbolic approach generalizes to OOD physics because the discovered equations (e.g., angular acceleration from gravity and torque) are parametrically invariant -- the functional form is the same across all environments, only the coefficients change.
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-    subgraph Phase1["Phase 1: Causal Structure Identification"]
-        A1[Collect exploratory data from E_train] --> A2[Infer causal graph G]
-        A2 --> A3[Identify causal parents of reward Pa_G R]
-        A3 --> A4[Validate mechanism invariance across envs]
+    subgraph Phase1["Phase 1: Causal Discovery"]
+        A1[Collect multi-env data] --> A2[PC algorithm + env-param augmentation]
+        A2 --> A3[Validate mechanism invariance]
     end
 
-    subgraph Phase2["Phase 2: Feature Selection"]
-        B1[Test each feature f in Anc_G R] --> B2[Test stability of P R given do f]
-        B2 --> B3["Retain F_robust = {f : Var_e[P_e(R|do(f))] < eps}"]
+    subgraph Phase2["Phase 2: Feature Selection + Analysis"]
+        B1[Invariance-based feature filtering] --> B2[Transition dynamics analysis]
+        B2 --> B3[Observation constraint detection]
     end
 
-    subgraph Phase3["Phase 3: Policy Optimization"]
-        C1[Initialize policy pi_0 and Lagrange multipliers] --> C2[Sample environments from E]
-        C2 --> C3[Collect trajectories under pi_t]
-        C3 --> C4[Estimate causal effects]
-        C4 --> C5[Compute composite gradient]
-        C5 --> C6[Update policy + Lagrange multipliers]
-        C6 --> C7{Converged?}
-        C7 -- No --> C2
-        C7 -- Yes --> C8[Output candidate policies]
+    subgraph Phase3["Phase 3: Hypothesis Discovery"]
+        C1[PySR symbolic regression] --> C2[Multi-seed Pareto front]
+        C2 --> C3[Register candidate hypotheses]
     end
 
-    subgraph Phase4["Phase 4: Ensemble Construction"]
-        D1[Evaluate policies against hard constraints] --> D2[Compute MDL scores]
-        D2 --> D3["Weight: w_i ~ exp(-MDL(pi_i))"]
-        D3 --> D4["Deploy ensemble pi_ens(a|s) = sum w_i pi_i(a|s)"]
+    subgraph Phase4["Phase 4: Falsification"]
+        D1[Structural consistency - Chow test] --> D2[OOD prediction test]
+        D2 --> D3[Trajectory prediction test]
+        D3 --> D4[Select best validated per target]
+    end
+
+    subgraph Phase5["Phase 5: Analytic Policy"]
+        E1[Coefficient calibration] --> E2[Spurious term pruning]
+        E2 --> E3[iLQR/MPC with adaptive replanning]
+        E3 --> E4[Robust scenario planning]
+    end
+
+    subgraph Phase6["Phase 6: Validation"]
+        F1[Residual learning if needed] --> F2[Premise / Derivation / Conclusion tests]
+        F2 --> F3[Deploy or iterate]
     end
 
     Phase1 --> Phase2
     Phase2 --> Phase3
     Phase3 --> Phase4
+    Phase4 --> Phase5
+    Phase5 --> Phase6
 
     style Phase1 fill:#1a1a2e,stroke:#16213e,color:#e8e8e8
     style Phase2 fill:#16213e,stroke:#0f3460,color:#e8e8e8
     style Phase3 fill:#0f3460,stroke:#533483,color:#e8e8e8
     style Phase4 fill:#533483,stroke:#e94560,color:#e8e8e8
+    style Phase5 fill:#e94560,stroke:#c74b50,color:#e8e8e8
+    style Phase6 fill:#c74b50,stroke:#a85751,color:#e8e8e8
 ```
 
 ## Key Features
 
-- **Domain-agnostic**: applicable to any RL problem where environment families can be constructed
-- **Custom RL backbone**: purpose-built policy optimization algorithm tailored to CIRC-RL's multi-objective needs, built on PyTorch with Stable-Baselines3 infrastructure (VecEnv, logging, replay buffers)
-- **DAG-based pipeline**: phases are orchestrated as a directed acyclic graph with caching and partial re-runs
-- **Causal discovery**: custom implementation of causal graph inference algorithms (PC, GES, FCI), referencing causal-learn and DoWhy
-- **Multi-environment training**: SB3 VecEnv extensions for parallel environment family sampling
-- **Safety-first**: lexicographic priorities ensure constraints are satisfied before optimizing performance
+- **Scientific discovery pipeline**: discovers symbolic dynamics equations, validates them through falsification, and derives analytic policies as mathematical consequences
+- **Domain-agnostic**: applicable to any RL problem where environment families can be constructed and dynamics have discoverable analytic structure
+- **Symbolic regression**: multi-seed PySR with sum-of-products constraints, automatic canonical coordinate detection, and Pareto-front deduplication
+- **Rigorous falsification**: structural consistency (calibrated Chow test), OOD prediction, and trajectory prediction tests with MDL scoring
+- **Analytic control**: iLQR/MPC with coefficient calibration, spurious term detection, adaptive replanning, and robust scenario-based planning
+- **Causal discovery**: PC algorithm with environment-parameter augmentation, mechanism invariance validation
+- **Diagnostic validation**: premise/derivation/conclusion tests that localize failures to specific components
+- **DAG-based pipeline**: stages are orchestrated with caching and partial re-runs
 - **Reproducibility**: deterministic seeding, full config logging (Hydra), git hash tracking per run
 
 ## Installation
@@ -104,6 +130,13 @@ uv sync
 uv run pre-commit install
 ```
 
+### Symbolic Regression Support
+
+```bash
+# Install with PySR symbolic regression (requires Julia)
+uv sync --extra symbolic
+```
+
 ### GPU Support
 
 ```bash
@@ -114,90 +147,122 @@ uv sync --extra cuda
 ## Quick Start
 
 ```python
-from circ_rl.training import CIRCTrainer
-from circ_rl.causal_discovery import CausalGraphBuilder
-from circ_rl.environments import EnvironmentFamily
-from circ_rl.constraints import ConstraintSet
+from circ_rl.environments.env_family import EnvironmentFamily
+from circ_rl.hypothesis.symbolic_regressor import SymbolicRegressionConfig
+from circ_rl.orchestration.stages import (
+    CausalDiscoveryStage,
+    FeatureSelectionStage,
+    TransitionAnalysisStage,
+    HypothesisGenerationStage,
+    HypothesisFalsificationStage,
+    AnalyticPolicyDerivationStage,
+)
 
-# Define environment family
+# 1. Define environment family with parametric variation
 env_family = EnvironmentFamily.from_gymnasium(
-    base_env="CartPole-v1",
-    param_distributions={
-        "gravity": (9.0, 11.0),
-        "masscart": (0.5, 2.0),
-    },
-    n_envs=10,
+    base_env="Pendulum-v1",
+    param_distributions={"g": (8.0, 12.0), "m": (0.8, 1.5), "l": (0.7, 1.3)},
+    n_envs=25,
+    seed=42,
 )
 
-# Define safety constraints
-constraints = ConstraintSet()
-constraints.add_expected_cost("pole_angle_violation", threshold=0.05)
+# 2. Causal discovery (PC algorithm with env-param augmentation)
+cd_output = CausalDiscoveryStage(
+    env_family=env_family, n_transitions_per_env=5000,
+    include_env_params=True, seed=42,
+).run({})
 
-# Build causal graph (or provide domain knowledge)
-causal_graph = CausalGraphBuilder.discover(env_family, method="pc")
-
-# Train with CIRC-RL
-trainer = CIRCTrainer(
-    env_family=env_family,
-    causal_graph=causal_graph,
-    constraints=constraints,
-    config_path="configs/cartpole.yaml",
+# 3. Feature selection + transition analysis
+fs_output = FeatureSelectionStage().run({"causal_discovery": cd_output})
+ta_output = TransitionAnalysisStage().run(
+    {"causal_discovery": cd_output, "feature_selection": fs_output}
 )
-ensemble_policy = trainer.run()
+
+# 4. Discover symbolic dynamics via PySR
+sr_config = SymbolicRegressionConfig(max_complexity=30, n_iterations=80)
+hg_output = HypothesisGenerationStage(
+    include_env_params=True, sr_config=sr_config,
+).run({"causal_discovery": cd_output, "feature_selection": fs_output,
+       "transition_analysis": ta_output})
+
+# 5. Falsify hypotheses (structural consistency, OOD, trajectory tests)
+hf_output = HypothesisFalsificationStage().run(
+    {"hypothesis_generation": hg_output, "causal_discovery": cd_output}
+)
+
+# 6. Derive analytic policy (iLQR with coefficient calibration)
+apd_output = AnalyticPolicyDerivationStage(env_family=env_family).run(
+    {"hypothesis_falsification": hf_output, "transition_analysis": ta_output,
+     "causal_discovery": cd_output}
+)
+policy = apd_output["analytic_policy"]
+
+# Use the policy
+import numpy as np
+action = policy.get_action(np.array([1.0, 0.0, 0.0]), env_idx=0)
 ```
 
-> **Note:** This API is illustrative and will evolve as the implementation matures. See the framework document for the full theoretical specification.
+> **Note:** Requires PySR for symbolic regression: `pip install 'circ-rl[symbolic]'`. See `experiments/pendulum_v2_real.py` for the full 8-stage pipeline and `experiments/pendulum_compare.py` for v1 vs v2 evaluation.
 
 ## Project Structure
 
 ```
-CIRC-RL/
-    causal_discovery/        # Phase 1: causal graph inference (PC, GES, FCI)
-    feature_selection/       # Phase 2: causal invariance-based feature filtering
-    policy/                  # Policy networks, causal Q-functions, representations
-    training/                # Phase 3: multi-env policy optimization, Lagrangian updates
-    evaluation/              # Phase 4: ensemble construction, MDL scoring
-    environments/            # SB3 VecEnv extensions, environment family management
-    constraints/             # Constraint definitions, Lagrange multiplier management
-    regularization/          # Complexity penalties (parametric, functional, path, IB)
+circ_rl/
+    causal_discovery/        # Phase 1: PC, GES, FCI algorithms; causal graph; mechanism validation
+    feature_selection/       # Phase 2: invariance-based feature filtering; transition analysis
+    hypothesis/              # Phase 3-4: symbolic expressions, PySR regression, hypothesis register,
+                             #   falsification engine, structural consistency, spurious detection
+    analytic_policy/         # Phase 5: iLQR/MPC solvers, coefficient calibrator, robust MPC,
+                             #   hypothesis classifier, action normalizer
+    policy/                  # Neural policies: CausalPolicy, ResidualPolicy, CompositePolicy
+    training/                # Trajectory buffers, rollout workers, residual trainer
+    diagnostics/             # Phase 7: premise, derivation, conclusion tests; diagnostic suite
+    evaluation/              # MDL scoring, constraint verification
+    environments/            # EnvironmentFamily, DataCollector
+    orchestration/           # 8-stage pipeline, caching, checkpointing
+    constraints/             # Constraint functions, Lagrange multiplier management
+    regularization/          # Parametric, functional, path, IB complexity penalties
     invariance/              # IRM penalties, worst-case optimization
-    orchestration/           # DAG-based pipeline, caching, checkpointing
-    configs/                 # Hydra YAML configuration files
-    tests/
-        unit/                # pytest + hypothesis property-based tests
-        integration/         # Gymnasium-based integration tests
-    experiments/             # Experiment scripts and result artifacts
-    docs/                    # Sphinx documentation source
+    utils/                   # Seeding, tensor ops, logging, checkpointing
+configs/                     # Hydra YAML configuration files
+tests/
+    unit/                    # pytest + hypothesis property-based tests
+    integration/             # Gymnasium-based integration tests
+experiments/                 # Experiment scripts (pendulum_v2_real.py, pendulum_compare.py, etc.)
+docs/                        # Theoretical extensions and documentation
 ```
 
 ## Roadmap
 
-### Planned Benchmarks
+### Benchmarks
 
 | Benchmark | Domain | Environment Family | Status |
 |-----------|--------|-------------------|--------|
+| Pendulum-v1 | Classic control | Gravity, mass, length randomization (50 OOD envs) | **Done** (v2: -43.7 mean, v1: -1967.3) |
 | CartPole variants | Classic control | Gravity, mass, pole length randomization | Planned |
 | MuJoCo locomotion | Continuous control | Friction, limb mass, terrain variation | Planned |
-| Procgen suite | Procedural generation | Level seeds as environments | Planned |
 | Custom financial env | Sequential decision | Market regime shifts as environments | Planned |
 
 ### Evaluation Protocol
 
-- **Within-family generalization**: hold-out environments from the same family
-- **Cross-family transfer**: evaluate on environment families not seen during training
-- **Ablation studies**: systematically disable each CIRC-RL component
-- **Baseline comparisons**: vanilla PPO, SAC, domain randomization, EPOpt
+- **Out-of-distribution generalization**: test on environments with physics parameters outside the training range (e.g., train on g=8--12, test on g=5--15)
+- **Head-to-head comparison**: v1 (neural CausalPolicy + PPO) vs v2 (symbolic dynamics + iLQR) on identical test environments
+- **Diagnostic validation**: premise/derivation/conclusion tests to localize failures
+- **Ablation studies**: systematically disable each pipeline component (calibration, spurious detection, adaptive replanning, robust MPC)
 
 ### Milestones
 
-- [ ] Core infrastructure (environments, config, logging, orchestration)
-- [ ] Causal discovery module (PC algorithm, graph validation)
-- [ ] Feature selection via causal invariance
-- [ ] Custom policy optimization with Lagrangian constraints
-- [ ] Invariant risk minimization integration
-- [ ] Complexity regularization (parametric, functional, information bottleneck)
-- [ ] Ensemble construction with MDL weighting
-- [ ] Benchmark suite and evaluation pipeline
+- [x] Core infrastructure (environments, config, logging, orchestration)
+- [x] Causal discovery module (PC algorithm, graph validation, env-param augmentation)
+- [x] Feature selection via causal invariance (mechanism invariance testing)
+- [x] Symbolic hypothesis generation (PySR multi-seed, Pareto front deduplication)
+- [x] Hypothesis falsification (structural consistency, OOD, trajectory tests)
+- [x] Analytic policy derivation (iLQR/MPC from validated symbolic models)
+- [x] Algorithmic improvements (coefficient calibration, spurious detection, adaptive replanning, robust MPC)
+- [x] Residual learning (bounded neural correction)
+- [x] Diagnostic validation (premise/derivation/conclusion tests)
+- [x] Pendulum-v1 benchmark (v1 neural vs v2 analytic, 50 OOD test environments)
+- [ ] Additional benchmarks (CartPole, MuJoCo locomotion, financial environments)
 - [ ] Documentation and tutorials
 
 ## Contributing
@@ -277,7 +342,7 @@ The full mathematical framework is documented in [`CIRC-RL_Framework.md`](CIRC-R
 
 ## License
 
-Copyright (C) 2025 Alessandro Flati
+Copyright (C) 2025-2026 Alessandro Flati
 
 This program is free software: you can redistribute it and/or modify it under the terms of the **GNU Affero General Public License** as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
 

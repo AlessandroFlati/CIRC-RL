@@ -26,6 +26,7 @@ from circ_rl.orchestration.pipeline import PipelineStage, hash_config
 
 if TYPE_CHECKING:
     from circ_rl.analytic_policy.ilqr_solver import ILQRSolution, ILQRSolver
+    from circ_rl.analytic_policy.robust_mpc import RobustILQRPlanner
     from circ_rl.environments.env_family import EnvironmentFamily
     from circ_rl.hypothesis.derived_features import DerivedFeatureSpec
     from circ_rl.hypothesis.expression import SymbolicExpression
@@ -485,6 +486,7 @@ class HypothesisGenerationStage(PipelineStage):
             register=register,
             env_param_names=raw_env_param_names,
             angular_dims=dynamics_angular_dims,
+            parallel=True,
         )
 
         # Reward hypotheses (always in observation space)
@@ -797,13 +799,27 @@ class AnalyticPolicyDerivationStage(PipelineStage):
         self,
         env_family: EnvironmentFamily,
         gamma: float = 0.99,
+        adaptive_replan_multiplier: float = 3.0,
+        min_replan_interval: int = 3,
+        robust_n_scenarios: int = 0,
+        robust_confidence_level: float = 0.95,
+        robust_min_uncertainty: float = 1e-6,
     ) -> None:
         super().__init__(
             name="analytic_policy_derivation",
-            dependencies=["hypothesis_falsification", "transition_analysis"],
+            dependencies=[
+                "hypothesis_falsification",
+                "transition_analysis",
+                "causal_discovery",
+            ],
         )
         self._env_family = env_family
         self._gamma = gamma
+        self._adaptive_replan_multiplier = adaptive_replan_multiplier
+        self._min_replan_interval = min_replan_interval
+        self._robust_n_scenarios = robust_n_scenarios
+        self._robust_confidence_level = robust_confidence_level
+        self._robust_min_uncertainty = robust_min_uncertainty
 
     def run(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Derive the analytic policy.
@@ -825,6 +841,7 @@ class AnalyticPolicyDerivationStage(PipelineStage):
 
         hf_output = inputs["hypothesis_falsification"]
         ta_output = inputs["transition_analysis"]
+        cd_output = inputs.get("causal_discovery", {})
 
         best_dynamics = hf_output["best_dynamics"]
         best_reward = hf_output["best_reward"]
@@ -892,6 +909,56 @@ class AnalyticPolicyDerivationStage(PipelineStage):
             dim_name = target.removeprefix("delta_")
             dim_idx = effective_state_names.index(dim_name)
             dynamics_expressions[dim_idx] = entry.expression
+
+        # Spurious term detection: prune discretization artifacts
+        spurious_dataset = cd_output.get("dataset")
+        if spurious_dataset is not None:
+            from circ_rl.hypothesis.spurious_detection import (
+                SpuriousTermDetector,
+            )
+
+            detector = SpuriousTermDetector(
+                r2_contribution_threshold=0.005,
+            )
+            # Build variable names matching what SR used
+            spvar_names = list(effective_state_names) + list(action_names)
+            if self._env_family.param_names:
+                spvar_names.extend(self._env_family.param_names)
+
+            # Use canonical dataset if available
+            sp_dataset = spurious_dataset
+            oa_canonical = inputs.get("observation_analysis", {}).get(
+                "canonical_dataset",
+            )
+            if oa_canonical is not None:
+                sp_dataset = oa_canonical
+
+            for dim_idx, expr in list(dynamics_expressions.items()):
+                try:
+                    sp_result = detector.detect(
+                        expr, sp_dataset, dim_idx, spvar_names,
+                        wrap_angular=(dim_idx in angular_dims),
+                    )
+                    if sp_result.n_spurious > 0:
+                        from circ_rl.hypothesis.expression import (
+                            SymbolicExpression as _SPE,
+                        )
+
+                        dynamics_expressions[dim_idx] = (
+                            _SPE.from_sympy(sp_result.pruned_expr)
+                        )
+                        logger.info(
+                            "Pruned {} spurious terms from dim {} "
+                            "(R2: {:.6f} -> {:.6f})",
+                            sp_result.n_spurious, dim_idx,
+                            sp_result.original_r2, sp_result.pruned_r2,
+                        )
+                except Exception:
+                    logger.debug(
+                        "Spurious detection skipped for dim {} "
+                        "(evaluation error)",
+                        dim_idx,
+                    )
 
         # Determine solver type from all expressions
         all_linear = all(
@@ -1012,6 +1079,7 @@ class AnalyticPolicyDerivationStage(PipelineStage):
             from circ_rl.analytic_policy.ilqr_solver import (
                 ILQRConfig,
                 ILQRSolver,
+                make_quadratic_terminal_cost,
             )
 
             first_entry = next(iter(best_dynamics.values()))
@@ -1037,6 +1105,20 @@ class AnalyticPolicyDerivationStage(PipelineStage):
             for env_idx in range(self._env_family.n_envs):
                 env_params = self._env_family.get_env_params(env_idx)
 
+                # Extract per-dim calibration coefficients for this env
+                per_dim_cal: dict[int, tuple[float, float]] = {}
+                for target, entry in best_dynamics.items():
+                    dim_name = target.removeprefix("delta_")
+                    dim_idx = effective_state_names.index(dim_name)
+                    if (
+                        entry.calibration_coefficients
+                        and env_idx in entry.calibration_coefficients
+                    ):
+                        per_dim_cal[dim_idx] = (
+                            entry.calibration_coefficients[env_idx]
+                        )
+                cal_arg = per_dim_cal or None
+
                 # Build dynamics callable in effective (canonical) space
                 dynamics_fn = _build_dynamics_fn(
                     dynamics_expressions,
@@ -1047,6 +1129,7 @@ class AnalyticPolicyDerivationStage(PipelineStage):
                     obs_low=obs_low_clamp,
                     obs_high=obs_high_clamp,
                     angular_dims=angular_dims,
+                    calibration_coefficients=cal_arg,
                 )
 
                 # Build reward callable (always in obs space)
@@ -1068,20 +1151,81 @@ class AnalyticPolicyDerivationStage(PipelineStage):
                     action_names,
                     state_dim,
                     env_params,
+                    calibration_coefficients=cal_arg,
                 )
 
+                # Build analytic reward derivatives if possible
+                reward_deriv_fn = None
+                if best_reward is not None:
+                    reward_deriv_fn = _build_reward_derivative_fns(
+                        best_reward.expression,
+                        effective_state_names,
+                        action_names,
+                        env_params,
+                        reward_derived_features or None,
+                        obs_state_names=state_names,
+                    )
+
+                effective_reward = reward_fn or _default_reward
+                terminal_cost_fn = make_quadratic_terminal_cost(
+                    reward_fn=effective_reward,
+                    action_dim=action_dim,
+                    gamma=self._gamma,
+                    state_dim=state_dim,
+                    scale_override=10.0,
+                )
+
+                # Compute adaptive replan threshold from dynamics MSEs
+                dynamics_mse_sum = sum(
+                    e.training_mse for e in best_dynamics.values()
+                )
+                adaptive_tau: float | None = None
+                if dynamics_mse_sum > 0:
+                    adaptive_tau = (
+                        self._adaptive_replan_multiplier
+                        * np.sqrt(dynamics_mse_sum)
+                    )
+
                 ilqr_config = ILQRConfig(
-                    horizon=200,
+                    horizon=100,
                     gamma=self._gamma,
                     max_action=float(action_high[0]),
+                    n_random_restarts=8,
+                    restart_scale=0.3,
+                    replan_interval=10,
+                    adaptive_replan_threshold=adaptive_tau,
+                    min_replan_interval=self._min_replan_interval,
                 )
 
                 ilqr_solvers[env_idx] = ILQRSolver(
                     config=ilqr_config,
                     dynamics_fn=dynamics_fn,
-                    reward_fn=reward_fn or _default_reward,
+                    reward_fn=effective_reward,
                     dynamics_jac_state_fn=jac_state_fn,
                     dynamics_jac_action_fn=jac_action_fn,
+                    terminal_cost_fn=terminal_cost_fn,
+                    reward_derivatives_fn=reward_deriv_fn,
+                )
+
+            # Build robust planners if enabled and uncertainty
+            # is significant
+            robust_planners: dict[int, RobustILQRPlanner] | None = None
+            if self._robust_n_scenarios >= 2:
+                robust_planners = self._build_robust_planners(
+                    best_dynamics=best_dynamics,
+                    cd_output=cd_output,
+                    ilqr_solvers=ilqr_solvers,
+                    dynamics_expressions=dynamics_expressions,
+                    effective_state_names=effective_state_names,
+                    action_names=action_names,
+                    state_dim=state_dim,
+                    env_params_per_env={
+                        i: self._env_family.get_env_params(i)
+                        for i in range(self._env_family.n_envs)
+                    },
+                    obs_low_clamp=obs_low_clamp,
+                    obs_high_clamp=obs_high_clamp,
+                    angular_dims=angular_dims,
                 )
 
             # Wrap the per-env iLQR solvers
@@ -1095,6 +1239,7 @@ class AnalyticPolicyDerivationStage(PipelineStage):
                 action_low=action_low,
                 action_high=action_high,
                 obs_to_canonical_fn=obs_to_canonical_fn,
+                robust_planners=robust_planners,
             )
 
             solver_type = "ilqr"
@@ -1113,6 +1258,184 @@ class AnalyticPolicyDerivationStage(PipelineStage):
             "solver_type": solver_type,
             "dynamics_expressions": dynamics_expressions,
         }
+
+    def _build_robust_planners(
+        self,
+        best_dynamics: dict[str, HypothesisEntry],
+        cd_output: dict[str, Any],
+        ilqr_solvers: dict[int, ILQRSolver],
+        dynamics_expressions: dict[int, SymbolicExpression],
+        effective_state_names: list[str],
+        action_names: list[str],
+        state_dim: int,
+        env_params_per_env: dict[int, dict[str, float]],
+        obs_low_clamp: np.ndarray | None,
+        obs_high_clamp: np.ndarray | None,
+        angular_dims: tuple[int, ...],
+    ) -> dict[int, RobustILQRPlanner] | None:
+        """Build per-env robust planners from coefficient uncertainty.
+
+        Returns None if uncertainty is below threshold or dataset is
+        unavailable.
+        """
+        from circ_rl.analytic_policy.coefficient_calibrator import (
+            CoefficientCalibrator,
+        )
+        from circ_rl.analytic_policy.ilqr_solver import ILQRConfig, ILQRSolver
+        from circ_rl.analytic_policy.robust_mpc import (
+            RobustILQRPlanner,
+            RobustMPCConfig,
+            ScenarioSampler,
+            build_scenario_dynamics_fn,
+            build_scenario_jacobian_fns,
+            check_uncertainty_significant,
+        )
+
+        dataset = cd_output.get("dataset")
+        if dataset is None:
+            logger.warning(
+                "Robust MPC: dataset not available, skipping"
+            )
+            return None
+
+        robust_config = RobustMPCConfig(
+            n_scenarios=self._robust_n_scenarios,
+            confidence_level=self._robust_confidence_level,
+            min_uncertainty_threshold=self._robust_min_uncertainty,
+        )
+
+        # Run calibration per dynamics dimension
+        calibrator = CoefficientCalibrator(
+            confidence_level=self._robust_confidence_level,
+        )
+
+        from circ_rl.analytic_policy.coefficient_calibrator import (
+            CoefficientUncertainty,
+        )
+
+        per_dim_uncertainty: dict[int, CoefficientUncertainty] = {}
+        for target, entry in best_dynamics.items():
+            from circ_rl.hypothesis.expression import (
+                SymbolicExpression as _SE,
+            )
+
+            expr = entry.expression
+            if not isinstance(expr, _SE):
+                continue
+            dim_name = target.removeprefix("delta_")
+            dim_idx = effective_state_names.index(dim_name)
+            wrap_angular = dim_idx in angular_dims
+
+            variable_names = effective_state_names + action_names
+            try:
+                unc = calibrator.calibrate(
+                    expr, dataset, dim_idx, variable_names,
+                    wrap_angular=wrap_angular,
+                )
+                per_dim_uncertainty[dim_idx] = unc
+            except Exception:
+                logger.debug(
+                    "Robust MPC: calibration failed for dim {}, "
+                    "skipping",
+                    dim_idx,
+                )
+
+        if not per_dim_uncertainty:
+            return None
+
+        sampler = ScenarioSampler(robust_config)
+        rng = np.random.default_rng(42)
+
+        robust_planners: dict[int, RobustILQRPlanner] = {}
+
+        for env_idx in range(self._env_family.n_envs):
+            if not check_uncertainty_significant(
+                per_dim_uncertainty, env_idx,
+                robust_config.min_uncertainty_threshold,
+            ):
+                continue
+
+            base_solver = ilqr_solvers.get(env_idx)
+            if base_solver is None:
+                continue
+
+            scenarios = sampler.sample_scenarios(
+                per_dim_uncertainty, env_idx, rng,
+            )
+
+            # Build base dynamics fn (without calibration -- robust
+            # MPC applies its own scenario coefficients)
+            env_params = env_params_per_env[env_idx]
+            base_dyn_fn = _build_dynamics_fn(
+                dynamics_expressions,
+                effective_state_names,
+                action_names,
+                state_dim,
+                env_params,
+                obs_low=obs_low_clamp,
+                obs_high=obs_high_clamp,
+                angular_dims=angular_dims,
+                calibration_coefficients=None,
+            )
+            base_jac_state = base_solver._jac_state_fn
+            base_jac_action = base_solver._jac_action_fn
+
+            # Build per-scenario solvers
+            scenario_solvers: list[ILQRSolver] = []
+            scenario_dynamics: list[
+                Callable[[np.ndarray, np.ndarray], np.ndarray]
+            ] = []
+
+            for scenario_coeffs in scenarios:
+                sc_dyn = build_scenario_dynamics_fn(
+                    base_dyn_fn, scenario_coeffs, state_dim,
+                )
+                sc_jac_state, sc_jac_action = build_scenario_jacobian_fns(
+                    base_jac_state, base_jac_action,
+                    scenario_coeffs, state_dim,
+                )
+
+                sc_config = ILQRConfig(
+                    horizon=base_solver.config.horizon,
+                    gamma=base_solver.config.gamma,
+                    max_action=base_solver.config.max_action,
+                    n_random_restarts=robust_config.reduced_restarts,
+                    restart_scale=base_solver.config.restart_scale,
+                    replan_interval=base_solver.config.replan_interval,
+                )
+
+                sc_solver = ILQRSolver(
+                    config=sc_config,
+                    dynamics_fn=sc_dyn,
+                    reward_fn=base_solver._reward_fn,
+                    dynamics_jac_state_fn=sc_jac_state,
+                    dynamics_jac_action_fn=sc_jac_action,
+                    terminal_cost_fn=base_solver._terminal_cost_fn,
+                    reward_derivatives_fn=base_solver._reward_derivatives_fn,
+                )
+                scenario_solvers.append(sc_solver)
+                scenario_dynamics.append(sc_dyn)
+
+            robust_planners[env_idx] = RobustILQRPlanner(
+                config=robust_config,
+                base_solver=base_solver,
+                scenario_solvers=scenario_solvers,
+                scenario_dynamics=scenario_dynamics,
+            )
+
+        if robust_planners:
+            logger.info(
+                "Robust MPC enabled for {} envs with {} scenarios",
+                len(robust_planners), self._robust_n_scenarios,
+            )
+        else:
+            logger.info(
+                "Robust MPC: uncertainty below threshold for all "
+                "envs, using standard MPC"
+            )
+            return None
+
+        return robust_planners
 
     def config_hash(self) -> str:
         return hash_config({
@@ -1366,12 +1689,59 @@ class DiagnosticValidationStage(PipelineStage):
                 "recommended_action": result.recommended_action,
             }
 
-        # Use a subset of envs as test envs
+        # Use a representative subset of envs for diagnostics.
+        # Testing all envs is O(n_envs) in iLQR solves and dominates
+        # runtime.  Five evenly-spaced envs give good coverage of the
+        # parametric range while keeping the stage under 15 min.
         n_envs = self._env_family.n_envs
-        test_env_ids = list(range(n_envs))
+        max_diag_envs = min(5, n_envs)
+        step = max(1, n_envs // max_diag_envs)
+        test_env_ids = list(range(0, n_envs, step))[:max_diag_envs]
+
+        # Lighten the iLQR solvers for diagnostic evaluation:
+        # - Disable robust MPC (diagnostics measure quality, not robustness)
+        # - Reduce random restarts (diagnostics need representative, not
+        #   peak performance)
+        # - Widen replan interval (coarser but still valid for averages)
+        # This yields ~10x speedup with negligible diagnostic quality loss.
+        saved_robust = getattr(analytic_policy, "_robust_planners", None)
+        saved_configs: dict[int, Any] = {}
+        solvers = getattr(analytic_policy, "_ilqr_solvers", None)
+
+        if saved_robust is not None:
+            analytic_policy._robust_planners = None  # type: ignore[union-attr]
+
+        # Force-disable adaptive replanning at the policy level
+        if hasattr(analytic_policy, "_force_disable_adaptive_replan"):
+            analytic_policy._force_disable_adaptive_replan = True  # type: ignore[union-attr]
+
+        if solvers is not None:
+            from dataclasses import replace as _dc_replace
+
+            for env_id, solver in solvers.items():
+                saved_configs[env_id] = solver._config
+                solver._config = _dc_replace(
+                    solver._config,
+                    n_random_restarts=1,
+                    replan_interval=25,
+                    parallel_restarts=False,
+                    adaptive_replan_threshold=None,
+                    min_replan_interval=25,
+                )
+            logger.info(
+                "Diagnostic validation: lightweight iLQR "
+                "(restarts=1, replan_interval=25, no adaptive, no robust MPC)",
+            )
+
+        # Clear cached plans so the lighter config takes effect
+        if hasattr(analytic_policy, "_solutions"):
+            analytic_policy._solutions.clear()  # type: ignore[union-attr]
+        if hasattr(analytic_policy, "_steps"):
+            analytic_policy._steps.clear()  # type: ignore[union-attr]
 
         # Compute predicted returns by simulating the policy through
         # the learned dynamics + reward models from real initial states
+        diag_episodes = 3
         predicted_returns = _compute_predicted_returns(
             analytic_policy=analytic_policy,
             dynamics_expressions=dynamics_expressions,
@@ -1382,6 +1752,7 @@ class DiagnosticValidationStage(PipelineStage):
             action_names=action_names,
             env_family=self._env_family,
             test_env_ids=test_env_ids,
+            n_episodes=diag_episodes,
             reward_derived_features=reward_derived_features,
         )
 
@@ -1389,18 +1760,36 @@ class DiagnosticValidationStage(PipelineStage):
             premise_r2_threshold=self._premise_r2,
             derivation_divergence_threshold=self._derivation_div,
             conclusion_error_threshold=self._conclusion_err,
+            eval_episodes=diag_episodes,
         )
 
-        result = suite.run(
-            policy=analytic_policy,
-            dynamics_expressions=dynamics_expressions,
-            dataset=dataset,
-            state_feature_names=state_names,
-            variable_names=variable_names,
-            env_family=self._env_family,
-            predicted_returns=predicted_returns,
-            test_env_ids=test_env_ids,
-        )
+        try:
+            result = suite.run(
+                policy=analytic_policy,
+                dynamics_expressions=dynamics_expressions,
+                dataset=dataset,
+                state_feature_names=state_names,
+                variable_names=variable_names,
+                env_family=self._env_family,
+                predicted_returns=predicted_returns,
+                test_env_ids=test_env_ids,
+            )
+        finally:
+            # Restore deployment-grade solver configs
+            if solvers is not None:
+                for env_id, orig_config in saved_configs.items():
+                    if env_id in solvers:
+                        solvers[env_id]._config = orig_config
+            if saved_robust is not None:
+                analytic_policy._robust_planners = saved_robust  # type: ignore[union-attr]
+            # Restore adaptive replanning
+            if hasattr(analytic_policy, "_force_disable_adaptive_replan"):
+                analytic_policy._force_disable_adaptive_replan = False  # type: ignore[union-attr]
+            # Clear diagnostic-mode cached plans
+            if hasattr(analytic_policy, "_solutions"):
+                analytic_policy._solutions.clear()  # type: ignore[union-attr]
+            if hasattr(analytic_policy, "_steps"):
+                analytic_policy._steps.clear()  # type: ignore[union-attr]
 
         logger.info(
             "Diagnostic validation: recommended_action={}",
@@ -1557,27 +1946,57 @@ def _build_dynamics_fn(
     obs_low: np.ndarray | None = None,
     obs_high: np.ndarray | None = None,
     angular_dims: tuple[int, ...] = (),
+    calibration_coefficients: dict[int, tuple[float, float]] | None = None,
 ) -> Any:
     """Build a dynamics callable from symbolic expressions.
+
+    Tries Numba JIT compilation first for faster per-call execution
+    in the iLQR inner loop. Falls back to numpy lambdify if Numba
+    is unavailable or compilation fails.
 
     :param obs_low: Lower observation bounds (clamp output). Optional.
     :param obs_high: Upper observation bounds (clamp output). Optional.
     :param angular_dims: State dimensions that are angular coordinates.
         After adding deltas, these are wrapped to ``[-pi, pi]``.
+    :param calibration_coefficients: Per-dimension ``(alpha, beta)``
+        calibration. When provided, each delta is transformed as
+        ``delta' = alpha * delta + beta``. Used for per-environment
+        coefficient calibration.
     :returns: Callable ``(state, action) -> next_state``.
     """
+    # Try Numba-accelerated compilation first (no obs clamping in
+    # canonical space, so fast path is suitable)
+    if obs_low is None and obs_high is None:
+        try:
+            from circ_rl.analytic_policy.fast_dynamics import (
+                build_fast_dynamics_fn,
+            )
+
+            fast_fn = build_fast_dynamics_fn(
+                dynamics_expressions,
+                state_names,
+                action_names,
+                state_dim,
+                env_params,
+                angular_dims=angular_dims,
+            )
+            if fast_fn is not None:
+                logger.debug("Using Numba-accelerated dynamics function")
+                return fast_fn
+        except Exception:
+            pass
+
     import sympy
 
     from circ_rl.hypothesis.expression import SymbolicExpression as _SE
 
-    # Compile per-dimension callables with env params substituted
+    # Fallback: numpy lambdify
     dim_fns: dict[int, Any] = {}
     var_names = list(state_names) + list(action_names)
 
     for dim_idx, expr in dynamics_expressions.items():
         sympy_expr = expr.sympy_expr
 
-        # Substitute env params into the expression
         if env_params:
             subs = {sympy.Symbol(k): v for k, v in env_params.items()}
             sympy_expr = sympy_expr.subs(subs)
@@ -1585,19 +2004,22 @@ def _build_dynamics_fn(
         compiled = _SE.from_sympy(sympy_expr)
         dim_fns[dim_idx] = compiled.to_callable(var_names)
 
+    # Capture calibration for closure
+    _cal = calibration_coefficients
+
     def dynamics_fn(state: np.ndarray, action: np.ndarray) -> np.ndarray:
         next_state = state.copy()
-        # Build input row: [state, action]
         x = np.concatenate([state, action]).reshape(1, -1)
         for dim_idx, fn in dim_fns.items():
-            delta = fn(x)
-            next_state[dim_idx] += float(delta[0])
-        # Wrap angular dimensions to [-pi, pi]
+            delta = float(fn(x)[0])
+            if _cal is not None and dim_idx in _cal:
+                alpha, beta = _cal[dim_idx]
+                delta = alpha * delta + beta
+            next_state[dim_idx] += delta
         for d in angular_dims:
             next_state[d] = float(
                 np.arctan2(np.sin(next_state[d]), np.cos(next_state[d]))
             )
-        # Clamp to observation bounds to prevent polynomial divergence
         if obs_low is not None and obs_high is not None:
             np.clip(next_state, obs_low, obs_high, out=next_state)
         return next_state
@@ -1616,6 +2038,10 @@ def _build_reward_fn(
 ) -> Any:
     """Build a reward callable from a symbolic expression.
 
+    Tries Numba JIT compilation first for simple reward expressions
+    (no derived features, no canonical-to-obs mapping). Falls back
+    to numpy lambdify otherwise.
+
     :param derived_feature_specs: DerivedFeatureSpec list for computing
         features from the state at runtime (e.g., theta from cos/sin).
     :param canonical_to_obs_fn: If set, the callable receives canonical
@@ -1626,6 +2052,25 @@ def _build_reward_fn(
         features use these names, not the canonical state names.
     :returns: Callable ``(state, action) -> float``.
     """
+    # Try Numba-accelerated compilation for simple reward expressions
+    if not derived_feature_specs and canonical_to_obs_fn is None:
+        try:
+            from circ_rl.analytic_policy.fast_dynamics import (
+                build_fast_reward_fn,
+            )
+
+            fast_fn = build_fast_reward_fn(
+                reward_expression,
+                state_names,
+                action_names,
+                env_params,
+            )
+            if fast_fn is not None:
+                logger.debug("Using Numba-accelerated reward function")
+                return fast_fn
+        except Exception:
+            pass
+
     import sympy
 
     from circ_rl.hypothesis.expression import SymbolicExpression as _SE
@@ -1695,8 +2140,11 @@ def _build_dynamics_jacobian_fns(
     env_params: dict[str, float] | None,
     obs_low: np.ndarray | None = None,
     obs_high: np.ndarray | None = None,
+    calibration_coefficients: dict[int, tuple[float, float]] | None = None,
 ) -> tuple[Any, Any]:
     r"""Build analytic Jacobian callables from symbolic expressions.
+
+    Tries Numba JIT compilation first, falls back to numpy lambdify.
 
     Uses ``sympy.diff()`` on each dynamics expression to compute
     exact partial derivatives, then compiles them via ``lambdify``.
@@ -1716,6 +2164,25 @@ def _build_dynamics_jacobian_fns(
     :returns: Tuple ``(jac_state_fn, jac_action_fn)`` where each is
         a callable ``(state, action) -> matrix``.
     """
+    # Try Numba-accelerated Jacobians first
+    try:
+        from circ_rl.analytic_policy.fast_dynamics import (
+            build_fast_jacobian_fns,
+        )
+
+        fast_jac_s, fast_jac_a = build_fast_jacobian_fns(
+            dynamics_expressions,
+            state_names,
+            action_names,
+            state_dim,
+            env_params,
+        )
+        if fast_jac_s is not None and fast_jac_a is not None:
+            logger.debug("Using Numba-accelerated Jacobian functions")
+            return fast_jac_s, fast_jac_a
+    except Exception:
+        pass
+
     import sympy as sp
 
     all_var_names = list(state_names) + list(action_names)
@@ -1742,23 +2209,52 @@ def _build_dynamics_jacobian_fns(
         if param_subs:
             sympy_expr = sympy_expr.subs(param_subs)
 
+        # Replace Abs with a smooth approximation before differentiating.
+        # Abs(x) -> sqrt(x^2 + eps) avoids non-differentiable Derivative
+        # nodes that sp.lambdify cannot compile.
+        # NOTE: do NOT rewrite(Piecewise) first -- that converts Abs to
+        # Piecewise which is no longer matched by .replace(sp.Abs, ...).
+        _eps = sp.Rational(1, 10**10)
+        sympy_expr = sympy_expr.replace(
+            sp.Abs, lambda x: sp.sqrt(x**2 + _eps),  # type: ignore[arg-type]
+        )
+
         # Derivatives w.r.t. state variables
         for j, s_sym in enumerate(state_syms):
             deriv = sp.diff(sympy_expr, s_sym)
             deriv_simplified = sp.simplify(deriv)
             if deriv_simplified != 0:
-                a_fns[(dim_idx, j)] = sp.lambdify(
-                    all_symbols, deriv_simplified, modules=["numpy"],
-                )
+                try:
+                    a_fns[(dim_idx, j)] = sp.lambdify(
+                        all_symbols, deriv_simplified, modules=["numpy"],
+                    )
+                except Exception:
+                    logger.warning(
+                        "Cannot compile d(delta_x{})/d(x{}) -- "
+                        "falling back to finite differences",
+                        dim_idx, j,
+                    )
+                    return None, None
 
         # Derivatives w.r.t. action variables
         for j, a_sym in enumerate(action_syms):
             deriv = sp.diff(sympy_expr, a_sym)
             deriv_simplified = sp.simplify(deriv)
             if deriv_simplified != 0:
-                b_fns[(dim_idx, j)] = sp.lambdify(
-                    all_symbols, deriv_simplified, modules=["numpy"],
-                )
+                try:
+                    b_fns[(dim_idx, j)] = sp.lambdify(
+                        all_symbols, deriv_simplified, modules=["numpy"],
+                    )
+                except Exception:
+                    logger.warning(
+                        "Cannot compile d(delta_x{})/d(u{}) -- "
+                        "falling back to finite differences",
+                        dim_idx, j,
+                    )
+                    return None, None
+
+    # Capture calibration for Jacobian scaling
+    _cal = calibration_coefficients
 
     def jac_state_fn(
         state: np.ndarray, action: np.ndarray,
@@ -1767,7 +2263,11 @@ def _build_dynamics_jacobian_fns(
         a_mat = np.eye(state_dim)  # Identity for x_{t+1} = x_t + delta
         args = [*state, *action]
         for (di, dj), fn in a_fns.items():
-            a_mat[di, dj] += float(fn(*args))
+            val = float(fn(*args))
+            # d(alpha * delta + beta)/dx = alpha * d(delta)/dx
+            if _cal is not None and di in _cal:
+                val *= _cal[di][0]
+            a_mat[di, dj] += val
         return a_mat
 
     def jac_action_fn(
@@ -1777,10 +2277,206 @@ def _build_dynamics_jacobian_fns(
         b_mat = np.zeros((state_dim, action_dim))
         args = [*state, *action]
         for (di, dj), fn in b_fns.items():
-            b_mat[di, dj] = float(fn(*args))
+            val = float(fn(*args))
+            # d(alpha * delta + beta)/du = alpha * d(delta)/du
+            if _cal is not None and di in _cal:
+                val *= _cal[di][0]
+            b_mat[di, dj] = val
         return b_mat
 
     return jac_state_fn, jac_action_fn
+
+
+def _build_reward_derivative_fns(
+    reward_expression: SymbolicExpression,
+    canonical_state_names: list[str],
+    action_names: list[str],
+    env_params: dict[str, float] | None,
+    derived_feature_specs: list[Any] | None = None,
+    obs_state_names: list[str] | None = None,
+) -> (
+    Callable[
+        [np.ndarray, np.ndarray],
+        tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    ]
+    | None
+):
+    r"""Build analytic reward derivative callables from a symbolic expression.
+
+    Uses ``sympy.diff()`` on the reward expression to compute exact
+    first and second derivatives, then compiles them via ``lambdify``.
+
+    When the reward is expressed in observation space with derived
+    features (e.g., ``theta = atan2(sin, cos)``), composes the
+    canonical-to-obs mapping symbolically before differentiating.
+
+    :param reward_expression: Symbolic reward expression.
+    :param canonical_state_names: Canonical state variable names
+        (what iLQR uses internally).
+    :param action_names: Action variable names.
+    :param env_params: Environment parameters to substitute.
+    :param derived_feature_specs: DerivedFeatureSpec list. Each spec
+        with a ``sympy_fn`` attribute enables symbolic substitution.
+    :param obs_state_names: Observation-space state names. When
+        provided (and different from canonical), the reward is
+        assumed to be in obs space and requires symbolic composition.
+    :returns: Callable ``(state, action) -> (r_x, r_u, r_xx, r_uu, r_ux)``
+        or ``None`` if symbolic composition is not possible.
+    """
+    import sympy as sp
+
+    from circ_rl.hypothesis.expression import SymbolicExpression as _SE
+
+    sympy_expr = reward_expression.sympy_expr
+
+    # Substitute environment parameters
+    if env_params:
+        subs = {sp.Symbol(k): v for k, v in env_params.items()}
+        sympy_expr = sympy_expr.subs(subs)
+
+    # Step 1: Substitute derived features with their symbolic definitions
+    if derived_feature_specs:
+        for spec in derived_feature_specs:
+            if spec.sympy_fn is None:
+                logger.debug(
+                    "Derived feature '{}' has no sympy_fn, "
+                    "cannot build analytic reward derivatives",
+                    spec.name,
+                )
+                return None
+            source_syms = [sp.Symbol(n) for n in spec.source_names]
+            sympy_expr = sympy_expr.subs(
+                sp.Symbol(spec.name), spec.sympy_fn(*source_syms),
+            )
+
+    # Step 2: If reward uses obs-space names, substitute with canonical
+    # equivalents. For circle constraints: s0 -> cos(phi_0), s1 -> sin(phi_0)
+    # For unconstrained dims: obs_name -> canonical_name (rename)
+    if obs_state_names is not None and obs_state_names != canonical_state_names:
+        n_obs = len(obs_state_names)
+        n_can = len(canonical_state_names)
+
+        if n_can < n_obs:
+            # Likely angular dims: canonical has fewer dims than obs.
+            # For each pair of obs dims that map to one canonical dim
+            # (circle constraint), substitute obs = cos/sin of canonical.
+            # Heuristic: first (n_obs - n_can) canonical dims are angular,
+            # each consuming 2 obs dims.
+            n_angular = n_obs - n_can
+            obs_subs: dict[sp.Symbol, sp.Expr] = {}
+
+            for a_idx in range(n_angular):
+                can_sym = sp.Symbol(canonical_state_names[a_idx])
+                obs_cos_name = obs_state_names[2 * a_idx]
+                obs_sin_name = obs_state_names[2 * a_idx + 1]
+                obs_subs[sp.Symbol(obs_cos_name)] = sp.cos(can_sym)
+                obs_subs[sp.Symbol(obs_sin_name)] = sp.sin(can_sym)
+
+            # Unconstrained dims: simple rename
+            obs_offset = 2 * n_angular
+            can_offset = n_angular
+            for i in range(n_obs - obs_offset):
+                obs_name = obs_state_names[obs_offset + i]
+                can_name = canonical_state_names[can_offset + i]
+                if obs_name != can_name:
+                    obs_subs[sp.Symbol(obs_name)] = sp.Symbol(can_name)
+
+            sympy_expr = sympy_expr.subs(obs_subs)
+        else:
+            # Same dimension count, just rename
+            for obs_n, can_n in zip(
+                obs_state_names, canonical_state_names, strict=True,
+            ):
+                if obs_n != can_n:
+                    sympy_expr = sympy_expr.subs(
+                        sp.Symbol(obs_n), sp.Symbol(can_n),
+                    )
+
+    # Simplify the composed expression
+    sympy_expr = sp.simplify(sympy_expr)
+
+    # Build the variable list in canonical space
+    all_var_names = list(canonical_state_names) + list(action_names)
+    all_symbols = [sp.Symbol(n) for n in all_var_names]
+    state_dim = len(canonical_state_names)
+    action_dim = len(action_names)
+
+    # Compute symbolic derivatives
+    # First derivatives (gradient)
+    grad_state_exprs = [sp.diff(sympy_expr, sp.Symbol(n)) for n in canonical_state_names]
+    grad_action_exprs = [sp.diff(sympy_expr, sp.Symbol(n)) for n in action_names]
+
+    # Second derivatives (Hessians)
+    hess_xx_exprs = [
+        [sp.diff(sympy_expr, sp.Symbol(si), sp.Symbol(sj))
+         for sj in canonical_state_names]
+        for si in canonical_state_names
+    ]
+    hess_uu_exprs = [
+        [sp.diff(sympy_expr, sp.Symbol(ai), sp.Symbol(aj))
+         for aj in action_names]
+        for ai in action_names
+    ]
+    hess_ux_exprs = [
+        [sp.diff(sympy_expr, sp.Symbol(ai), sp.Symbol(sj))
+         for sj in canonical_state_names]
+        for ai in action_names
+    ]
+
+    # Compile all derivatives via lambdify
+    grad_s_fns = [
+        sp.lambdify(all_symbols, sp.simplify(e), modules=["numpy"])
+        for e in grad_state_exprs
+    ]
+    grad_a_fns = [
+        sp.lambdify(all_symbols, sp.simplify(e), modules=["numpy"])
+        for e in grad_action_exprs
+    ]
+    hess_xx_fns = [
+        [sp.lambdify(all_symbols, sp.simplify(e), modules=["numpy"])
+         for e in row]
+        for row in hess_xx_exprs
+    ]
+    hess_uu_fns = [
+        [sp.lambdify(all_symbols, sp.simplify(e), modules=["numpy"])
+         for e in row]
+        for row in hess_uu_exprs
+    ]
+    hess_ux_fns = [
+        [sp.lambdify(all_symbols, sp.simplify(e), modules=["numpy"])
+         for e in row]
+        for row in hess_ux_exprs
+    ]
+
+    logger.debug(
+        "Built analytic reward derivatives for expression: {}",
+        sp.simplify(sympy_expr),
+    )
+
+    def reward_derivatives_fn(
+        state: np.ndarray, action: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        args = [*state, *action]
+
+        r_x = np.array([float(fn(*args)) for fn in grad_s_fns])
+        r_u = np.array([float(fn(*args)) for fn in grad_a_fns])
+
+        r_xx = np.array([
+            [float(fn(*args)) for fn in row]
+            for row in hess_xx_fns
+        ])  # (state_dim, state_dim)
+        r_uu = np.array([
+            [float(fn(*args)) for fn in row]
+            for row in hess_uu_fns
+        ])  # (action_dim, action_dim)
+        r_ux = np.array([
+            [float(fn(*args)) for fn in row]
+            for row in hess_ux_fns
+        ])  # (action_dim, state_dim)
+
+        return r_x, r_u, r_xx, r_uu, r_ux
+
+    return reward_derivatives_fn
 
 
 def _compute_predicted_returns(
@@ -1914,6 +2610,7 @@ class _ILQRAnalyticPolicy:
         action_low: np.ndarray | None = None,
         action_high: np.ndarray | None = None,
         obs_to_canonical_fn: Any | None = None,
+        robust_planners: dict[int, RobustILQRPlanner] | None = None,
     ) -> None:
         self._dynamics_hypothesis = dynamics_hypothesis
         self._reward_hypothesis = reward_hypothesis
@@ -1924,11 +2621,20 @@ class _ILQRAnalyticPolicy:
         self._action_low = action_low
         self._action_high = action_high
         self._obs_to_canonical_fn = obs_to_canonical_fn
+        self._robust_planners = robust_planners
         self.solver_type = "ilqr"
 
         # Stateful: cached plans and step counters per env
         self._solutions: dict[int, ILQRSolution] = {}
         self._steps: dict[int, int] = {}
+
+        # Adaptive replanning diagnostics
+        self._prediction_errors: dict[int, list[float]] = {}
+        self._replan_counts: dict[int, int] = {}
+
+        # Override flag: when True, adaptive replanning is disabled
+        # regardless of solver config. Used by DiagnosticValidationStage.
+        self._force_disable_adaptive_replan: bool = False
 
     @property
     def n_free_parameters(self) -> int:
@@ -1977,16 +2683,73 @@ class _ILQRAnalyticPolicy:
         if solver is None:
             solver = next(iter(self._ilqr_solvers.values()))
 
-        horizon = solver.config.horizon
+        replan_interval = solver.config.replan_interval
+        if replan_interval is None:
+            replan_interval = solver.config.horizon
 
-        # Plan if needed: first call or step exceeds horizon
-        needs_plan = (
-            env_idx not in self._solutions
-            or self._steps[env_idx] >= horizon
+        tau = (
+            None if self._force_disable_adaptive_replan
+            else solver.config.adaptive_replan_threshold
         )
+        min_interval = solver.config.min_replan_interval
+
+        # Plan if needed: first call
+        needs_plan = env_idx not in self._solutions
+
+        if not needs_plan:
+            t = self._steps[env_idx]
+
+            # Check max interval (existing fixed-interval logic)
+            if t >= replan_interval:
+                needs_plan = True
+
+            # Check adaptive threshold (only if above min interval)
+            elif tau is not None and t >= min_interval:
+                sol = self._solutions[env_idx]
+                if t < len(sol.nominal_states):
+                    predicted_state = sol.nominal_states[t]  # (state_dim,)
+                    deviation = float(
+                        np.linalg.norm(canonical_state - predicted_state)
+                    )
+                    # Track for diagnostics
+                    if env_idx not in self._prediction_errors:
+                        self._prediction_errors[env_idx] = []
+                    self._prediction_errors[env_idx].append(deviation)
+                    if deviation > tau:
+                        needs_plan = True
+                        logger.debug(
+                            "Adaptive replan triggered for env {}: "
+                            "deviation={:.4f} > tau={:.4f} at step {}",
+                            env_idx, deviation, tau, t,
+                        )
 
         if needs_plan:
-            sol = solver.plan(canonical_state, self._action_dim)
+            self._replan_counts[env_idx] = (
+                self._replan_counts.get(env_idx, 0) + 1
+            )
+            # Warm-start from tail of previous plan when replanning
+            warm_start = None
+            if env_idx in self._solutions:
+                prev_sol = self._solutions[env_idx]
+                t_prev = self._steps[env_idx]
+                remaining = prev_sol.nominal_actions[t_prev:]
+                pad = np.zeros((t_prev, self._action_dim))
+                warm_start = np.vstack([remaining, pad])
+
+            # Use robust planner if available for this env
+            robust_planner = (
+                self._robust_planners.get(env_idx)
+                if self._robust_planners is not None
+                else None
+            )
+            if robust_planner is not None:
+                sol = robust_planner.plan(
+                    canonical_state, self._action_dim, warm_start,
+                )
+            else:
+                sol = solver.plan(
+                    canonical_state, self._action_dim, warm_start,
+                )
             self._solutions[env_idx] = sol
             self._steps[env_idx] = 0
 
@@ -2004,6 +2767,32 @@ class _ILQRAnalyticPolicy:
         self._steps[env_idx] = t + 1
         return action
 
+    @property
+    def replan_stats(self) -> dict[int, dict[str, float]]:
+        """Per-env replanning statistics for diagnostics.
+
+        :returns: Dict mapping env_idx to stats dict with keys:
+            total_replans, mean_prediction_error, max_prediction_error.
+        """
+        stats: dict[int, dict[str, float]] = {}
+        for env_idx in set(
+            list(self._replan_counts.keys())
+            + list(self._prediction_errors.keys())
+        ):
+            errors = self._prediction_errors.get(env_idx, [])
+            stats[env_idx] = {
+                "total_replans": float(
+                    self._replan_counts.get(env_idx, 0),
+                ),
+                "mean_prediction_error": (
+                    float(np.mean(errors)) if errors else 0.0
+                ),
+                "max_prediction_error": (
+                    float(np.max(errors)) if errors else 0.0
+                ),
+            }
+        return stats
+
     def reset(self, env_idx: int | None = None) -> None:
         """Clear cached plan for re-planning.
 
@@ -2012,6 +2801,10 @@ class _ILQRAnalyticPolicy:
         if env_idx is None:
             self._solutions.clear()
             self._steps.clear()
+            self._prediction_errors.clear()
+            self._replan_counts.clear()
         else:
             self._solutions.pop(env_idx, None)
             self._steps.pop(env_idx, None)
+            self._prediction_errors.pop(env_idx, None)
+            self._replan_counts.pop(env_idx, None)

@@ -10,7 +10,7 @@ Consistency).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -33,6 +33,11 @@ class StructuralConsistencyResult:
     :param pooled_mse: MSE from the pooled (hypothesis-constrained) model.
     :param relative_improvement: Relative MSE improvement from per-env
         calibration. Values near 0 indicate the functional form is correct.
+    :param per_env_coefficients: Per-environment calibration coefficients
+        ``(alpha_e, beta_e)`` from the OLS fit
+        ``y = alpha_e * h(x) + beta_e``.
+    :param pooled_coefficients: Pooled calibration coefficients
+        ``(alpha, beta)`` from the pooled OLS fit.
     """
 
     passed: bool
@@ -41,6 +46,10 @@ class StructuralConsistencyResult:
     per_env_mse: dict[int, float]
     pooled_mse: float
     relative_improvement: float = 0.0
+    per_env_coefficients: dict[int, tuple[float, float]] = field(
+        default_factory=dict,
+    )
+    pooled_coefficients: tuple[float, float] = (1.0, 0.0)
 
 
 class StructuralConsistencyTest:
@@ -182,10 +191,14 @@ class StructuralConsistencyTest:
         y_pred_pooled = design_pooled @ beta_pooled  # (N,)
         ss_pooled = float(np.sum((targets - y_pred_pooled) ** 2))
         n_pooled_params = 2  # alpha + beta
+        # Capture pooled calibration: (alpha, beta) where
+        # beta_pooled[0] = intercept, beta_pooled[1] = slope
+        pooled_coefficients = (float(beta_pooled[1]), float(beta_pooled[0]))
 
         # Per-environment: y = alpha_e * h(x) + beta_e (per-env calibration)
         ss_per_env = 0.0
         per_env_mse: dict[int, float] = {}
+        per_env_coefficients: dict[int, tuple[float, float]] = {}
         total_per_env_params = 0
 
         for env_id in unique_envs:
@@ -216,6 +229,10 @@ class StructuralConsistencyTest:
             ss_per_env += ss_env
             per_env_mse[env_id] = ss_env / n_e
             total_per_env_params += n_params
+            # Capture per-env calibration: (alpha_e, beta_e)
+            per_env_coefficients[env_id] = (
+                float(beta_env[1]), float(beta_env[0]),
+            )
 
         pooled_mse = ss_pooled / n_total if n_total > 0 else 0.0
 
@@ -230,6 +247,8 @@ class StructuralConsistencyTest:
             return StructuralConsistencyResult(
                 passed=True, f_statistic=0.0, p_value=1.0,
                 per_env_mse=per_env_mse, pooled_mse=pooled_mse,
+                per_env_coefficients=per_env_coefficients,
+                pooled_coefficients=pooled_coefficients,
             )
 
         f_stat = ((ss_pooled - ss_per_env) / extra_params) / (
@@ -266,6 +285,8 @@ class StructuralConsistencyTest:
             per_env_mse=per_env_mse,
             pooled_mse=pooled_mse,
             relative_improvement=relative_improvement,
+            per_env_coefficients=per_env_coefficients,
+            pooled_coefficients=pooled_coefficients,
         )
 
     @staticmethod

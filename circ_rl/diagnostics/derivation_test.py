@@ -132,9 +132,16 @@ class DerivationTest:
                     for dim_idx, func in callables.items():
                         try:
                             delta = float(func(x_row)[0])  # type: ignore[operator]
-                            predicted_next[dim_idx] = state[dim_idx] + delta
+                            if np.isfinite(delta):
+                                predicted_next[dim_idx] = state[dim_idx] + delta
                         except Exception:  # noqa: S110
                             pass
+
+                    # Guard: if any state component is non-finite, the
+                    # dynamics model has diverged (e.g., division by a
+                    # state variable near zero). Abort this trajectory.
+                    if not np.all(np.isfinite(predicted_next)):
+                        break
 
                     # The "observed" state under the policy is what we'd
                     # get from the dynamics hypothesis. If the derivation
@@ -146,6 +153,8 @@ class DerivationTest:
                     # (self-consistency check)
                     action2 = policy.get_action(predicted_next, env_id)
                     div = float(np.sqrt(np.sum((action - action2) ** 2)))
+                    if not np.isfinite(div):
+                        break
                     total_div += div
 
                 avg_div = total_div / self._horizon

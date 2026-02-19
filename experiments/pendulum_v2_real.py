@@ -247,9 +247,10 @@ def main() -> None:
         n_all = len(all_targets)
         print(f"\n  --- Best Validated Dynamics ({n_cov}/{n_all} dims) ---")
         for target, entry in best_dynamics.items():
+            mdl_str = f", MDL={entry.mdl_score:.2f}" if entry.mdl_score is not None else ""
             print(
                 f"  [{target}] {entry.expression.expression_str}"
-                f"  (R2={entry.training_r2:.4f}, MDL={entry.mdl_score:.2f})"
+                f"  (R2={entry.training_r2:.4f}{mdl_str})"
             )
         if missing:
             print(f"\n  WARNING: No validated hypothesis for: {sorted(missing)}")
@@ -261,10 +262,10 @@ def main() -> None:
         return
 
     if best_reward:
+        r_mdl = f", MDL={best_reward.mdl_score:.2f}" if best_reward.mdl_score is not None else ""
         print(
             f"  [reward] {best_reward.expression.expression_str}"
-            f"  (R2={best_reward.training_r2:.4f}, "
-            f"MDL={best_reward.mdl_score:.2f})"
+            f"  (R2={best_reward.training_r2:.4f}{r_mdl})"
         )
 
     # ====================================================================
@@ -274,11 +275,15 @@ def main() -> None:
     apd_stage = AnalyticPolicyDerivationStage(
         env_family=env_family,
         gamma=0.99,
+        adaptive_replan_multiplier=3.0,
+        min_replan_interval=3,
+        robust_n_scenarios=5,
     )
     apd_output = apd_stage.run(
         {
             "hypothesis_falsification": hf_output,
             "transition_analysis": ta_output,
+            "causal_discovery": cd_output,
         }
     )
     analytic_policy = apd_output["analytic_policy"]

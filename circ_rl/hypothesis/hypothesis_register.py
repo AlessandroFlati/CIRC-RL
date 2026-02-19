@@ -52,6 +52,8 @@ class HypothesisEntry:
     status: HypothesisStatus = HypothesisStatus.UNTESTED
     falsification_reason: str | None = None
     mdl_score: float | None = None
+    calibration_coefficients: dict[int, tuple[float, float]] | None = None
+    pooled_calibration: tuple[float, float] | None = None
 
 
 class HypothesisRegister:

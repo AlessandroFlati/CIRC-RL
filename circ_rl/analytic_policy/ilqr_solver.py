@@ -28,6 +28,8 @@ See ``CIRC-RL_Framework.md`` Section 3.6.2 (Nonlinear Known Dynamics).
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -58,6 +60,36 @@ class ILQRConfig:
     :param n_random_restarts: Number of random action initializations
         to try in addition to the default (zero or warm-start). The best
         solution across all runs is returned. 0 disables multi-start.
+    :param restart_scale: Scale factor for random restart action
+        initialization. Actions are sampled from
+        :math:`\mathcal{N}(0, \sigma)` where
+        :math:`\sigma = \text{restart\_scale} \times \text{max\_action}`,
+        then clipped to ``[-max_action, max_action]``.
+    :param replan_interval: How often (in timesteps) to replan from
+        the current observed state. Must be ``<= horizon``. When set
+        ``< horizon``, the controller operates in MPC mode: it plans
+        over the full horizon but only executes ``replan_interval``
+        steps before replanning. ``None`` means same as ``horizon``
+        (single-plan mode).
+    :param use_tanh_squash: If ``True``, use smooth tanh squashing
+        instead of hard clipping for action bounds in the line search.
+        Provides gradient information near boundaries, improving
+        optimization when actions are near ``max_action``.
+    :param parallel_restarts: If ``True``, run multi-start restarts
+        in parallel using ``ThreadPoolExecutor``. NumPy releases the
+        GIL during computation, so thread-based parallelism is
+        effective. Set to ``False`` for deterministic single-threaded
+        execution.
+    :param adaptive_replan_threshold: State deviation norm threshold
+        for adaptive replanning. When the observed state deviates from
+        the predicted nominal trajectory by more than this threshold,
+        an immediate replan is triggered. ``None`` disables adaptive
+        replanning (uses fixed ``replan_interval`` only).
+        See ``CIRC-RL_Framework.md`` Section 7.2.
+    :param min_replan_interval: Minimum steps between replans to
+        prevent thrashing when the model is noisy. Adaptive replanning
+        cannot trigger before this many steps since the last replan.
+        Default 3.
     """
 
     horizon: int = 200
@@ -72,6 +104,36 @@ class ILQRConfig:
     gamma: float = 0.99
     max_action: float = 2.0
     n_random_restarts: int = 0
+    restart_scale: float = 0.3
+    replan_interval: int | None = None
+    use_tanh_squash: bool = True
+    parallel_restarts: bool = True
+    adaptive_replan_threshold: float | None = None
+    min_replan_interval: int = 3
+
+    def __post_init__(self) -> None:
+        if self.replan_interval is not None:
+            if self.replan_interval < 1:
+                raise ValueError(
+                    f"replan_interval must be >= 1, "
+                    f"got {self.replan_interval}"
+                )
+            if self.replan_interval > self.horizon:
+                raise ValueError(
+                    f"replan_interval ({self.replan_interval}) must be "
+                    f"<= horizon ({self.horizon})"
+                )
+        if self.adaptive_replan_threshold is not None:
+            if self.adaptive_replan_threshold <= 0:
+                raise ValueError(
+                    f"adaptive_replan_threshold must be > 0, "
+                    f"got {self.adaptive_replan_threshold}"
+                )
+        if self.min_replan_interval < 1:
+            raise ValueError(
+                f"min_replan_interval must be >= 1, "
+                f"got {self.min_replan_interval}"
+            )
 
 
 @dataclass
@@ -142,6 +204,18 @@ class ILQRSolver:
         ``(state, action) -> B``, where ``B`` is the Jacobian
         :math:`\partial f / \partial u` of shape
         ``(state_dim, action_dim)``.
+    :param terminal_cost_fn: Optional callable
+        ``(state) -> (cost, gradient, hessian)`` providing the terminal
+        value function. ``cost`` is a scalar, ``gradient`` has shape
+        ``(state_dim,)``, ``hessian`` has shape
+        ``(state_dim, state_dim)``. Used to initialize the backward
+        pass instead of zeros.
+    :param reward_derivatives_fn: Optional callable
+        ``(state, action) -> (r_x, r_u, r_xx, r_uu, r_ux)`` providing
+        analytic reward derivatives. When provided, replaces finite-
+        difference computation in the backward pass. Derivatives use
+        the **reward** sign convention (positive); the solver negates
+        them to obtain cost derivatives internally.
     """
 
     def __init__(
@@ -155,12 +229,34 @@ class ILQRSolver:
         dynamics_jac_action_fn: (
             Callable[[np.ndarray, np.ndarray], np.ndarray] | None
         ) = None,
+        terminal_cost_fn: (
+            Callable[
+                [np.ndarray],
+                tuple[float, np.ndarray, np.ndarray],
+            ]
+            | None
+        ) = None,
+        reward_derivatives_fn: (
+            Callable[
+                [np.ndarray, np.ndarray],
+                tuple[
+                    np.ndarray,
+                    np.ndarray,
+                    np.ndarray,
+                    np.ndarray,
+                    np.ndarray,
+                ],
+            ]
+            | None
+        ) = None,
     ) -> None:
         self._config = config
         self._dynamics_fn = dynamics_fn
         self._reward_fn = reward_fn
         self._jac_state_fn = dynamics_jac_state_fn
         self._jac_action_fn = dynamics_jac_action_fn
+        self._terminal_cost_fn = terminal_cost_fn
+        self._reward_derivatives_fn = reward_derivatives_fn
 
     @property
     def config(self) -> ILQRConfig:
@@ -193,26 +289,48 @@ class ILQRSolver:
                 initial_state, action_dim, warm_start_actions,
             )
 
-        # Multi-start: run default + n_random_restarts random inits
-        best_sol = self._plan_single(
-            initial_state, action_dim, warm_start_actions,
-        )
+        # Pre-generate all random action sequences (RNG not thread-safe)
         rng = np.random.default_rng()
-
+        all_inits: list[np.ndarray | None] = [warm_start_actions]
         for _ in range(cfg.n_random_restarts):
-            random_actions = rng.uniform(
-                -cfg.max_action, cfg.max_action,
-                size=(cfg.horizon, action_dim),
+            all_inits.append(
+                np.clip(
+                    rng.normal(
+                        0,
+                        cfg.restart_scale * cfg.max_action,
+                        size=(cfg.horizon, action_dim),
+                    ),
+                    -cfg.max_action,
+                    cfg.max_action,
+                )
             )
-            sol = self._plan_single(
-                initial_state, action_dim, random_actions,
-            )
-            if sol.total_reward > best_sol.total_reward:
-                best_sol = sol
+
+        n_runs = len(all_inits)
+
+        if cfg.parallel_restarts and n_runs > 1:
+            max_workers = min(n_runs, os.cpu_count() or 4)
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = [
+                    pool.submit(
+                        self._plan_single,
+                        initial_state,
+                        action_dim,
+                        init_actions,
+                    )
+                    for init_actions in all_inits
+                ]
+                solutions = [f.result() for f in futures]
+        else:
+            solutions = [
+                self._plan_single(initial_state, action_dim, init_actions)
+                for init_actions in all_inits
+            ]
+
+        best_sol = max(solutions, key=lambda s: s.total_reward)
 
         logger.info(
             "iLQR multi-start: best of {} runs, reward={:.2f}",
-            1 + cfg.n_random_restarts,
+            n_runs,
             best_sol.total_reward,
         )
         return best_sol
@@ -412,9 +530,18 @@ class ILQRSolver:
         gamma = self._config.gamma
         horizon = actions.shape[0]
 
-        # Terminal value function: V_T = 0 (no terminal cost)
-        v_x = np.zeros(state_dim)  # (state_dim,)
-        v_xx = np.zeros((state_dim, state_dim))  # (state_dim, state_dim)
+        # Terminal value function
+        if self._terminal_cost_fn is not None:
+            try:
+                _tc_val, v_x, v_xx = self._terminal_cost_fn(states[-1])
+                v_x = np.asarray(v_x, dtype=np.float64)  # (state_dim,)
+                v_xx = np.asarray(v_xx, dtype=np.float64)  # (state_dim, state_dim)
+            except np.linalg.LinAlgError:
+                v_x = np.zeros(state_dim)  # (state_dim,)
+                v_xx = np.zeros((state_dim, state_dim))  # (state_dim, state_dim)
+        else:
+            v_x = np.zeros(state_dim)  # (state_dim,)
+            v_xx = np.zeros((state_dim, state_dim))  # (state_dim, state_dim)
 
         k_gains: list[np.ndarray] = [
             np.zeros(action_dim) for _ in range(horizon)
@@ -522,13 +649,18 @@ class ILQRSolver:
                     + big_k_gains[t] @ dx
                 )
 
-                # Clip to action bounds
-                np.clip(
-                    new_actions[t],
-                    -cfg.max_action,
-                    cfg.max_action,
-                    out=new_actions[t],
-                )
+                # Bound actions: smooth tanh or hard clip
+                if cfg.use_tanh_squash:
+                    new_actions[t] = cfg.max_action * np.tanh(
+                        new_actions[t] / cfg.max_action,
+                    )
+                else:
+                    np.clip(
+                        new_actions[t],
+                        -cfg.max_action,
+                        cfg.max_action,
+                        out=new_actions[t],
+                    )
 
                 new_states[t + 1] = self._dynamics_fn(
                     new_states[t], new_actions[t],
@@ -593,10 +725,11 @@ class ILQRSolver:
         action_dim: int,
         eps: float = 1e-5,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        r"""Compute cost derivatives via finite differences.
+        r"""Compute cost derivatives, analytically or via finite differences.
 
-        Cost is defined as :math:`c = -r` (negated reward). Returns
-        the gradient and Hessian of the cost function.
+        Cost is defined as :math:`c = -r` (negated reward). When
+        ``reward_derivatives_fn`` is available, uses exact analytic
+        derivatives; otherwise falls back to finite differences.
 
         :returns: Tuple ``(c_x, c_u, c_xx, c_uu, c_ux)`` where
             ``c_x`` has shape ``(state_dim,)``,
@@ -605,6 +738,12 @@ class ILQRSolver:
             ``c_uu`` has shape ``(action_dim, action_dim)``,
             ``c_ux`` has shape ``(action_dim, state_dim)``.
         """
+        if self._reward_derivatives_fn is not None:
+            r_x, r_u, r_xx, r_uu, r_ux = self._reward_derivatives_fn(
+                state, action,
+            )
+            return -r_x, -r_u, -r_xx, -r_uu, -r_ux
+
         r0 = self._reward_fn(state, action)
 
         # Gradient w.r.t. state: c_x = -r_x
@@ -771,3 +910,127 @@ def _finite_diff_jac_action(
             - dynamics_fn(state, a_minus)
         ) / (2 * eps)
     return jac
+
+
+def make_quadratic_terminal_cost(
+    reward_fn: Callable[[np.ndarray, np.ndarray], float],
+    action_dim: int,
+    gamma: float,
+    state_dim: int,
+    eps: float = 1e-5,
+    scale_override: float | None = None,
+    max_hessian_eigval: float = 1e4,
+) -> Callable[[np.ndarray], tuple[float, np.ndarray, np.ndarray]]:
+    r"""Build a terminal cost function from the running reward.
+
+    Approximates the infinite-horizon cost-to-go by assuming the
+    system stays at the terminal state under zero action:
+
+    .. math::
+
+        V_T(x) \approx s \cdot c(x, 0)
+
+    where :math:`c = -r` and :math:`s` is either ``scale_override``
+    or :math:`\gamma / (1 - \gamma)`. The gradient and Hessian are
+    computed via finite differences at the terminal state. Hessian
+    eigenvalues are clamped to ``[-max_hessian_eigval, max_hessian_eigval]``
+    to prevent ill-conditioning.
+
+    :param reward_fn: Stage reward ``(state, action) -> float``.
+    :param action_dim: Action dimensionality.
+    :param gamma: Discount factor.
+    :param state_dim: State dimensionality.
+    :param eps: Finite difference step size.
+    :param scale_override: If provided, use this as the terminal cost
+        scale instead of ``gamma / (1 - gamma)``. Useful to reduce
+        terminal cost aggressiveness when gamma is close to 1.
+    :param max_hessian_eigval: Maximum absolute eigenvalue for the
+        scaled terminal Hessian. Eigenvalues exceeding this are
+        clamped to prevent ill-conditioning.
+    :returns: Callable ``(state) -> (cost, gradient, hessian)``.
+    """
+    if scale_override is not None:
+        scale = scale_override
+    else:
+        scale = gamma / (1.0 - gamma)
+
+    def terminal_cost_fn(
+        state: np.ndarray,
+    ) -> tuple[float, np.ndarray, np.ndarray]:
+        zero_action = np.zeros(action_dim)
+        r0 = reward_fn(state, zero_action)
+        c0 = -r0
+
+        # Gradient: c_x = -r_x via central differences
+        c_x = np.zeros(state_dim)  # (state_dim,)
+        for i in range(state_dim):
+            s_plus = state.copy()
+            s_minus = state.copy()
+            s_plus[i] += eps
+            s_minus[i] -= eps
+            c_x[i] = -(
+                reward_fn(s_plus, zero_action)
+                - reward_fn(s_minus, zero_action)
+            ) / (2 * eps)
+
+        # Hessian: c_xx = -r_xx via central differences
+        c_xx = np.zeros((state_dim, state_dim))  # (state_dim, state_dim)
+        for i in range(state_dim):
+            for j in range(i, state_dim):
+                if i == j:
+                    s_plus = state.copy()
+                    s_minus = state.copy()
+                    s_plus[i] += eps
+                    s_minus[i] -= eps
+                    c_xx[i, i] = -(
+                        reward_fn(s_plus, zero_action)
+                        - 2 * r0
+                        + reward_fn(s_minus, zero_action)
+                    ) / (eps ** 2)
+                else:
+                    s_pp = state.copy()
+                    s_pm = state.copy()
+                    s_mp = state.copy()
+                    s_mm = state.copy()
+                    s_pp[i] += eps
+                    s_pp[j] += eps
+                    s_pm[i] += eps
+                    s_pm[j] -= eps
+                    s_mp[i] -= eps
+                    s_mp[j] += eps
+                    s_mm[i] -= eps
+                    s_mm[j] -= eps
+                    c_xx[i, j] = -(
+                        reward_fn(s_pp, zero_action)
+                        - reward_fn(s_pm, zero_action)
+                        - reward_fn(s_mp, zero_action)
+                        + reward_fn(s_mm, zero_action)
+                    ) / (4 * eps ** 2)
+                    c_xx[j, i] = c_xx[i, j]
+
+        scaled_hessian = scale * c_xx  # (state_dim, state_dim)
+
+        # Guard against NaN/Inf from numerical Hessian
+        if not np.all(np.isfinite(scaled_hessian)):
+            scaled_hessian = np.eye(state_dim) * max_hessian_eigval
+
+        # Clamp eigenvalues to prevent ill-conditioning
+        try:
+            eigvals, eigvecs = np.linalg.eigh(scaled_hessian)
+        except np.linalg.LinAlgError:
+            # Fallback: use identity-scaled Hessian
+            scaled_hessian = np.eye(state_dim) * max_hessian_eigval
+            eigvals = np.full(state_dim, max_hessian_eigval)
+            eigvecs = np.eye(state_dim)
+        eigvals = np.clip(
+            eigvals, -max_hessian_eigval, max_hessian_eigval,
+        )
+        scaled_hessian = eigvecs @ np.diag(eigvals) @ eigvecs.T
+
+        return (
+            scale * c0,
+            scale * c_x,
+            scaled_hessian,
+        )
+
+    return terminal_cost_fn

@@ -216,3 +216,4 @@ __marimo__/
 .circ_cache/
 outputs/
 experiments/outputs/
+.julia_sysimage.so

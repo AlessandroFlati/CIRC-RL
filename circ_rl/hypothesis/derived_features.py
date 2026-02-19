@@ -30,11 +30,17 @@ class DerivedFeatureSpec:
         source arrays. Takes one 1D array per source name and returns
         a 1D array of the same length. For example,
         ``np.arctan2`` for ``theta = atan2(sin_theta, cos_theta)``.
+    :param sympy_fn: Optional sympy equivalent of ``compute_fn``,
+        used for building analytic reward derivatives. For example,
+        ``sympy.atan2`` for ``np.arctan2``. When provided, enables
+        symbolic composition of the reward expression through the
+        derived feature for exact differentiation.
     """
 
     name: str
     source_names: tuple[str, ...]
     compute_fn: Callable[..., Any]
+    sympy_fn: Callable[..., Any] | None = None
 
 
 def compute_derived_columns(
