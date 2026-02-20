@@ -1720,17 +1720,28 @@ class DiagnosticValidationStage(PipelineStage):
 
             for env_id, solver in solvers.items():
                 saved_configs[env_id] = solver._config
-                solver._config = _dc_replace(
-                    solver._config,
-                    n_random_restarts=1,
-                    replan_interval=25,
-                    parallel_restarts=False,
-                    adaptive_replan_threshold=None,
-                    min_replan_interval=25,
-                )
+                # MPPI configs lack iLQR-specific fields; detect by attr
+                if hasattr(solver._config, "n_random_restarts"):
+                    solver._config = _dc_replace(
+                        solver._config,
+                        n_random_restarts=1,
+                        replan_interval=25,
+                        parallel_restarts=False,
+                        adaptive_replan_threshold=None,
+                        min_replan_interval=25,
+                    )
+                else:
+                    solver._config = _dc_replace(
+                        solver._config,
+                        n_samples=32,
+                        n_iterations=1,
+                        replan_interval=25,
+                        adaptive_replan_threshold=None,
+                        min_replan_interval=25,
+                    )
             logger.info(
-                "Diagnostic validation: lightweight iLQR "
-                "(restarts=1, replan_interval=25, no adaptive, no robust MPC)",
+                "Diagnostic validation: lightweight solver "
+                "(reduced config for faster diagnostics)",
             )
 
         # Clear cached plans so the lighter config takes effect

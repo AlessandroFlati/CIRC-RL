@@ -365,6 +365,84 @@ def compile_torch_fn(
         return None
 
 
+def build_batched_dynamics_fn(
+    dynamics_expressions: dict[int, Any],
+    state_names: list[str],
+    action_names: list[str],
+    state_dim: int,
+    env_params: dict[str, float] | None,
+    angular_dims: tuple[int, ...] = (),
+    calibration_coefficients: dict[int, tuple[float, float]] | None = None,
+) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
+    r"""Build a vectorized dynamics function for K parallel rollouts.
+
+    Each per-dimension sympy expression is lambdified with the numpy
+    module backend. Since numpy functions broadcast over leading
+    dimensions, passing ``(K,)``-shaped state/action columns naturally
+    produces ``(K,)``-shaped deltas.
+
+    :param dynamics_expressions: Per-dimension symbolic dynamics.
+        Values must have a ``.sympy_expr`` attribute.
+    :param state_names: Canonical state variable names.
+    :param action_names: Action variable names.
+    :param state_dim: Number of state dimensions.
+    :param env_params: Environment parameter values to substitute.
+    :param angular_dims: Indices of angular state dimensions to wrap.
+    :param calibration_coefficients: Per-dimension ``(alpha, beta)``
+        calibration coefficients.
+    :returns: Callable ``(states, actions) -> next_states`` where
+        ``states`` has shape ``(K, state_dim)`` and ``actions`` has
+        shape ``(K, action_dim)``.
+    """
+    import sympy
+
+    var_names = list(state_names) + list(action_names)
+    symbols = [sympy.Symbol(n) for n in var_names]
+    dim_fns: dict[int, Callable[..., Any]] = {}
+
+    for dim_idx, expr_obj in dynamics_expressions.items():
+        sympy_expr = expr_obj.sympy_expr
+        if env_params:
+            subs = {sympy.Symbol(k): v for k, v in env_params.items()}
+            sympy_expr = sympy_expr.subs(subs)
+        fn = sympy.lambdify(symbols, sympy_expr, modules=["numpy"])
+        dim_fns[dim_idx] = fn
+
+    _cal = calibration_coefficients
+    _ang = angular_dims
+
+    def batched_dynamics_fn(
+        states: np.ndarray,
+        actions: np.ndarray,
+    ) -> np.ndarray:
+        """Vectorized dynamics: (K, S), (K, A) -> (K, S)."""
+        next_states = states.copy()  # (K, S)
+        n_state = states.shape[1]
+        n_action = actions.shape[1]
+        # Build column list: [s0, s1, ..., a0, a1, ...]
+        cols = [states[:, i] for i in range(n_state)]
+        cols += [actions[:, i] for i in range(n_action)]
+
+        for dim_idx, fn in dim_fns.items():
+            delta = fn(*cols)  # (K,) via broadcasting
+            if isinstance(delta, (int, float)):
+                # Expression evaluated to a constant (no variables)
+                delta = np.full(states.shape[0], delta)
+            if _cal is not None and dim_idx in _cal:
+                alpha, beta = _cal[dim_idx]
+                delta = alpha * delta + beta
+            next_states[:, dim_idx] += delta
+
+        for d in _ang:
+            next_states[:, d] = np.arctan2(
+                np.sin(next_states[:, d]),
+                np.cos(next_states[:, d]),
+            )
+        return next_states
+
+    return batched_dynamics_fn
+
+
 def build_torch_dynamics_fns(
     dynamics_expressions: dict[int, Any],
     state_names: list[str],
