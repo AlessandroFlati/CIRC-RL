@@ -53,6 +53,18 @@ class SymbolicExpression:
         # Using object.__setattr__ because the dataclass is frozen.
         object.__setattr__(self, "_callable_cache", {})
 
+    def __getstate__(self) -> dict[str, Any]:
+        """Exclude callable cache from pickling (closures are not picklable)."""
+        state = self.__dict__.copy()
+        state.pop("_callable_cache", None)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Restore object and reinitialize callable cache."""
+        for key, value in state.items():
+            object.__setattr__(self, key, value)
+        object.__setattr__(self, "_callable_cache", {})
+
     @staticmethod
     def count_tree_nodes(expr: sympy.Expr) -> int:
         """Count the number of nodes in a sympy expression tree.

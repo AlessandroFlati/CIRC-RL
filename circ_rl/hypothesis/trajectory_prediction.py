@@ -252,19 +252,28 @@ class TrajectoryPredictionTest:
     ) -> np.ndarray:
         """Build a single input row for expression evaluation.
 
+        Resolves variable names to state, action, or env-param columns.
+        State features are matched by name from ``state_feature_names``
+        first, then by ``s<N>`` pattern as fallback.
+
         :returns: Array of shape ``(1, len(variable_names))``.
         """
-        row = []
+        row: list[float] = []
         state_dim = len(state_feature_names)
         for name in variable_names:
-            if name.startswith("s") and name[1:].isdigit():
+            # State features: match by name first (handles canonical
+            # coordinates like phi_0 that don't follow s<N> convention)
+            if name in state_feature_names:
+                idx = state_feature_names.index(name)
+                row.append(float(state[idx]) if idx < state_dim else 0.0)
+            elif name.startswith("s") and name[1:].isdigit():
                 idx = int(name[1:])
-                row.append(state[idx] if idx < state_dim else 0.0)
+                row.append(float(state[idx]) if idx < state_dim else 0.0)
             elif name == "action":
-                row.append(action[0] if action_dim >= 1 else 0.0)
+                row.append(float(action[0]) if action_dim >= 1 else 0.0)
             elif name.startswith("action_") and name[7:].isdigit():
                 idx = int(name[7:])
-                row.append(action[idx] if idx < action_dim else 0.0)
+                row.append(float(action[idx]) if idx < action_dim else 0.0)
             elif env_params_row is not None:
                 # Env param -- find positional index
                 ep_offset = state_dim + action_dim

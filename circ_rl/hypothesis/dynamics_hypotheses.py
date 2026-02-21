@@ -119,6 +119,12 @@ class DynamicsHypothesisGenerator:
        R2 >= ``tiered_r2_threshold``, skip the full run.
     3. **Full SR** (minutes): full complexity and iteration budget.
 
+    Templates above ``template_min_r2`` are registered as hypothesis
+    candidates, but PySR is only skipped when the best template achieves
+    R2 >= ``template_skip_pysr_r2``. This ensures that multiple candidate
+    expressions (both template-based and SR-based) compete during
+    falsification.
+
     See ``CIRC-RL_Framework.md`` Section 3.4.1.
 
     :param sr_config: Configuration for symbolic regression (used as
@@ -127,11 +133,13 @@ class DynamicsHypothesisGenerator:
         input features to the symbolic regression (enables discovery of
         parametric relationships like :math:`\beta_e \propto 1/(m l^2)`).
     :param use_templates: If True, try physics template matching before
-        running PySR. When a template achieves R2 >= ``template_min_r2``,
-        PySR is skipped for that dimension. This is orders of magnitude
-        faster than symbolic regression.
+        running PySR. Matching templates are registered as hypothesis
+        candidates alongside PySR results.
     :param template_min_r2: Minimum R2 for a physics template to be
-        accepted (skipping PySR for that dimension).
+        registered as a hypothesis candidate. Default 0.90.
+    :param template_skip_pysr_r2: If the best template achieves R2 >=
+        this threshold, PySR is skipped for that dimension entirely.
+        Default 0.999.
     :param use_tiered_sr: If True, run a quick low-complexity SR pass
         before the full config. When the quick pass finds R2 >=
         ``tiered_r2_threshold``, the full pass is skipped.
@@ -144,7 +152,8 @@ class DynamicsHypothesisGenerator:
         sr_config: SymbolicRegressionConfig | None = None,
         include_env_params: bool = True,
         use_templates: bool = True,
-        template_min_r2: float = 0.99,
+        template_min_r2: float = 0.90,
+        template_skip_pysr_r2: float = 0.999,
         use_tiered_sr: bool = True,
         tiered_r2_threshold: float = 0.95,
     ) -> None:
@@ -152,6 +161,7 @@ class DynamicsHypothesisGenerator:
         self._include_env_params = include_env_params
         self._use_templates = use_templates
         self._template_min_r2 = template_min_r2
+        self._template_skip_pysr_r2 = template_skip_pysr_r2
         self._use_tiered_sr = use_tiered_sr
         self._tiered_r2_threshold = tiered_r2_threshold
 
@@ -228,34 +238,51 @@ class DynamicsHypothesisGenerator:
         x: np.ndarray,
         y: np.ndarray,
         var_names: list[str],
-    ) -> list[SymbolicExpression] | None:
+    ) -> tuple[list[SymbolicExpression], bool]:
         """Try physics template matching before PySR.
 
-        :returns: List of expressions if a template matched above
-            threshold, or None to fall through to PySR.
+        Returns ALL templates above ``template_min_r2`` as candidates,
+        and signals whether to skip PySR (only when best R2 >=
+        ``template_skip_pysr_r2``).
+
+        :returns: Tuple of (template_expressions, skip_pysr). The list
+            may be empty if no template matches above threshold.
         """
         if not self._use_templates:
-            return None
+            return [], False
 
         from circ_rl.hypothesis.physics_templates import TemplateBasedIdentifier
 
         identifier = TemplateBasedIdentifier(min_r2=self._template_min_r2)
         results = identifier.identify(x, y, var_names)
 
-        if results:
-            logger.info(
-                "Template matched for {}: {} results (best R2={:.6f}), "
-                "skipping PySR",
-                target_var, len(results), results[0][1],
+        if not results:
+            logger.debug(
+                "No template matched for {} (threshold R2={}), "
+                "falling through to PySR",
+                target_var, self._template_min_r2,
             )
-            return [expr for expr, _r2 in results]
+            return [], False
 
-        logger.debug(
-            "No template matched for {} (threshold R2={}), "
-            "falling through to PySR",
-            target_var, self._template_min_r2,
-        )
-        return None
+        best_r2 = results[0][1]
+        skip_pysr = best_r2 >= self._template_skip_pysr_r2
+
+        if skip_pysr:
+            logger.info(
+                "Template matched for {}: {} results (best R2={:.6f} "
+                ">= {:.4f}), skipping PySR",
+                target_var, len(results), best_r2,
+                self._template_skip_pysr_r2,
+            )
+        else:
+            logger.info(
+                "Template matched for {}: {} results (best R2={:.6f} "
+                "< {:.4f}), will also run PySR",
+                target_var, len(results), best_r2,
+                self._template_skip_pysr_r2,
+            )
+
+        return [expr for expr, _r2 in results], skip_pysr
 
     def _make_quick_sr_config(self) -> SymbolicRegressionConfig:
         """Build a reduced-budget SR config for the quick tier.
@@ -337,29 +364,36 @@ class DynamicsHypothesisGenerator:
 
         Discovery strategy (fastest to slowest):
 
-        1. Physics template matching (~100ms)
-        2. Quick SR pass (low complexity, ~30s)
+        1. Physics template matching (~100ms) -- always registered
+        2. Quick SR pass (low complexity, ~30s) -- skipped if templates
+           achieve R2 >= ``template_skip_pysr_r2``
         3. Full SR pass (only if quick pass R2 < threshold)
         """
         all_ids: list[str] = []
 
         for target_var, _dim_idx, x, y, var_names in dim_tasks:
-            # Try template matching first
-            template_exprs = self._try_templates(target_var, x, y, var_names)
+            expressions: list[SymbolicExpression] = []
 
-            if template_exprs is not None:
-                expressions = template_exprs
-            elif self._use_tiered_sr:
-                expressions = self._run_tiered_sr(
-                    target_var, x, y, var_names,
-                )
-            else:
-                logger.info(
-                    "Running SR for {}: {} samples, {} features",
-                    target_var, x.shape[0], x.shape[1],
-                )
-                regressor = SymbolicRegressor(self._sr_config)
-                expressions = regressor.fit(x, y, var_names)
+            # Try template matching first
+            template_exprs, skip_pysr = self._try_templates(
+                target_var, x, y, var_names,
+            )
+            expressions.extend(template_exprs)
+
+            # Run PySR unless templates are near-perfect
+            if not skip_pysr:
+                if self._use_tiered_sr:
+                    sr_exprs = self._run_tiered_sr(
+                        target_var, x, y, var_names,
+                    )
+                else:
+                    logger.info(
+                        "Running SR for {}: {} samples, {} features",
+                        target_var, x.shape[0], x.shape[1],
+                    )
+                    regressor = SymbolicRegressor(self._sr_config)
+                    sr_exprs = regressor.fit(x, y, var_names)
+                expressions.extend(sr_exprs)
 
             for i, expr in enumerate(expressions):
                 entry = self._make_entry(
@@ -369,8 +403,10 @@ class DynamicsHypothesisGenerator:
                 all_ids.append(entry.hypothesis_id)
 
             logger.info(
-                "Registered {} hypotheses for {}",
+                "Registered {} hypotheses for {} ({} template, {} SR)",
                 len(expressions), target_var,
+                len(template_exprs),
+                len(expressions) - len(template_exprs),
             )
 
         return all_ids
@@ -383,31 +419,45 @@ class DynamicsHypothesisGenerator:
         """Run SR for each dimension in parallel processes.
 
         Tries physics template matching first for each dimension.
-        Only dimensions that fail template matching are submitted to
-        PySR in parallel.
+        Only dimensions where templates don't achieve R2 >=
+        ``template_skip_pysr_r2`` are submitted to PySR in parallel.
+        Template expressions are always registered as candidates.
         """
         all_ids: list[str] = []
 
         # Try templates first (fast, in main process)
         sr_tasks: list[tuple[str, int, np.ndarray, np.ndarray, list[str]]] = []
+        template_count_per_dim: dict[str, int] = {}
+
         for target_var, dim_idx, x, y, var_names in dim_tasks:
-            template_exprs = self._try_templates(target_var, x, y, var_names)
-            if template_exprs is not None:
-                for i, expr in enumerate(template_exprs):
-                    entry = self._make_entry(
-                        expr, target_var, x, y, var_names, idx=i,
-                    )
-                    register.register(entry)
-                    all_ids.append(entry.hypothesis_id)
-                logger.info(
-                    "Registered {} hypotheses for {} (template)",
-                    len(template_exprs), target_var,
+            template_exprs, skip_pysr = self._try_templates(
+                target_var, x, y, var_names,
+            )
+
+            # Register template expressions
+            n_existing = len(all_ids)
+            for i, expr in enumerate(template_exprs):
+                entry = self._make_entry(
+                    expr, target_var, x, y, var_names, idx=i,
                 )
-            else:
+                register.register(entry)
+                all_ids.append(entry.hypothesis_id)
+            template_count_per_dim[target_var] = len(all_ids) - n_existing
+
+            if template_count_per_dim[target_var] > 0:
+                logger.info(
+                    "Registered {} template hypotheses for {}",
+                    template_count_per_dim[target_var], target_var,
+                )
+
+            if not skip_pysr:
                 sr_tasks.append((target_var, dim_idx, x, y, var_names))
 
         if not sr_tasks:
-            logger.info("All dimensions matched templates, skipping PySR")
+            logger.info(
+                "All dimensions matched templates (R2 >= {}), skipping PySR",
+                self._template_skip_pysr_r2,
+            )
             return all_ids
 
         logger.info(
@@ -438,15 +488,18 @@ class DynamicsHypothesisGenerator:
                 )
                 _, _, x, y, var_names = task
 
+                # Offset index by number of templates already registered
+                idx_offset = template_count_per_dim.get(target_var, 0)
                 for i, expr in enumerate(expressions):
                     entry = self._make_entry(
-                        expr, target_var, x, y, var_names, idx=i,
+                        expr, target_var, x, y, var_names,
+                        idx=idx_offset + i,
                     )
                     register.register(entry)
                     all_ids.append(entry.hypothesis_id)
 
                 logger.info(
-                    "Registered {} hypotheses for {} (parallel)",
+                    "Registered {} SR hypotheses for {} (parallel)",
                     len(expressions), target_var,
                 )
 

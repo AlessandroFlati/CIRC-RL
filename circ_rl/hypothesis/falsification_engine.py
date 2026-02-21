@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
+import sympy
+
 from circ_rl.hypothesis.expression import SymbolicExpression
 from circ_rl.hypothesis.hypothesis_register import (
     HypothesisEntry,
@@ -218,7 +220,15 @@ class FalsificationEngine:
 
         # Test 3: Trajectory prediction (dynamics hypotheses only)
         if target_dim_idx >= 0:
-            dyn_exprs = {target_dim_idx: expr}
+            # Apply pooled calibration (alpha * h(x) + beta) to correct
+            # for small coefficient errors that compound over multi-step
+            # rollouts. The structural consistency test already computed
+            # these coefficients.
+            traj_expr = self._apply_calibration(
+                expr, struct_result.pooled_coefficients,
+            )
+
+            dyn_exprs = {target_dim_idx: traj_expr}
             traj_result = trajectory_test.test(
                 dyn_exprs, dataset, state_feature_names, variable_names,
             )
@@ -414,6 +424,30 @@ class FalsificationEngine:
             best_per_target=best_per_target,
             best_effort_per_target=best_effort_per_target,
         )
+
+    @staticmethod
+    def _apply_calibration(
+        expr: SymbolicExpression,
+        pooled_coefficients: tuple[float, float],
+    ) -> SymbolicExpression:
+        """Apply pooled calibration to an expression.
+
+        Transforms :math:`h(x)` into :math:`\\alpha \\cdot h(x) + \\beta`
+        using the calibration coefficients from the structural consistency
+        test. Skips transformation when coefficients are near-identity
+        (alpha ~ 1, beta ~ 0).
+
+        :param expr: The original symbolic expression.
+        :param pooled_coefficients: Tuple of (alpha, beta) from pooled OLS.
+        :returns: Calibrated expression (possibly the same object if
+            calibration is near-identity).
+        """
+        alpha, beta = pooled_coefficients
+        if abs(alpha - 1.0) < 1e-6 and abs(beta) < 1e-6:
+            return expr
+
+        calibrated_sympy = alpha * expr.sympy_expr + sympy.Float(beta)
+        return SymbolicExpression.from_sympy(sympy.sympify(calibrated_sympy))
 
     @staticmethod
     def _resolve_target_dim(
