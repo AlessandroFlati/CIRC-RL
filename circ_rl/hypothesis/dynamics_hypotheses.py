@@ -39,14 +39,18 @@ def _dynamics_sr_worker(
     var_names: list[str],
     use_tiered: bool = True,
     tiered_r2_threshold: float = 0.95,
+    extended_r2_threshold: float = 0.85,
 ) -> list[SymbolicExpression]:
     """Top-level worker for parallel per-dimension SR.
 
     Must be top-level for pickling by ProcessPoolExecutor.
     Sets ``_CIRC_SR_SUBPROCESS=1`` to prevent nested seed parallelism.
 
-    When ``use_tiered`` is True, runs a quick low-complexity pass first
-    and only runs the full config if R2 < ``tiered_r2_threshold``.
+    When ``use_tiered`` is True, runs up to three tiers:
+
+    1. Quick pass (complexity<=15, iters<=20): skip full if R2 >= threshold.
+    2. Full pass (user config): skip extended if R2 >= extended threshold.
+    3. Extended pass (+10 complexity, 2x iters): only if full R2 < 0.85.
     """
     import dataclasses as dc
 
@@ -85,8 +89,30 @@ def _dynamics_sr_worker(
         full_regressor = SymbolicRegressor(sr_config)
         full_exprs = full_regressor.fit(x, y, var_names)
 
-        # Merge and deduplicate
+        # Check if extended tier is needed
         all_exprs = quick_exprs + full_exprs
+        if all_exprs:
+            best_r2 = SymbolicRegressor._best_r2(
+                all_exprs, x, y, var_names,
+            )
+            if best_r2 < extended_r2_threshold:
+                logger.info(
+                    "SR worker for {}: full pass R2={:.6f} < {:.4f}, "
+                    "running extended pass",
+                    target_var, best_r2, extended_r2_threshold,
+                )
+                ext_config = dc.replace(
+                    sr_config,
+                    max_complexity=min(40, sr_config.max_complexity + 10),
+                    n_iterations=max(80, sr_config.n_iterations * 2),
+                    max_samples=min(15000, sr_config.max_samples * 2),
+                    timeout_seconds=max(300, sr_config.timeout_seconds * 2),
+                )
+                ext_regressor = SymbolicRegressor(ext_config)
+                ext_exprs = ext_regressor.fit(x, y, var_names)
+                all_exprs.extend(ext_exprs)
+
+        # Merge and deduplicate
         seen: set[str] = set()
         unique: list[SymbolicExpression] = []
         for expr in sorted(all_exprs, key=lambda e: e.complexity):
@@ -136,7 +162,9 @@ class DynamicsHypothesisGenerator:
         running PySR. Matching templates are registered as hypothesis
         candidates alongside PySR results.
     :param template_min_r2: Minimum R2 for a physics template to be
-        registered as a hypothesis candidate. Default 0.90.
+        registered as a hypothesis candidate. Default 0.80. Set
+        conservatively low so templates survive to falsification even
+        when data artifacts (e.g., velocity clipping) degrade fit.
     :param template_skip_pysr_r2: If the best template achieves R2 >=
         this threshold, PySR is skipped for that dimension entirely.
         Default 0.999.
@@ -145,6 +173,9 @@ class DynamicsHypothesisGenerator:
         ``tiered_r2_threshold``, the full pass is skipped.
     :param tiered_r2_threshold: Minimum R2 from the quick SR pass to
         skip the full run. Default 0.95.
+    :param extended_r2_threshold: If the full SR pass leaves best R2
+        below this threshold, run an extended third tier with doubled
+        iterations and increased complexity. Default 0.85.
     """
 
     def __init__(
@@ -152,10 +183,11 @@ class DynamicsHypothesisGenerator:
         sr_config: SymbolicRegressionConfig | None = None,
         include_env_params: bool = True,
         use_templates: bool = True,
-        template_min_r2: float = 0.90,
+        template_min_r2: float = 0.80,
         template_skip_pysr_r2: float = 0.999,
         use_tiered_sr: bool = True,
         tiered_r2_threshold: float = 0.95,
+        extended_r2_threshold: float = 0.85,
     ) -> None:
         self._sr_config = sr_config or SymbolicRegressionConfig()
         self._include_env_params = include_env_params
@@ -164,6 +196,7 @@ class DynamicsHypothesisGenerator:
         self._template_skip_pysr_r2 = template_skip_pysr_r2
         self._use_tiered_sr = use_tiered_sr
         self._tiered_r2_threshold = tiered_r2_threshold
+        self._extended_r2_threshold = extended_r2_threshold
 
     def generate(
         self,
@@ -311,9 +344,20 @@ class DynamicsHypothesisGenerator:
     ) -> list[SymbolicExpression]:
         """Run tiered SR: quick pass first, full pass only if needed.
 
-        :returns: List of Pareto-front expressions (merged from both tiers
-            if the full tier runs).
+        Three tiers (fastest to slowest):
+
+        1. Quick pass: low complexity (<=15), few iterations (<=20).
+           Skips to result if best R2 >= ``tiered_r2_threshold``.
+        2. Full pass: user-configured complexity and iterations.
+           Skips to result if best R2 >= ``extended_r2_threshold``.
+        3. Extended pass: +10 complexity, doubled iterations, doubled
+           samples. Only triggered when full pass R2 is poor (<0.85).
+
+        :returns: List of Pareto-front expressions (merged from all tiers
+            that ran).
         """
+        import dataclasses as dc
+
         # Tier 1: quick low-complexity pass
         quick_config = self._make_quick_sr_config()
         quick_regressor = SymbolicRegressor(quick_config)
@@ -345,11 +389,38 @@ class DynamicsHypothesisGenerator:
         full_regressor = SymbolicRegressor(self._sr_config)
         full_exprs = full_regressor.fit(x, y, var_names)
 
+        # Check if extended tier is needed
+        all_so_far = quick_exprs + full_exprs
+        if all_so_far:
+            best_r2 = SymbolicRegressor._best_r2(all_so_far, x, y, var_names)
+            if best_r2 < self._extended_r2_threshold:
+                logger.info(
+                    "Tiered SR for {}: full pass R2={:.6f} < {:.4f}, "
+                    "running extended pass",
+                    target_var, best_r2, self._extended_r2_threshold,
+                )
+                full = self._sr_config
+                ext_config = dc.replace(
+                    full,
+                    max_complexity=min(40, full.max_complexity + 10),
+                    n_iterations=max(80, full.n_iterations * 2),
+                    max_samples=min(15000, full.max_samples * 2),
+                    timeout_seconds=max(300, full.timeout_seconds * 2),
+                )
+                ext_regressor = SymbolicRegressor(ext_config)
+                logger.info(
+                    "Extended SR for {} (complexity<={}, iters={}, "
+                    "samples<={})",
+                    target_var, ext_config.max_complexity,
+                    ext_config.n_iterations, ext_config.max_samples,
+                )
+                ext_exprs = ext_regressor.fit(x, y, var_names)
+                all_so_far.extend(ext_exprs)
+
         # Merge and deduplicate
-        all_exprs = quick_exprs + full_exprs
         seen: set[str] = set()
         unique: list[SymbolicExpression] = []
-        for expr in sorted(all_exprs, key=lambda e: e.complexity):
+        for expr in sorted(all_so_far, key=lambda e: e.complexity):
             if expr.expression_str not in seen:
                 seen.add(expr.expression_str)
                 unique.append(expr)
@@ -480,6 +551,7 @@ class DynamicsHypothesisGenerator:
                     var_names,
                     self._use_tiered_sr,
                     self._tiered_r2_threshold,
+                    self._extended_r2_threshold,
                 ): target_var
                 for target_var, _dim_idx, x, y, var_names in sr_tasks
             }

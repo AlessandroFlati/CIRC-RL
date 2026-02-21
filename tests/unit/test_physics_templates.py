@@ -222,3 +222,145 @@ class TestTemplateBasedIdentifier:
         # Without override (uses default 1.0), should find none
         results_strict = identifier.identify(x, y, ["s0"])
         assert len(results_strict) == 0
+
+
+# ---------------------------------------------------------------------------
+# Cosine terrain templates (MountainCar family)
+# ---------------------------------------------------------------------------
+
+class TestCosineTerrainTemplates:
+    """Test the cosine terrain velocity templates for MountainCar."""
+
+    def test_match_mountaincar_discrete_variables(self):
+        """With MountainCar-v0 variables, should match cosine_terrain_velocity."""
+        lib = PhysicsTemplateLibrary()
+        matched = lib.match(["s0", "s1", "action", "gravity", "force"])
+        names = [t.name for t in matched]
+        assert "cosine_terrain_velocity" in names
+
+    def test_match_mountaincar_continuous_variables(self):
+        """With MCContinuous variables, should match powered_cosine_terrain."""
+        lib = PhysicsTemplateLibrary()
+        matched = lib.match(["s0", "s1", "action", "power"])
+        names = [t.name for t in matched]
+        assert "powered_cosine_terrain" in names
+
+    def test_match_position_integration(self):
+        """position_integration should match when s1 is available."""
+        lib = PhysicsTemplateLibrary()
+        matched = lib.match(["s0", "s1"])
+        names = [t.name for t in matched]
+        assert "position_integration" in names
+
+    def test_fit_mountaincar_discrete_dynamics(self):
+        """Fit cosine terrain velocity to MountainCar-v0 dynamics.
+
+        True dynamics: velocity += (action - 1) * force - cos(3 * pos) * gravity
+        with force=0.001, gravity=0.0025.
+        """
+        lib = PhysicsTemplateLibrary()
+        matched = lib.match(["s0", "s1", "action", "gravity", "force"])
+        template = next(t for t in matched if t.name == "cosine_terrain_velocity")
+
+        rng = np.random.default_rng(42)
+        n = 2000
+        position = rng.uniform(-1.2, 0.6, n)
+        velocity = rng.uniform(-0.07, 0.07, n)
+        action = rng.choice([0.0, 1.0, 2.0], n)
+        gravity = np.full(n, 0.0025)
+        force = np.full(n, 0.001)
+
+        y = (action - 1) * force - np.cos(3 * position) * gravity
+
+        x = np.column_stack([position, velocity, action, gravity, force])
+        var_names = ["s0", "s1", "action", "gravity", "force"]
+
+        expr, r2 = lib.fit(template, x, y, var_names)
+        assert r2 > 0.999, f"R2={r2:.6f} too low for exact MountainCar dynamics"
+
+    def test_fit_mountaincar_continuous_dynamics(self):
+        """Fit powered cosine terrain to MountainCarContinuous-v0 dynamics.
+
+        True dynamics: velocity += action * power - 0.0025 * cos(3 * pos)
+        with power=0.0015.
+        """
+        lib = PhysicsTemplateLibrary()
+        matched = lib.match(["s0", "s1", "action", "power"])
+        template = next(t for t in matched if t.name == "powered_cosine_terrain")
+
+        rng = np.random.default_rng(42)
+        n = 2000
+        position = rng.uniform(-1.2, 0.6, n)
+        velocity = rng.uniform(-0.07, 0.07, n)
+        action = rng.uniform(-1, 1, n)
+        power = np.full(n, 0.0015)
+
+        y = action * power - 0.0025 * np.cos(3 * position)
+
+        x = np.column_stack([position, velocity, action, power])
+        var_names = ["s0", "s1", "action", "power"]
+
+        expr, r2 = lib.fit(template, x, y, var_names)
+        assert r2 > 0.999, f"R2={r2:.6f} too low for exact MCCont dynamics"
+
+    def test_fit_position_integration(self):
+        """Fit position_integration to delta_pos = velocity data."""
+        lib = PhysicsTemplateLibrary()
+        matched = lib.match(["s0", "s1"])
+        template = next(t for t in matched if t.name == "position_integration")
+
+        rng = np.random.default_rng(42)
+        n = 1000
+        position = rng.uniform(-1.2, 0.6, n)
+        velocity = rng.uniform(-0.07, 0.07, n)
+
+        y = velocity  # delta_pos = velocity
+
+        x = np.column_stack([position, velocity])
+        var_names = ["s0", "s1"]
+
+        expr, r2 = lib.fit(template, x, y, var_names)
+        assert r2 > 0.999, f"R2={r2:.6f} too low for velocity integration"
+
+    def test_fit_mountaincar_with_varied_params(self):
+        """Fit cosine terrain with varied gravity/force across envs."""
+        lib = PhysicsTemplateLibrary()
+        matched = lib.match(["s0", "s1", "action", "gravity", "force"])
+        template = next(t for t in matched if t.name == "cosine_terrain_velocity")
+
+        rng = np.random.default_rng(42)
+        n = 3000
+        position = rng.uniform(-1.2, 0.6, n)
+        velocity = rng.uniform(-0.07, 0.07, n)
+        action = rng.choice([0.0, 1.0, 2.0], n)
+        # Varied env params
+        gravity = rng.uniform(0.001, 0.005, n)
+        force = rng.uniform(0.0005, 0.002, n)
+
+        y = (action - 1) * force - np.cos(3 * position) * gravity
+
+        x = np.column_stack([position, velocity, action, gravity, force])
+        var_names = ["s0", "s1", "action", "gravity", "force"]
+
+        expr, r2 = lib.fit(template, x, y, var_names)
+        assert r2 > 0.999, f"R2={r2:.6f} too low for varied-param MountainCar"
+
+    def test_identifier_finds_cosine_terrain(self):
+        """TemplateBasedIdentifier should find cosine terrain for MC data."""
+        rng = np.random.default_rng(42)
+        n = 2000
+        position = rng.uniform(-1.2, 0.6, n)
+        velocity = rng.uniform(-0.07, 0.07, n)
+        action = rng.choice([0.0, 1.0, 2.0], n)
+        gravity = np.full(n, 0.0025)
+        force = np.full(n, 0.001)
+
+        y = (action - 1) * force - np.cos(3 * position) * gravity
+
+        x = np.column_stack([position, velocity, action, gravity, force])
+        var_names = ["s0", "s1", "action", "gravity", "force"]
+
+        identifier = TemplateBasedIdentifier(min_r2=0.99)
+        results = identifier.identify(x, y, var_names)
+        assert len(results) > 0, "Should find at least one template match"
+        assert results[0][1] > 0.999

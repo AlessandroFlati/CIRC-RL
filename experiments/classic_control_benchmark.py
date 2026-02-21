@@ -200,7 +200,7 @@ def _make_sr_config(
     :param fast: If True, use reduced iterations/populations.
     :returns: A SymbolicRegressionConfig.
     """
-    n_iterations = 30 if fast else 80
+    n_iterations = 50 if fast else 80
     populations = 15 if fast else 25
     max_samples = 5000 if fast else 10000
 

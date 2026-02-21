@@ -182,6 +182,51 @@ class PhysicsTemplateLibrary:
             initial_guesses=(0.05,),
         ))
 
+        # --- Velocity integration (generic: delta_x = c1 * v) ---
+        self._templates.append(PhysicsTemplate(
+            name="position_integration",
+            expression=c1 * v_sym,
+            free_coefficients=[c1],
+            required_variables=frozenset({"s1"}),
+            domain="mechanics",
+            initial_guesses=(1.0,),
+        ))
+
+        # --- Cosine terrain templates (MountainCar family) ---
+
+        gravity = sp.Symbol("gravity")
+        force = sp.Symbol("force")
+        power = sp.Symbol("power")
+
+        # MountainCar-v0 (discrete): velocity += (action-1)*force - cos(3*pos)*gravity
+        # Template: delta_v = c1 * (action - c2) * force - cos(c3 * position) * gravity
+        # c3 is a free coeff that curve_fit discovers as 3.0
+        self._templates.append(PhysicsTemplate(
+            name="cosine_terrain_velocity",
+            expression=(
+                c1 * (action - c2) * force
+                + c3 * sp.cos(c4 * x_sym) * gravity
+            ),
+            free_coefficients=[c1, c2, c3, c4],
+            required_variables=frozenset({"s0", "s1", "action", "gravity", "force"}),
+            domain="mechanics",
+            initial_guesses=(1.0, 1.0, -1.0, 3.0),
+        ))
+
+        # MountainCarContinuous-v0: velocity += action*power - 0.0025*cos(3*pos)
+        # Template: delta_v = c1 * action * power + c2 * cos(c3 * position)
+        self._templates.append(PhysicsTemplate(
+            name="powered_cosine_terrain",
+            expression=(
+                c1 * action * power
+                + c2 * sp.cos(c3 * x_sym)
+            ),
+            free_coefficients=[c1, c2, c3],
+            required_variables=frozenset({"s0", "action", "power"}),
+            domain="mechanics",
+            initial_guesses=(1.0, -0.0025, 3.0),
+        ))
+
     @property
     def templates(self) -> list[PhysicsTemplate]:
         """All registered templates."""
