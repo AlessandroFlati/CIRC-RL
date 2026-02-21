@@ -486,7 +486,7 @@ class HypothesisGenerationStage(PipelineStage):
             register=register,
             env_param_names=raw_env_param_names,
             angular_dims=dynamics_angular_dims,
-            parallel=True,
+            parallel=False,
         )
 
         # Reward hypotheses (always in observation space)

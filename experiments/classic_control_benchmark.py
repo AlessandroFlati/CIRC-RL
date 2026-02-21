@@ -77,6 +77,8 @@ class EnvConfig:
     :param sr_unary_operators: PySR unary operators for this environment.
     :param sr_max_complexity: PySR max expression complexity.
     :param reward_derived_features: Derived features for reward SR.
+    :param goal_is_survival: If True, "goal" = surviving max_steps (CartPole).
+        If False, "goal" = terminated=True (MountainCar reaching summit).
     """
 
     name: str
@@ -89,6 +91,7 @@ class EnvConfig:
     sr_unary_operators: tuple[str, ...]
     sr_max_complexity: int
     reward_derived_features: list[DerivedFeatureSpec]
+    goal_is_survival: bool = False
 
 
 def _make_env_configs() -> dict[str, EnvConfig]:
@@ -137,10 +140,11 @@ def _make_env_configs() -> dict[str, EnvConfig]:
             },
             continuous_action=False,
             max_steps=500,
-            solver="ilqr",
+            solver="mppi",
             sr_unary_operators=("sin", "cos", "square"),
             sr_max_complexity=30,
             reward_derived_features=[],
+            goal_is_survival=True,
         ),
         "mountaincar": EnvConfig(
             name="mountaincar",
@@ -452,6 +456,8 @@ def _build_mppi_solver(
         reward_fn, batched_reward_fn = _mountaincar_reward_fns(
             env_cfg.gym_id,
         )
+    elif env_cfg.name == "cartpole":
+        reward_fn, batched_reward_fn = _cartpole_reward_fns()
     else:
         raise ValueError(f"No MPPI reward function for {env_cfg.name}")
 
@@ -468,19 +474,35 @@ def _build_mppi_solver(
         max_action = 1.0
         action_dim = 1
 
-    mppi_config = MPPIConfig(
-        horizon=50,
-        n_samples=256,
-        temperature=0.5,
-        noise_sigma=0.3,
-        n_iterations=3,
-        gamma=0.99,
-        max_action=max_action,
-        colored_noise_beta=1.0,
-        replan_interval=3,
-        adaptive_replan_threshold=adaptive_tau,
-        min_replan_interval=2,
-    )
+    # Per-environment MPPI tuning
+    if env_cfg.name == "cartpole":
+        mppi_config = MPPIConfig(
+            horizon=30,
+            n_samples=256,
+            temperature=0.3,
+            noise_sigma=0.5,
+            n_iterations=3,
+            gamma=0.99,
+            max_action=max_action,
+            colored_noise_beta=0.5,
+            replan_interval=1,
+            adaptive_replan_threshold=adaptive_tau,
+            min_replan_interval=1,
+        )
+    else:
+        mppi_config = MPPIConfig(
+            horizon=50,
+            n_samples=256,
+            temperature=0.5,
+            noise_sigma=0.3,
+            n_iterations=3,
+            gamma=0.99,
+            max_action=max_action,
+            colored_noise_beta=1.0,
+            replan_interval=3,
+            adaptive_replan_threshold=adaptive_tau,
+            min_replan_interval=2,
+        )
 
     mppi_solvers: dict[int, MPPISolver] = {}
     for env_idx in range(test_family.n_envs):
@@ -576,6 +598,46 @@ def _mountaincar_reward_fns(
     return scalar_reward_fn, batched_reward_fn
 
 
+def _cartpole_reward_fns() -> tuple[Any, Any]:
+    """Create CartPole reward functions for MPPI.
+
+    Uses angle-based shaping to keep the pole upright and the cart centered.
+    CartPole terminates when ``|theta| > 0.2095 rad`` or ``|x| > 2.4``.
+    The reward encourages staying alive (small angle, centered cart).
+
+    :returns: ``(scalar_reward_fn, batched_reward_fn)``.
+    """
+    # CartPole state: [x, x_dot, theta, theta_dot]
+    # Termination: |theta| > 12 deg (0.2095 rad), |x| > 2.4
+    theta_limit = 0.2095
+    x_limit = 2.4
+
+    def scalar_reward_fn(
+        state: np.ndarray, action: np.ndarray,
+    ) -> float:
+        x, x_dot, theta, theta_dot = state[0], state[1], state[2], state[3]
+        # Heavy penalty near terminal boundaries
+        if abs(theta) > theta_limit or abs(x) > x_limit:
+            return -10.0
+        # Reward for staying upright and centered
+        angle_cost = (theta / theta_limit) ** 2
+        position_cost = (x / x_limit) ** 2
+        return float(1.0 - 0.5 * angle_cost - 0.3 * position_cost)
+
+    def batched_reward_fn(
+        states: np.ndarray, actions: np.ndarray,
+    ) -> np.ndarray:
+        x = states[:, 0]  # (K,)
+        theta = states[:, 2]  # (K,)
+        terminal = (np.abs(theta) > theta_limit) | (np.abs(x) > x_limit)
+        angle_cost = (theta / theta_limit) ** 2  # (K,)
+        position_cost = (x / x_limit) ** 2  # (K,)
+        reward = 1.0 - 0.5 * angle_cost - 0.3 * position_cost  # (K,)
+        return np.where(terminal, -10.0, reward)  # (K,)
+
+    return scalar_reward_fn, batched_reward_fn
+
+
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
@@ -659,14 +721,19 @@ def _evaluate_policy(
 
             total_reward += float(reward)
             if terminated:
-                reached_goal = True
+                if not env_cfg.goal_is_survival:
+                    reached_goal = True
                 steps_list.append(float(step + 1))
                 break
             if truncated:
+                if env_cfg.goal_is_survival:
+                    reached_goal = True
                 steps_list.append(float(step + 1))
                 break
         else:
             steps_list.append(float(max_steps))
+            if env_cfg.goal_is_survival:
+                reached_goal = True
 
         returns.append(total_reward)
         goals.append(1.0 if reached_goal else 0.0)
@@ -771,14 +838,19 @@ def _evaluate_baseline(
             obs, reward, terminated, truncated, _ = env.step(action)
             total_reward += float(reward)
             if terminated:
-                reached_goal = True
+                if not env_cfg.goal_is_survival:
+                    reached_goal = True
                 steps_list.append(float(step + 1))
                 break
             if truncated:
+                if env_cfg.goal_is_survival:
+                    reached_goal = True
                 steps_list.append(float(step + 1))
                 break
         else:
             steps_list.append(float(max_steps))
+            if env_cfg.goal_is_survival:
+                reached_goal = True
 
         returns.append(total_reward)
         goals.append(1.0 if reached_goal else 0.0)

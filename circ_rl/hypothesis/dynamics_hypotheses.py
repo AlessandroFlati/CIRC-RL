@@ -460,12 +460,16 @@ class DynamicsHypothesisGenerator:
             )
             return all_ids
 
+        # Cap parallel workers at 2 to avoid OOM from multiple Julia runtimes
+        # (each PySR process uses ~1-2GB). Dimensions beyond the cap are
+        # processed sequentially within the pool.
+        n_workers = min(2, len(sr_tasks))
         logger.info(
-            "Running SR for {} dimensions in parallel",
-            len(sr_tasks),
+            "Running SR for {} dimensions ({} parallel workers)",
+            len(sr_tasks), n_workers,
         )
 
-        with ProcessPoolExecutor(max_workers=len(sr_tasks)) as pool:
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
             futures = {
                 pool.submit(
                     _dynamics_sr_worker,
