@@ -238,15 +238,42 @@ class DynamicsHypothesisGenerator:
         dim_tasks: list[tuple[str, int, np.ndarray, np.ndarray, list[str]]],
         register: HypothesisRegister,
     ) -> list[str]:
-        """Run SR for each dimension in parallel processes."""
-        logger.info(
-            "Running SR for {} dimensions in parallel",
-            len(dim_tasks),
-        )
+        """Run SR for each dimension in parallel processes.
 
+        Tries physics template matching first for each dimension.
+        Only dimensions that fail template matching are submitted to
+        PySR in parallel.
+        """
         all_ids: list[str] = []
 
-        with ProcessPoolExecutor(max_workers=len(dim_tasks)) as pool:
+        # Try templates first (fast, in main process)
+        sr_tasks: list[tuple[str, int, np.ndarray, np.ndarray, list[str]]] = []
+        for target_var, dim_idx, x, y, var_names in dim_tasks:
+            template_exprs = self._try_templates(target_var, x, y, var_names)
+            if template_exprs is not None:
+                for i, expr in enumerate(template_exprs):
+                    entry = self._make_entry(
+                        expr, target_var, x, y, var_names, idx=i,
+                    )
+                    register.register(entry)
+                    all_ids.append(entry.hypothesis_id)
+                logger.info(
+                    "Registered {} hypotheses for {} (template)",
+                    len(template_exprs), target_var,
+                )
+            else:
+                sr_tasks.append((target_var, dim_idx, x, y, var_names))
+
+        if not sr_tasks:
+            logger.info("All dimensions matched templates, skipping PySR")
+            return all_ids
+
+        logger.info(
+            "Running SR for {} dimensions in parallel",
+            len(sr_tasks),
+        )
+
+        with ProcessPoolExecutor(max_workers=len(sr_tasks)) as pool:
             futures = {
                 pool.submit(
                     _dynamics_sr_worker,
@@ -256,15 +283,14 @@ class DynamicsHypothesisGenerator:
                     y,
                     var_names,
                 ): target_var
-                for target_var, _dim_idx, x, y, var_names in dim_tasks
+                for target_var, _dim_idx, x, y, var_names in sr_tasks
             }
 
             for future in as_completed(futures):
                 target_var = futures[future]
                 expressions = future.result()
-                # Find the matching task to get x, y, var_names for _make_entry
                 task = next(
-                    t for t in dim_tasks if t[0] == target_var
+                    t for t in sr_tasks if t[0] == target_var
                 )
                 _, _, x, y, var_names = task
 

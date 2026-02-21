@@ -63,7 +63,11 @@ class SymbolicRegressionConfig:
         E.g., ``{"sin": 10}`` limits what appears inside ``sin``.
     :param max_samples: Maximum number of samples to use for regression.
         If the input data has more rows than this, a random subset is
-        selected (seeded by ``random_state``). None means no subsampling.
+        selected (seeded by ``random_state``). Default 10000.
+    :param batching: If True, enable mini-batch training in PySR.
+        Faster per-iteration but may reduce search quality slightly.
+    :param batch_size: Number of samples per mini-batch (only used when
+        ``batching=True``). Default 50.
     :param n_sr_runs: Number of SR runs with different seeds.
         When > 1, runs PySR multiple times with seeds
         ``random_state, random_state + 1, ...`` and merges the
@@ -92,7 +96,9 @@ class SymbolicRegressionConfig:
     nested_constraints: dict[str, dict[str, int]] | None = None
     complexity_of_operators: dict[str, int | float] | None = None
     constraints: dict[str, int | tuple[int, int]] | None = None
-    max_samples: int | None = None
+    max_samples: int | None = 10000
+    batching: bool = False
+    batch_size: int = 50
     n_sr_runs: int = 1
     parallel_seeds: bool = True
     early_stop_r2: float | None = None
@@ -368,6 +374,9 @@ class SymbolicRegressor:
             extra_kwargs["complexity_of_operators"] = cfg.complexity_of_operators
         if cfg.constraints is not None:
             extra_kwargs["constraints"] = cfg.constraints
+        if cfg.batching:
+            extra_kwargs["batching"] = True
+            extra_kwargs["batch_size"] = cfg.batch_size
 
         model = PySRRegressor(
             niterations=cfg.n_iterations,

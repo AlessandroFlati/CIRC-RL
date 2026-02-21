@@ -96,6 +96,11 @@ class InvFeatureSelector:
     :param poly_degree: Polynomial degree for basis expansion in the Chow test.
     :param loeo_r2_threshold: Minimum leave-one-environment-out R^2 for the
         global pre-check to pass. Default 0.9.
+    :param max_loeo_samples: Maximum number of training samples per LOEO
+        fold. When the training partition exceeds this, a random subset
+        is drawn (seeded for reproducibility). Reduces LOEO wall-clock
+        time with negligible accuracy loss for ``HistGradientBoostingRegressor``.
+        Default 10000. Set to 0 to disable subsampling.
     :param skip_ancestor_check: When True, skip the graph-based ancestor
         check and evaluate all features.
     :param enable_conditional_invariance: Legacy flag for ATE variance mode.
@@ -112,6 +117,7 @@ class InvFeatureSelector:
         min_weight: float = 0.1,
         poly_degree: int = 2,
         loeo_r2_threshold: float = 0.9,
+        max_loeo_samples: int = 10000,
         enable_conditional_invariance: bool = False,
         skip_ancestor_check: bool = False,
     ) -> None:
@@ -130,6 +136,7 @@ class InvFeatureSelector:
         self._min_weight = min_weight
         self._poly_degree = poly_degree
         self._loeo_r2_threshold = loeo_r2_threshold
+        self._max_loeo_samples = max_loeo_samples
         self._enable_conditional_invariance = enable_conditional_invariance
         self._skip_ancestor_check = skip_ancestor_check
         self._estimator = CausalEffectEstimator()
@@ -241,7 +248,7 @@ class InvFeatureSelector:
         globally_invariant = False
         if len(unique_envs) >= 2:
             min_loeo_r2 = self._loeo_mechanism_precheck(
-                dataset, unique_envs,
+                dataset, unique_envs, self._max_loeo_samples,
             )
             globally_invariant = min_loeo_r2 >= self._loeo_r2_threshold
             if globally_invariant:
@@ -466,6 +473,7 @@ class InvFeatureSelector:
     def _loeo_mechanism_precheck(
         dataset: ExploratoryDataset,
         unique_envs: list[int],
+        max_loeo_samples: int = 10000,
     ) -> float:
         r"""Leave-One-Environment-Out R^2 pre-check for global mechanism invariance.
 
@@ -485,6 +493,9 @@ class InvFeatureSelector:
 
         :param dataset: Multi-environment exploratory data.
         :param unique_envs: Sorted list of environment IDs.
+        :param max_loeo_samples: Maximum training samples per fold.
+            When the training partition exceeds this, a random subset
+            is drawn. Set to 0 to disable subsampling.
         :returns: Minimum leave-one-environment-out R^2.
         """
         from sklearn.ensemble import HistGradientBoostingRegressor
@@ -498,10 +509,22 @@ class InvFeatureSelector:
             train_mask = env_ids != held_out
             test_mask = env_ids == held_out
 
+            x_train = states[train_mask]
+            y_train = rewards[train_mask]
+
+            # Subsample training data if too large
+            if max_loeo_samples > 0 and x_train.shape[0] > max_loeo_samples:
+                rng = np.random.default_rng(42 + held_out)
+                idx = rng.choice(
+                    x_train.shape[0], max_loeo_samples, replace=False,
+                )
+                x_train = x_train[idx]
+                y_train = y_train[idx]
+
             model = HistGradientBoostingRegressor(
-                max_iter=200, max_depth=5, random_state=42,
+                max_iter=100, max_depth=5, random_state=42,
             )
-            model.fit(states[train_mask], rewards[train_mask])
+            model.fit(x_train, y_train)
 
             y_pred = model.predict(states[test_mask])
             y_true = rewards[test_mask]

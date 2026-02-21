@@ -67,14 +67,23 @@ class TransitionAnalyzer:
 
     :param loeo_r2_threshold: Minimum LOEO R^2 for a state dimension to be
         considered invariant. Default 0.9.
+    :param max_loeo_samples: Maximum number of training samples per LOEO
+        fold. When the training partition exceeds this, a random subset
+        is drawn (seeded for reproducibility). Default 10000. Set to 0
+        to disable subsampling.
     """
 
-    def __init__(self, loeo_r2_threshold: float = 0.9) -> None:
+    def __init__(
+        self,
+        loeo_r2_threshold: float = 0.9,
+        max_loeo_samples: int = 10000,
+    ) -> None:
         if loeo_r2_threshold <= 0 or loeo_r2_threshold >= 1:
             raise ValueError(
                 f"loeo_r2_threshold must be in (0, 1), got {loeo_r2_threshold}"
             )
         self._loeo_r2_threshold = loeo_r2_threshold
+        self._max_loeo_samples = max_loeo_samples
 
     def analyze(
         self,
@@ -100,6 +109,7 @@ class TransitionAnalyzer:
         # Step 1: LOEO transition test
         per_dim_loeo_r2, transition_loeo_r2 = self._loeo_transition_test(
             dataset, unique_envs, state_feature_names,
+            self._max_loeo_samples,
         )
 
         variant_dims = [
@@ -140,6 +150,7 @@ class TransitionAnalyzer:
         dataset: ExploratoryDataset,
         unique_envs: list[int],
         state_feature_names: list[str],
+        max_loeo_samples: int = 10000,
     ) -> tuple[dict[str, float], dict[int, float]]:
         r"""Leave-One-Environment-Out R^2 test for transition invariance.
 
@@ -150,6 +161,9 @@ class TransitionAnalyzer:
         :param dataset: Multi-environment data.
         :param unique_envs: Sorted list of environment IDs.
         :param state_feature_names: Names of state features.
+        :param max_loeo_samples: Maximum training samples per fold.
+            When the training partition exceeds this, a random subset
+            is drawn. Set to 0 to disable subsampling.
         :returns: Tuple of (per_dim_min_r2, per_env_min_r2).
         """
         from sklearn.ensemble import HistGradientBoostingRegressor
@@ -178,10 +192,22 @@ class TransitionAnalyzer:
                 train_mask = env_ids != held_out
                 test_mask = env_ids == held_out
 
+                x_train = features[train_mask]
+                y_train = targets[train_mask]
+
+                # Subsample training data if too large
+                if max_loeo_samples > 0 and x_train.shape[0] > max_loeo_samples:
+                    rng = np.random.default_rng(42 + held_out + dim_idx * 1000)
+                    idx = rng.choice(
+                        x_train.shape[0], max_loeo_samples, replace=False,
+                    )
+                    x_train = x_train[idx]
+                    y_train = y_train[idx]
+
                 model = HistGradientBoostingRegressor(
-                    max_iter=200, max_depth=5, random_state=42,
+                    max_iter=100, max_depth=5, random_state=42,
                 )
-                model.fit(features[train_mask], targets[train_mask])
+                model.fit(x_train, y_train)
 
                 y_pred = model.predict(features[test_mask])
                 y_true = targets[test_mask]
