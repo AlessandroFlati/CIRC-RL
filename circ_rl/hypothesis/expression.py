@@ -48,6 +48,11 @@ class SymbolicExpression:
     free_symbols: frozenset[str]
     n_constants: int
 
+    def __post_init__(self) -> None:
+        # Mutable cache for compiled callables, keyed by variable_names tuple.
+        # Using object.__setattr__ because the dataclass is frozen.
+        object.__setattr__(self, "_callable_cache", {})
+
     @staticmethod
     def count_tree_nodes(expr: sympy.Expr) -> int:
         """Count the number of nodes in a sympy expression tree.
@@ -100,6 +105,9 @@ class SymbolicExpression:
     ) -> Callable[..., np.ndarray]:
         """Compile the expression into a fast numpy-callable function.
 
+        Results are cached by ``variable_names`` so repeated calls with
+        the same variable ordering skip the ``sympy.lambdify`` step.
+
         :param variable_names: Ordered list of variable names matching
             the columns of the input array. Symbols in the expression
             that are not in this list are treated as missing (will raise
@@ -110,6 +118,13 @@ class SymbolicExpression:
         :raises ValueError: If any free symbol in the expression is not
             found in variable_names.
         """
+        cache_key = tuple(variable_names)
+        cache: dict[tuple[str, ...], Callable[..., np.ndarray]] = (
+            self._callable_cache  # type: ignore[attr-defined]
+        )
+        if cache_key in cache:
+            return cache[cache_key]
+
         sym_vars = [sympy.Symbol(name) for name in variable_names]
 
         # Validate that all free symbols are provided
@@ -125,6 +140,7 @@ class SymbolicExpression:
             self.sympy_expr,
             modules=["numpy"],
         )
+        n_vars = len(variable_names)
 
         def evaluate(x: np.ndarray) -> np.ndarray:
             """Evaluate the expression on input data.
@@ -132,13 +148,14 @@ class SymbolicExpression:
             :param x: Input array of shape ``(n_samples, n_variables)``.
             :returns: Output array of shape ``(n_samples,)``.
             """
-            assert x.shape[1] == len(variable_names), (
-                f"Expected {len(variable_names)} columns, got {x.shape[1]}"
+            assert x.shape[1] == n_vars, (
+                f"Expected {n_vars} columns, got {x.shape[1]}"
             )
             cols: list[Any] = [x[:, i] for i in range(x.shape[1])]
             result = func(*cols)
             return np.asarray(result, dtype=np.float64).ravel()
 
+        cache[cache_key] = evaluate
         return evaluate
 
     def __repr__(self) -> str:

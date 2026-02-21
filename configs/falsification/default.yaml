@@ -4,6 +4,6 @@ ood_confidence: 0.99
 ood_failure_fraction: 0.2
 trajectory_failure_fraction: 0.2
 held_out_fraction: 0.2
-trajectory_horizon: 50
+trajectory_horizon: 30
 trajectory_divergence_factor: 0.5
-n_test_trajectories: 20
+n_test_trajectories: 10

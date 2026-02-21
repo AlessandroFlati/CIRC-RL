@@ -76,8 +76,9 @@ class SymbolicRegressionConfig:
         Default 1 (single run).
     :param parallel_seeds: If True and ``n_sr_runs > 1``, run seeds
         in parallel using ``ProcessPoolExecutor``. Each PySR process
-        gets its own Julia runtime. Disabled automatically when
-        running inside a subprocess (to avoid nested parallelism).
+        gets its own Julia runtime (~4 min startup each). Default False
+        to reuse a single Julia runtime across seeds. Disabled automatically
+        when running inside a subprocess (to avoid nested parallelism).
     :param early_stop_r2: If set, stop multi-seed runs early when
         any expression achieves training R2 >= this threshold.
         Only used when ``n_sr_runs > 1``. None means no early
@@ -100,8 +101,8 @@ class SymbolicRegressionConfig:
     batching: bool = False
     batch_size: int = 50
     n_sr_runs: int = 1
-    parallel_seeds: bool = True
-    early_stop_r2: float | None = None
+    parallel_seeds: bool = False
+    early_stop_r2: float | None = 0.99
 
 
 class SymbolicRegressor:

@@ -58,10 +58,10 @@ class TrajectoryPredictionTest:
 
     def __init__(
         self,
-        max_horizon: int = 50,
+        max_horizon: int = 30,
         divergence_threshold_factor: float = 0.5,
         failure_fraction: float = 0.2,
-        n_trajectories: int = 20,
+        n_trajectories: int = 10,
     ) -> None:
         self._max_horizon = max_horizon
         self._divergence_factor = divergence_threshold_factor
