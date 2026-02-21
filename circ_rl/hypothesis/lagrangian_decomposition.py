@@ -992,3 +992,95 @@ def build_lagrangian_scalar_dynamics_fn(
         )
 
     return scalar_dynamics_fn
+
+
+# ---------------------------------------------------------------------------
+# Energy computation for cost shaping
+# ---------------------------------------------------------------------------
+
+
+def evaluate_coefficients(
+    templates: dict[str, sympy.Expr],
+    env_params: dict[str, float],
+) -> dict[str, float]:
+    """Evaluate parametric templates for a specific environment.
+
+    :param templates: Symbolic templates mapping coefficient names to
+        sympy expressions in terms of environment parameters.
+    :param env_params: Environment parameter values.
+    :returns: Dict mapping coefficient names to float values.
+    """
+    subs = {sympy.Symbol(k): v for k, v in env_params.items()}
+    return {cn: float(templates[cn].subs(subs)) for cn in COEFF_NAMES}
+
+
+def compute_mechanical_energy(
+    state: np.ndarray,
+    coeffs: dict[str, float],
+) -> float:
+    """Compute total mechanical energy E = T + V for a single state.
+
+    :param state: Canonical state ``[phi_0, phi_1, w1, w2]``.
+    :param coeffs: EL coefficient values (from ``evaluate_coefficients``).
+    :returns: Total mechanical energy.
+    """
+    phi_0, phi_1 = state[0], state[1]
+    w1, w2 = state[2], state[3]
+
+    d1 = coeffs["d1_const"] + coeffs["d1_cos"] * math.cos(phi_1)
+    d2 = coeffs["d2_const"] + coeffs["d2_cos"] * math.cos(phi_1)
+    d3 = coeffs["d3"]
+
+    # Kinetic energy: T = 0.5 * qdot^T M qdot
+    kinetic = 0.5 * (d1 * w1**2 + 2.0 * d2 * w1 * w2 + d3 * w2**2)
+
+    # Potential energy: V = -g_sin1*cos(phi_0) - g_sin12*cos(phi_0+phi_1)
+    potential = (
+        -coeffs["g_sin1"] * math.cos(phi_0)
+        - coeffs["g_sin12"] * math.cos(phi_0 + phi_1)
+    )
+
+    return kinetic + potential
+
+
+def compute_mechanical_energy_batched(
+    states: np.ndarray,
+    coeffs: dict[str, float],
+) -> np.ndarray:
+    """Compute total mechanical energy for K parallel states.
+
+    :param states: Shape ``(K, 4)`` canonical states.
+    :param coeffs: EL coefficient values.
+    :returns: Shape ``(K,)`` total mechanical energies.
+    """
+    phi_0 = states[:, 0]  # (K,)
+    phi_1 = states[:, 1]  # (K,)
+    w1 = states[:, 2]  # (K,)
+    w2 = states[:, 3]  # (K,)
+
+    d1 = coeffs["d1_const"] + coeffs["d1_cos"] * np.cos(phi_1)  # (K,)
+    d2 = coeffs["d2_const"] + coeffs["d2_cos"] * np.cos(phi_1)  # (K,)
+    d3 = coeffs["d3"]
+
+    # Kinetic energy: T = 0.5 * qdot^T M qdot
+    kinetic = 0.5 * (d1 * w1**2 + 2.0 * d2 * w1 * w2 + d3 * w2**2)  # (K,)
+
+    # Potential energy
+    potential = (
+        -coeffs["g_sin1"] * np.cos(phi_0)
+        - coeffs["g_sin12"] * np.cos(phi_0 + phi_1)
+    )  # (K,)
+
+    return kinetic + potential  # (K,)
+
+
+def compute_goal_energy(coeffs: dict[str, float]) -> float:
+    """Compute mechanical energy at the upright goal state.
+
+    Goal: phi_0=pi, phi_1=0, w1=0, w2=0 (upright, stationary).
+
+    :param coeffs: EL coefficient values.
+    :returns: Goal energy E*.
+    """
+    # T = 0 (zero velocity), V = -g_sin1*cos(pi) - g_sin12*cos(pi)
+    return coeffs["g_sin1"] + coeffs["g_sin12"]

@@ -620,6 +620,93 @@ def _acrobot_batched_reward_fn(
     return tip_height - 0.01 * u**2 - 0.001 * (dt1**2 + dt2**2)  # (K,)
 
 
+def _make_energy_reward_fn(
+    coeffs: dict[str, float],
+    e_goal: float,
+    energy_weight: float = 1.0,
+) -> Callable[[np.ndarray, np.ndarray], float]:
+    """Create a scalar energy-shaped reward function for a specific env.
+
+    Composite reward: position_reward - energy_penalty - action/velocity costs.
+    The energy penalty guides MPPI to pump energy toward E* before focusing
+    on tip position.
+
+    :param coeffs: EL coefficient values for this environment.
+    :param e_goal: Target mechanical energy (upright, stationary).
+    :param energy_weight: Weight for the energy deficit penalty.
+    :returns: Reward function ``(state, action) -> float``.
+    """
+    from circ_rl.hypothesis.lagrangian_decomposition import (
+        compute_mechanical_energy,
+    )
+
+    _coeffs = coeffs
+    _eg = e_goal
+    _ew = energy_weight
+
+    def reward_fn(state: np.ndarray, action: np.ndarray) -> float:
+        t1, t2, dt1, dt2 = state[0], state[1], state[2], state[3]
+        tip_height = -np.cos(t1) - np.cos(t1 + t2)
+
+        # Energy deficit: normalized squared error
+        e_current = compute_mechanical_energy(state, _coeffs)
+        e_deficit = ((e_current - _eg) / max(abs(_eg), 1e-6)) ** 2
+
+        return float(
+            tip_height
+            - _ew * e_deficit
+            - 0.01 * action[0] ** 2
+            - 0.001 * (dt1 ** 2 + dt2 ** 2)
+        )
+
+    return reward_fn
+
+
+def _make_energy_batched_reward_fn(
+    coeffs: dict[str, float],
+    e_goal: float,
+    energy_weight: float = 1.0,
+) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
+    """Create a vectorized energy-shaped reward for K-parallel MPPI rollouts.
+
+    :param coeffs: EL coefficient values for this environment.
+    :param e_goal: Target mechanical energy.
+    :param energy_weight: Weight for energy deficit penalty.
+    :returns: Reward function ``(states, actions) -> rewards``
+        where shapes are ``(K, 4), (K, 1) -> (K,)``.
+    """
+    from circ_rl.hypothesis.lagrangian_decomposition import (
+        compute_mechanical_energy_batched,
+    )
+
+    _coeffs = coeffs
+    _eg = e_goal
+    _ew = energy_weight
+
+    def batched_reward_fn(
+        states: np.ndarray, actions: np.ndarray,
+    ) -> np.ndarray:
+        t1 = states[:, 0]  # (K,)
+        t2 = states[:, 1]  # (K,)
+        dt1 = states[:, 2]  # (K,)
+        dt2 = states[:, 3]  # (K,)
+        u = actions[:, 0]  # (K,)
+
+        tip_height = -np.cos(t1) - np.cos(t1 + t2)  # (K,)
+
+        e_current = compute_mechanical_energy_batched(states, _coeffs)  # (K,)
+        e_deficit = ((e_current - _eg) / max(abs(_eg), 1e-6)) ** 2  # (K,)
+
+        return (
+            tip_height
+            - _ew * e_deficit
+            - 0.01 * u**2
+            - 0.001 * (dt1**2 + dt2**2)
+        )  # (K,)
+
+    return batched_reward_fn
+
+
 def _build_mppi_policy(
     test_family: EnvironmentFamily,
     best_dynamics: dict[str, HypothesisEntry],
@@ -630,6 +717,8 @@ def _build_mppi_policy(
     adaptive_replan_multiplier: float = 3.0,
     min_replan_interval: int = 3,
     lagrangian_templates: dict[str, Any] | None = None,
+    use_energy_shaping: bool = False,
+    energy_weight: float = 1.0,
 ) -> _ILQRAnalyticPolicy:
     """Build MPPI policy for Acrobot test environments.
 
@@ -779,12 +868,32 @@ def _build_mppi_policy(
                 calibration_coefficients=cal_arg,
             )
 
+        # Choose reward functions (energy-shaped or standard)
+        if use_energy_shaping and lagrangian_templates is not None:
+            from circ_rl.hypothesis.lagrangian_decomposition import (
+                compute_goal_energy,
+                evaluate_coefficients,
+            )
+            env_coeffs = evaluate_coefficients(
+                lagrangian_templates, env_params,
+            )
+            e_goal = compute_goal_energy(env_coeffs)
+            scalar_reward_fn = _make_energy_reward_fn(
+                env_coeffs, e_goal, energy_weight,
+            )
+            batched_reward_fn = _make_energy_batched_reward_fn(
+                env_coeffs, e_goal, energy_weight,
+            )
+        else:
+            scalar_reward_fn = _acrobot_reward_fn
+            batched_reward_fn = _acrobot_batched_reward_fn
+
         mppi_solvers[env_idx] = MPPISolver(
             config=mppi_config,
             dynamics_fn=dynamics_fn,
-            reward_fn=_acrobot_reward_fn,
+            reward_fn=scalar_reward_fn,
             batched_dynamics_fn=batched_dynamics_fn,
-            batched_reward_fn=_acrobot_batched_reward_fn,
+            batched_reward_fn=batched_reward_fn,
         )
 
     first_entry = next(iter(best_dynamics.values()))
@@ -797,6 +906,237 @@ def _build_mppi_policy(
         action_dim=action_dim,
         n_envs=test_family.n_envs,
         ilqr_solvers=mppi_solvers,  # type: ignore[arg-type]
+        action_low=-max_action * np.ones(action_dim),
+        action_high=max_action * np.ones(action_dim),
+        obs_to_canonical_fn=obs_to_canonical_fn,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase-based policy builder (MPPI + iLQR switching)
+# ---------------------------------------------------------------------------
+
+
+def _make_numerical_jacobian_fns(
+    dynamics_fn: Callable[[np.ndarray, np.ndarray], np.ndarray],
+    state_dim: int,
+    action_dim: int,
+    eps: float = 1e-5,
+) -> tuple[
+    Callable[[np.ndarray, np.ndarray], np.ndarray],
+    Callable[[np.ndarray, np.ndarray], np.ndarray],
+]:
+    """Create numerical Jacobian functions from a dynamics function.
+
+    Uses forward finite differences for df/dx and df/du.
+
+    :param dynamics_fn: ``(state, action) -> next_state``.
+    :param state_dim: State dimensionality.
+    :param action_dim: Action dimensionality.
+    :param eps: Finite difference step size.
+    :returns: ``(jac_state_fn, jac_action_fn)`` where each returns
+        a numpy array of the appropriate Jacobian shape.
+    """
+    _eps = eps
+
+    def jac_state_fn(
+        state: np.ndarray, action: np.ndarray,
+    ) -> np.ndarray:
+        f0 = dynamics_fn(state, action)  # (S,)
+        jac = np.zeros((state_dim, state_dim))
+        for i in range(state_dim):
+            s_plus = state.copy()
+            s_plus[i] += _eps
+            jac[:, i] = (dynamics_fn(s_plus, action) - f0) / _eps
+        return jac
+
+    def jac_action_fn(
+        state: np.ndarray, action: np.ndarray,
+    ) -> np.ndarray:
+        f0 = dynamics_fn(state, action)  # (S,)
+        jac = np.zeros((state_dim, action_dim))
+        for i in range(action_dim):
+            a_plus = action.copy()
+            a_plus[i] += _eps
+            jac[:, i] = (dynamics_fn(state, a_plus) - f0) / _eps
+        return jac
+
+    return jac_state_fn, jac_action_fn
+
+
+def _build_phase_policy(
+    test_family: EnvironmentFamily,
+    best_dynamics: dict[str, HypothesisEntry],
+    state_names: list[str],
+    action_names: list[str],
+    lagrangian_templates: dict[str, Any],
+    oa_output: dict[str, Any] | None = None,
+    cd_output: dict[str, Any] | None = None,
+    adaptive_replan_multiplier: float = 3.0,
+    min_replan_interval: int = 3,
+    energy_weight: float = 1.0,
+    energy_threshold: float = 0.2,
+    tip_threshold: float = 0.8,
+) -> _ILQRAnalyticPolicy:
+    """Build phase-based policy: MPPI for energy pumping, iLQR for stabilization.
+
+    Creates per-env ``PhasePlanner`` instances that automatically switch
+    between MPPI (with energy-shaped reward) and iLQR (with position-based
+    reward) based on the system's mechanical energy and tip height.
+
+    Phase detection: switch to iLQR when both:
+    - Energy deficit |E - E*|/|E*| < ``energy_threshold``
+    - Tip height > ``tip_threshold``
+
+    :param lagrangian_templates: Required. Parametric EL coefficient templates.
+    :param energy_threshold: Relative energy deficit threshold for iLQR switch.
+    :param tip_threshold: Tip height threshold for iLQR switch.
+    :returns: An ``_ILQRAnalyticPolicy`` wrapping PhasePlanner instances.
+    """
+    from circ_rl.analytic_policy.phase_planner import PhasePlanner
+    from circ_rl.hypothesis.lagrangian_decomposition import (
+        build_lagrangian_batched_dynamics_fn,
+        build_lagrangian_scalar_dynamics_fn,
+        compute_goal_energy,
+        compute_mechanical_energy,
+        evaluate_coefficients,
+    )
+    from circ_rl.orchestration.stages import _ILQRAnalyticPolicy
+
+    max_action = 1.0
+    state_dim = len(state_names)
+
+    # Canonical space from observation analysis
+    obs_to_canonical_fn = None
+    if oa_output is not None:
+        analysis_result = oa_output.get("analysis_result")
+        if analysis_result is not None:
+            obs_to_canonical_fn = analysis_result.obs_to_canonical_fn
+
+    # -- Adaptive replanning threshold --
+    dynamics_mse_sum = sum(e.training_mse for e in best_dynamics.values())
+    adaptive_tau: float | None = None
+    if dynamics_mse_sum > 0:
+        adaptive_tau = adaptive_replan_multiplier * np.sqrt(dynamics_mse_sum)
+    if adaptive_tau is not None:
+        print(f"    Adaptive replan threshold: tau={adaptive_tau:.4f}")
+
+    # MPPI config: global exploration with energy-shaped reward
+    mppi_config = MPPIConfig(
+        horizon=100,
+        n_samples=512,
+        temperature=0.1,
+        noise_sigma=0.5,
+        n_iterations=3,
+        gamma=0.99,
+        max_action=max_action,
+        colored_noise_beta=1.0,
+        replan_interval=5,
+        adaptive_replan_threshold=adaptive_tau,
+        min_replan_interval=min_replan_interval,
+    )
+
+    # iLQR config: local stabilization near goal
+    ilqr_config = ILQRConfig(
+        horizon=50,
+        gamma=0.99,
+        max_action=max_action,
+        n_random_restarts=3,
+        restart_scale=0.1,
+        replan_interval=5,
+        adaptive_replan_threshold=adaptive_tau,
+        min_replan_interval=min_replan_interval,
+    )
+
+    phase_planners: dict[int, PhasePlanner] = {}
+
+    for env_idx in range(test_family.n_envs):
+        env_params = test_family.get_env_params(env_idx)
+
+        # Lagrangian-based dynamics (RK4)
+        dynamics_fn = build_lagrangian_scalar_dynamics_fn(
+            lagrangian_templates, env_params,
+        )
+        batched_dynamics_fn = build_lagrangian_batched_dynamics_fn(
+            lagrangian_templates, env_params,
+        )
+
+        # Energy functions for this env
+        env_coeffs = evaluate_coefficients(lagrangian_templates, env_params)
+        e_goal = compute_goal_energy(env_coeffs)
+
+        # --- MPPI solver (energy-shaped reward) ---
+        energy_reward = _make_energy_reward_fn(
+            env_coeffs, e_goal, energy_weight,
+        )
+        batched_energy_reward = _make_energy_batched_reward_fn(
+            env_coeffs, e_goal, energy_weight,
+        )
+        mppi_solver = MPPISolver(
+            config=mppi_config,
+            dynamics_fn=dynamics_fn,
+            reward_fn=energy_reward,
+            batched_dynamics_fn=batched_dynamics_fn,
+            batched_reward_fn=batched_energy_reward,
+        )
+
+        # --- iLQR solver (position-based reward for stabilization) ---
+        jac_state_fn, jac_action_fn = _make_numerical_jacobian_fns(
+            dynamics_fn, state_dim, 1,
+        )
+        terminal_cost_fn = make_quadratic_terminal_cost(
+            reward_fn=_acrobot_reward_fn,
+            action_dim=1,
+            gamma=0.99,
+            state_dim=state_dim,
+            scale_override=10.0,
+        )
+        ilqr_solver = ILQRSolver(
+            config=ilqr_config,
+            dynamics_fn=dynamics_fn,
+            reward_fn=_acrobot_reward_fn,
+            dynamics_jac_state_fn=jac_state_fn,
+            dynamics_jac_action_fn=jac_action_fn,
+            terminal_cost_fn=terminal_cost_fn,
+        )
+
+        # --- Phase detector ---
+        _coeffs = env_coeffs
+        _eg = e_goal
+        _et = energy_threshold
+        _tt = tip_threshold
+
+        def use_local(
+            state: np.ndarray,
+            coeffs: dict[str, float] = _coeffs,
+            eg: float = _eg,
+            et: float = _et,
+            tt: float = _tt,
+        ) -> bool:
+            e_curr = compute_mechanical_energy(state, coeffs)
+            e_deficit_rel = abs(e_curr - eg) / max(abs(eg), 1e-6)
+            tip = -np.cos(state[0]) - np.cos(state[0] + state[1])
+            return bool(e_deficit_rel < et and tip > tt)
+
+        phase_planners[env_idx] = PhasePlanner(
+            global_solver=mppi_solver,
+            local_solver=ilqr_solver,
+            use_local_fn=use_local,
+        )
+
+    first_entry = next(iter(best_dynamics.values()))
+    action_dim = 1
+
+    print(f"    Phase thresholds: energy_deficit<{energy_threshold}, "
+          f"tip_height>{tip_threshold}")
+
+    return _ILQRAnalyticPolicy(
+        dynamics_hypothesis=first_entry,
+        reward_hypothesis=None,
+        state_dim=state_dim,
+        action_dim=action_dim,
+        n_envs=test_family.n_envs,
+        ilqr_solvers=phase_planners,  # type: ignore[arg-type]
         action_low=-max_action * np.ones(action_dim),
         action_high=max_action * np.ones(action_dim),
         obs_to_canonical_fn=obs_to_canonical_fn,
@@ -1063,6 +1403,16 @@ def _parse_args() -> argparse.Namespace:
         help="Use Lagrangian decomposition for velocity dynamics "
         "(replaces PySR-discovered expressions for coupled DOFs).",
     )
+    parser.add_argument(
+        "--energy", action="store_true",
+        help="Use energy-based cost shaping (requires --lagrangian). "
+        "Adds (E - E*)^2 penalty to guide energy pumping.",
+    )
+    parser.add_argument(
+        "--phase", action="store_true",
+        help="Use phase-based planning (requires --lagrangian). "
+        "Switches between MPPI (energy pumping) and iLQR (stabilization).",
+    )
     return parser.parse_args()
 
 
@@ -1085,12 +1435,16 @@ def main() -> None:
 
     solver_name = args.solver.upper()
     lag_tag = " + LAGRANGIAN" if args.lagrangian else ""
+    energy_tag = " + ENERGY" if args.energy else ""
+    phase_tag = " + PHASE" if args.phase else ""
     print("=" * 70)
-    print(f"CIRC-RL v2: ACROBOT-v1 BENCHMARK ({solver_name}{lag_tag})")
+    print(f"CIRC-RL v2: ACROBOT-v1 BENCHMARK "
+          f"({solver_name}{lag_tag}{energy_tag}{phase_tag})")
     print(f"  {args.n_train} training envs, {args.n_test} OOD test envs")
     print(f"  Varied: LINK_MASS_1/2, LINK_LENGTH_1/2")
-    print(f"  Continuous torque + shaped reward (tip height)")
-    print(f"  Solver: {solver_name}{lag_tag}")
+    reward_type = "energy-shaped" if args.energy else "tip height"
+    print(f"  Continuous torque + shaped reward ({reward_type})")
+    print(f"  Solver: {solver_name}{lag_tag}{energy_tag}{phase_tag}")
     print("=" * 70)
 
     t0 = time.time()
@@ -1202,9 +1556,23 @@ def main() -> None:
     # ================================================================
     # Build policy (iLQR or MPPI)
     # ================================================================
-    print(f"\n[3/5] Building {solver_name} policy for test envs...")
+    build_label = solver_name + phase_tag
+    print(f"\n[3/5] Building {build_label} policy for test envs...")
     t_build = time.time()
-    if args.solver == "mppi":
+    if args.phase:
+        if lag_templates is None:
+            print("  ERROR: --phase requires --lagrangian (need energy function).")
+            return
+        policy = _build_phase_policy(
+            test_family,
+            best_dynamics,
+            dynamics_state_names,
+            action_names,
+            lagrangian_templates=lag_templates,
+            oa_output=oa_output,
+            cd_output=cd_output,
+        )
+    elif args.solver == "mppi":
         policy = _build_mppi_policy(
             test_family,
             best_dynamics,
@@ -1213,6 +1581,7 @@ def main() -> None:
             oa_output=oa_output,
             cd_output=cd_output,
             lagrangian_templates=lag_templates,
+            use_energy_shaping=args.energy,
         )
     else:
         policy = _build_ilqr_policy(
@@ -1224,7 +1593,7 @@ def main() -> None:
             cd_output=cd_output,
         )
     t_build_total = time.time() - t_build
-    print(f"  {solver_name} build: {t_build_total:.1f}s")
+    print(f"  {build_label} build: {t_build_total:.1f}s")
 
     # ================================================================
     # Evaluate
