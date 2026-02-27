@@ -225,13 +225,23 @@ class HypothesisRegister:
         falsified ones. Use this as a fallback when no validated
         hypothesis exists.
 
+        Accuracy (R2) is prioritised over simplicity because best-effort
+        hypotheses are further refined by SpuriousTermDetector, which
+        ablation-prunes terms that do not meaningfully contribute to R2.
+
         :param target_variable: The target variable.
         :returns: The best hypothesis by R2, or None if no hypotheses exist.
         """
         all_entries = self.get_by_target(target_variable)
         if not all_entries:
             return None
-        return max(all_entries, key=lambda e: e.training_r2)
+        best = max(all_entries, key=lambda e: e.training_r2)
+        logger.info(
+            "Best-effort for '{}': '{}' (complexity={}, R2={:.6f})",
+            target_variable, best.hypothesis_id,
+            best.complexity, best.training_r2,
+        )
+        return best
 
     def select_best_pareto(
         self,

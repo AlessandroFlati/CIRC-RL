@@ -141,6 +141,7 @@ class ObservationAnalysisResult:
     unconstrained_dims: tuple[int, ...]
     obs_to_canonical_fn: Callable[..., Any]
     canonical_to_obs_fn: Callable[..., Any]
+    batch_canonical_to_obs_fn: Callable[..., Any] | None = field(default=None)
     angular_dims: tuple[int, ...] = field(default=())
 
 
@@ -624,6 +625,35 @@ class ObservationAnalyzer:
                 idx += 1
             return obs
 
+        def batch_canonical_to_obs_fn(
+            canonical: np.ndarray,
+        ) -> np.ndarray:
+            """Convert batch of canonical coordinates to observation space.
+
+            Uses the internal mapping batch support for vectorized
+            conversion without per-sample Python loops.
+
+            :param canonical: Shape ``(B, canonical_dim)``.
+            :returns: Shape ``(B, obs_dim)``.
+            """
+            B = canonical.shape[0]
+            obs = np.zeros((B, obs_dim))
+            idx = 0
+            for m in mappings:
+                n_canonical = len(m.canonical_names)
+                obs_subset = m.canonical_to_obs(
+                    canonical[:, idx:idx + n_canonical],
+                )  # (B, n_obs_dims)
+                if obs_subset.ndim == 1:
+                    obs_subset = obs_subset.reshape(B, -1)
+                for k, d in enumerate(m.source_dims):
+                    obs[:, d] = obs_subset[:, k]
+                idx += n_canonical
+            for d in unconstrained_dims:
+                obs[:, d] = canonical[:, idx]
+                idx += 1
+            return obs
+
         logger.info(
             "Built canonical representation: {} -> {} dims, "
             "names={}, angular_dims={}",
@@ -640,6 +670,7 @@ class ObservationAnalyzer:
             unconstrained_dims=unconstrained_dims,
             obs_to_canonical_fn=obs_to_canonical_fn,
             canonical_to_obs_fn=canonical_to_obs_fn,
+            batch_canonical_to_obs_fn=batch_canonical_to_obs_fn,
             angular_dims=tuple(angular_dim_indices),
         )
 

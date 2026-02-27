@@ -729,6 +729,22 @@ class HypothesisFalsificationStage(PipelineStage):
         best_dynamics: dict[str, Any] = {}
         best_reward = None
 
+        # Set up SpuriousTermDetector for best-effort pruning
+        from circ_rl.hypothesis.spurious_detection import SpuriousTermDetector
+
+        spurious_detector = SpuriousTermDetector(
+            r2_contribution_threshold=0.005,
+        )
+        sp_dataset = (
+            canonical_dataset if use_canonical else dataset
+        )
+        sp_var_names = (
+            dynamics_variable_names if use_canonical else variable_names
+        )
+        sp_angular_dims = (
+            canonical_angular_dims if use_canonical else ()
+        )
+
         # Dynamics from first result
         for target, hyp_id in result.best_per_target.items():
             if target == "reward":
@@ -737,6 +753,14 @@ class HypothesisFalsificationStage(PipelineStage):
                 fallback_id = result.best_effort_per_target.get(target)
                 if fallback_id is not None:
                     entry = register.get(fallback_id)
+
+                    # Prune spurious terms from best-effort expressions
+                    entry = self._prune_best_effort(
+                        entry, target, sp_dataset, sp_var_names,
+                        sp_angular_dims, dynamics_state_names,
+                        spurious_detector,
+                    )
+
                     best_dynamics[target] = entry
                     logger.warning(
                         "Using best-effort (unvalidated) hypothesis for "
@@ -773,6 +797,85 @@ class HypothesisFalsificationStage(PipelineStage):
             "state_names": state_names,
             "reward_derived_features": reward_derived_features,
         }
+
+    @staticmethod
+    def _prune_best_effort(
+        entry: Any,
+        target: str,
+        dataset: Any,
+        variable_names: list[str],
+        angular_dims: tuple[int, ...],
+        state_names: list[str],
+        detector: Any,
+    ) -> Any:
+        """Run SpuriousTermDetector on a best-effort hypothesis.
+
+        Prunes additive terms that contribute negligibly to R2,
+        preventing overfit templates (e.g. ``damped_pendulum`` matching
+        a position dynamics dimension) from dominating simpler correct
+        expressions.
+
+        :param entry: HypothesisEntry to prune.
+        :param target: Target variable name (e.g. ``"delta_s0"``).
+        :param dataset: ExploratoryDataset for R2 computation.
+        :param variable_names: Variable names for expression evaluation.
+        :param angular_dims: Indices of angular state dimensions.
+        :param state_names: State dimension names.
+        :param detector: SpuriousTermDetector instance.
+        :returns: Original entry if no pruning needed, or a new entry
+            with the pruned expression.
+        """
+        from circ_rl.hypothesis.expression import SymbolicExpression
+        from circ_rl.hypothesis.hypothesis_register import HypothesisEntry
+
+        dim_name = target.removeprefix("delta_")
+        if dim_name not in state_names:
+            return entry
+
+        dim_idx = state_names.index(dim_name)
+        wrap_angular = dim_idx in angular_dims
+
+        try:
+            sp_result = detector.detect(
+                entry.expression, dataset, dim_idx,
+                variable_names, wrap_angular=wrap_angular,
+            )
+        except Exception:
+            logger.debug(
+                "Spurious detection skipped for '{}' (evaluation error)",
+                target,
+            )
+            return entry
+
+        if sp_result.n_spurious == 0:
+            return entry
+
+        logger.info(
+            "Pruned {}/{} spurious terms from best-effort '{}' "
+            "(R2: {:.6f} -> {:.6f})",
+            sp_result.n_spurious,
+            sp_result.n_spurious + len([
+                t for t in sp_result.term_analyses if not t.is_spurious
+            ]),
+            target,
+            sp_result.original_r2,
+            sp_result.pruned_r2,
+        )
+
+        pruned_expr = SymbolicExpression.from_sympy(sp_result.pruned_expr)
+        return HypothesisEntry(
+            hypothesis_id=entry.hypothesis_id + "_pruned",
+            target_variable=entry.target_variable,
+            expression=pruned_expr,
+            complexity=pruned_expr.complexity,
+            training_r2=entry.training_r2,
+            training_mse=entry.training_mse,
+            status=entry.status,
+            falsification_reason=entry.falsification_reason,
+            mdl_score=entry.mdl_score,
+            calibration_coefficients=entry.calibration_coefficients,
+            pooled_calibration=entry.pooled_calibration,
+        )
 
     def config_hash(self) -> str:
         return hash_config({
@@ -838,6 +941,7 @@ class AnalyticPolicyDerivationStage(PipelineStage):
             LQRSolver,
             QuadraticCost,
         )
+        from circ_rl.hypothesis.hypothesis_register import HypothesisStatus
 
         hf_output = inputs["hypothesis_falsification"]
         ta_output = inputs["transition_analysis"]
@@ -858,10 +962,14 @@ class AnalyticPolicyDerivationStage(PipelineStage):
         analysis_result = oa_output.get("analysis_result")
         obs_to_canonical_fn = None
         canonical_to_obs_fn = None
+        batch_canonical_to_obs_fn = None
         angular_dims: tuple[int, ...] = ()
         if analysis_result is not None:
             obs_to_canonical_fn = analysis_result.obs_to_canonical_fn
             canonical_to_obs_fn = analysis_result.canonical_to_obs_fn
+            batch_canonical_to_obs_fn = getattr(
+                analysis_result, "batch_canonical_to_obs_fn", None,
+            )
             angular_dims = analysis_result.angular_dims
             logger.info(
                 "iLQR will plan in canonical space: {} (angular={})",
@@ -1081,6 +1189,11 @@ class AnalyticPolicyDerivationStage(PipelineStage):
                 ILQRSolver,
                 make_quadratic_terminal_cost,
             )
+            from circ_rl.analytic_policy.fast_dynamics import (
+                build_fast_dynamics_fn,
+                build_fast_reward_derivatives_fn,
+                build_fast_reward_fn,
+            )
 
             first_entry = next(iter(best_dynamics.values()))
 
@@ -1105,7 +1218,12 @@ class AnalyticPolicyDerivationStage(PipelineStage):
             for env_idx in range(self._env_family.n_envs):
                 env_params = self._env_family.get_env_params(env_idx)
 
-                # Extract per-dim calibration coefficients for this env
+                # Extract per-dim calibration coefficients for this env.
+                # Prefer per-env calibration (from training), fall back to
+                # pooled calibration ONLY for best-effort (unvalidated)
+                # hypotheses. Validated hypotheses are structurally
+                # invariant, so their raw predictions should generalize
+                # to OOD test envs without calibration bias.
                 per_dim_cal: dict[int, tuple[float, float]] = {}
                 for target, entry in best_dynamics.items():
                     dim_name = target.removeprefix("delta_")
@@ -1117,6 +1235,11 @@ class AnalyticPolicyDerivationStage(PipelineStage):
                         per_dim_cal[dim_idx] = (
                             entry.calibration_coefficients[env_idx]
                         )
+                    elif (
+                        entry.pooled_calibration is not None
+                        and entry.status != HypothesisStatus.VALIDATED
+                    ):
+                        per_dim_cal[dim_idx] = entry.pooled_calibration
                 cal_arg = per_dim_cal or None
 
                 # Build dynamics callable in effective (canonical) space
@@ -1154,6 +1277,19 @@ class AnalyticPolicyDerivationStage(PipelineStage):
                     calibration_coefficients=cal_arg,
                 )
 
+                # Try Numba JIT for faster iLQR inner loops
+                fast_dyn = build_fast_dynamics_fn(
+                    dynamics_expressions,
+                    effective_state_names,
+                    action_names,
+                    state_dim,
+                    env_params,
+                    angular_dims=angular_dims,
+                    calibration_coefficients=cal_arg,
+                )
+                if fast_dyn is not None:
+                    dynamics_fn = fast_dyn
+
                 # Build analytic reward derivatives if possible
                 reward_deriv_fn = None
                 if best_reward is not None:
@@ -1167,6 +1303,18 @@ class AnalyticPolicyDerivationStage(PipelineStage):
                     )
 
                 effective_reward = reward_fn or _default_reward
+
+                # Try Numba JIT for reward
+                if best_reward is not None:
+                    fast_rew = build_fast_reward_fn(
+                        best_reward.expression,
+                        state_names,
+                        action_names,
+                        env_params,
+                    )
+                    if fast_rew is not None:
+                        effective_reward = fast_rew
+
                 terminal_cost_fn = make_quadratic_terminal_cost(
                     reward_fn=effective_reward,
                     action_dim=action_dim,
@@ -1190,22 +1338,96 @@ class AnalyticPolicyDerivationStage(PipelineStage):
                     horizon=100,
                     gamma=self._gamma,
                     max_action=float(action_high[0]),
-                    n_random_restarts=8,
+                    n_random_restarts=20,
                     restart_scale=0.3,
                     replan_interval=10,
                     adaptive_replan_threshold=adaptive_tau,
                     min_replan_interval=self._min_replan_interval,
                 )
 
-                ilqr_solvers[env_idx] = ILQRSolver(
-                    config=ilqr_config,
-                    dynamics_fn=dynamics_fn,
-                    reward_fn=effective_reward,
-                    dynamics_jac_state_fn=jac_state_fn,
-                    dynamics_jac_action_fn=jac_action_fn,
-                    terminal_cost_fn=terminal_cost_fn,
-                    reward_derivatives_fn=reward_deriv_fn,
+                # For small dimensions, use batched numpy solver
+                # (all restarts in a single (B,...) batch) to avoid
+                # GIL contention in ThreadPoolExecutor.
+                _use_batched = (
+                    state_dim + action_dim <= 5
+                    and ilqr_config.n_random_restarts > 0
+                    and self._robust_n_scenarios < 2
                 )
+                if _use_batched:
+                    from circ_rl.analytic_policy.batched_ilqr_solver import (
+                        BatchedNumpyILQRSolver,
+                        build_batched_jacobian_fns,
+                    )
+                    from circ_rl.analytic_policy.fast_dynamics import (
+                        build_batched_dynamics_fn,
+                        build_batched_reward_fn,
+                    )
+
+                    batched_dyn = build_batched_dynamics_fn(
+                        dynamics_expressions,
+                        effective_state_names,
+                        action_names,
+                        state_dim,
+                        env_params,
+                        angular_dims=angular_dims,
+                        calibration_coefficients=cal_arg,
+                    )
+                    batched_jac_result = build_batched_jacobian_fns(
+                        dynamics_expressions,
+                        effective_state_names,
+                        action_names,
+                        state_dim,
+                        env_params,
+                        calibration_coefficients=cal_arg,
+                    )
+                    # Build vectorized reward for fast cost eval
+                    b_reward_fn = None
+                    if best_reward is not None:
+                        b_reward_fn = build_batched_reward_fn(
+                            best_reward.expression,
+                            state_names,
+                            action_names,
+                            env_params,
+                            derived_feature_specs=reward_derived_features,
+                            canonical_to_obs_fn=canonical_to_obs_fn,
+                            obs_state_names=state_names,
+                            batch_canonical_to_obs_fn=(
+                                batch_canonical_to_obs_fn
+                            ),
+                        )
+                    if batched_jac_result is not None:
+                        b_jac_s, b_jac_a = batched_jac_result
+                        ilqr_solvers[env_idx] = BatchedNumpyILQRSolver(  # type: ignore[assignment]
+                            config=ilqr_config,
+                            batched_dynamics_fn=batched_dyn,
+                            reward_fn=effective_reward,
+                            batched_jac_state_fn=b_jac_s,
+                            batched_jac_action_fn=b_jac_a,
+                            reward_derivatives_fn=reward_deriv_fn,
+                            batched_reward_fn=b_reward_fn,
+                            terminal_cost_fn=terminal_cost_fn,
+                        )
+                        if env_idx == 0:
+                            logger.info(
+                                "Using BatchedNumpyILQRSolver "
+                                "(S={}, A={}, B={})",
+                                state_dim, action_dim,
+                                ilqr_config.n_random_restarts + 1,
+                            )
+                        _use_batched = True
+                    else:
+                        _use_batched = False
+
+                if not _use_batched:
+                    ilqr_solvers[env_idx] = ILQRSolver(
+                        config=ilqr_config,
+                        dynamics_fn=dynamics_fn,
+                        reward_fn=effective_reward,
+                        dynamics_jac_state_fn=jac_state_fn,
+                        dynamics_jac_action_fn=jac_action_fn,
+                        terminal_cost_fn=terminal_cost_fn,
+                        reward_derivatives_fn=reward_deriv_fn,
+                    )
 
             # Build robust planners if enabled and uncertainty
             # is significant
@@ -2187,6 +2409,7 @@ def _build_dynamics_jacobian_fns(
             action_names,
             state_dim,
             env_params,
+            calibration_coefficients=calibration_coefficients,
         )
         if fast_jac_s is not None and fast_jac_a is not None:
             logger.debug("Using Numba-accelerated Jacobian functions")

@@ -81,6 +81,32 @@ class TestEnvironmentFamily:
                 n_envs=0,
             )
 
+    def test_cartpole_derived_attrs_recomputed(self) -> None:
+        """Verify total_mass and polemass_length are recomputed after setattr."""
+        family = EnvironmentFamily.from_gymnasium(
+            base_env="CartPole-v1",
+            param_distributions={
+                "masscart": (0.5, 2.0),
+                "masspole": (0.05, 0.2),
+                "length": (0.3, 0.8),
+            },
+            n_envs=3,
+            seed=42,
+        )
+        for i in range(3):
+            env = family.make_env(i)
+            u = env.unwrapped
+            params = family.get_env_params(i)
+            expected_total = params["masscart"] + params["masspole"]
+            expected_pml = params["masspole"] * params["length"]
+            assert abs(u.total_mass - expected_total) < 1e-10, (
+                f"Env {i}: total_mass={u.total_mass}, expected {expected_total}"
+            )
+            assert abs(u.polemass_length - expected_pml) < 1e-10, (
+                f"Env {i}: polemass_length={u.polemass_length}, expected {expected_pml}"
+            )
+            env.close()
+
     def test_repr(self) -> None:
         family = EnvironmentFamily.from_gymnasium(
             base_env="CartPole-v1",

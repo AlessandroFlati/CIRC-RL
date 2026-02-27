@@ -715,18 +715,24 @@ def build_torch_ilqr_solver(
     reward_fn_numpy: Any,
     angular_dims: tuple[int, ...] = (),
     device: str = "auto",
+    reward_expression: Any | None = None,
 ) -> TorchILQRSolver | None:
     """Build a TorchILQRSolver from symbolic expressions.
 
     Compiles dynamics expressions to PyTorch callables using
     ``fast_dynamics.build_torch_dynamics_fns``. The reward function
-    is wrapped to operate on torch tensors.
+    is either compiled to PyTorch (if ``reward_expression`` is
+    provided) or wrapped with vectorized numpy evaluation.
 
+    :param reward_expression: Optional symbolic reward expression
+        with a ``.sympy_expr`` attribute. When provided, the reward
+        is compiled to a native PyTorch callable for batch evaluation.
     :returns: Solver instance, or None if compilation fails.
     """
     try:
         from circ_rl.analytic_policy.fast_dynamics import (
             build_torch_dynamics_fns,
+            compile_torch_fn,
         )
 
         torch_dyn_fns = build_torch_dynamics_fns(
@@ -744,20 +750,74 @@ def build_torch_ilqr_solver(
         logger.debug("Failed to build torch dynamics: {}", exc)
         return None
 
-    # Wrap numpy reward as torch-compatible
-    np_reward = reward_fn_numpy
+    # Build torch reward function -- try native torch first, then
+    # vectorized numpy fallback
+    torch_reward_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None
 
-    def torch_reward_fn(
-        state: torch.Tensor, action: torch.Tensor,
-    ) -> torch.Tensor:
-        """Evaluate reward for a batch of states/actions."""
-        B = state.shape[0]
-        rewards = torch.zeros(B, device=state.device, dtype=state.dtype)
-        for i in range(B):
-            s_np = state[i].detach().cpu().numpy()
-            a_np = action[i].detach().cpu().numpy()
-            rewards[i] = np_reward(s_np, a_np)
-        return rewards
+    if reward_expression is not None:
+        try:
+            import sympy
+
+            var_names = list(state_names) + list(action_names)
+            sympy_expr = reward_expression.sympy_expr
+            if env_params:
+                subs = {sympy.Symbol(k): v for k, v in env_params.items()}
+                sympy_expr = sympy_expr.subs(subs)
+
+            # Only compile if all free symbols are in var_names
+            # (reward may reference obs-space vars while dynamics
+            # uses canonical space -- those symbols would remain
+            # unresolved and crash at runtime)
+            expected_syms = {sympy.Symbol(n) for n in var_names}
+            free_syms = sympy_expr.free_symbols
+            if not free_syms.issubset(expected_syms):
+                logger.debug(
+                    "Reward has symbols outside dynamics vars: {}, "
+                    "skipping torch reward",
+                    free_syms - expected_syms,
+                )
+                raise ValueError("Reward variable mismatch")
+
+            torch_rew_compiled = compile_torch_fn(sympy_expr, var_names)
+            if torch_rew_compiled is not None:
+                _S = state_dim
+                _A = len(action_names)
+
+                def _native_torch_reward(
+                    state: torch.Tensor, action: torch.Tensor,
+                ) -> torch.Tensor:
+                    """Reward via native torch ops (no CPU transfer)."""
+                    var_list = [state[:, i] for i in range(_S)]
+                    var_list += [action[:, j] for j in range(_A)]
+                    result = torch_rew_compiled(*var_list)
+                    if result.dim() == 0:
+                        return result.expand(state.shape[0])
+                    return result
+
+                torch_reward_fn = _native_torch_reward
+                logger.debug("Torch iLQR: using native torch reward")
+        except Exception as exc:
+            logger.debug("Torch reward compilation failed: {}", exc)
+
+    if torch_reward_fn is None:
+        # Vectorized numpy fallback (batch transfer, not per-sample)
+        np_reward = reward_fn_numpy
+
+        def _numpy_batch_reward(
+            state: torch.Tensor, action: torch.Tensor,
+        ) -> torch.Tensor:
+            """Reward via batch numpy (single CPU transfer)."""
+            s_np = state.detach().cpu().numpy()  # (B, S)
+            a_np = action.detach().cpu().numpy()  # (B, A)
+            B = s_np.shape[0]
+            rewards_np = np.empty(B, dtype=np.float64)
+            for i in range(B):
+                rewards_np[i] = np_reward(s_np[i], a_np[i])
+            return torch.tensor(
+                rewards_np, device=state.device, dtype=state.dtype,
+            )
+
+        torch_reward_fn = _numpy_batch_reward
 
     tcfg = TorchILQRConfig(
         n_batch=max(1, numpy_config.n_random_restarts + 1),

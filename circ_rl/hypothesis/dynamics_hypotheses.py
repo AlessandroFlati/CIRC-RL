@@ -298,22 +298,16 @@ class DynamicsHypothesisGenerator:
             return [], False
 
         best_r2 = results[0][1]
-        skip_pysr = best_r2 >= self._template_skip_pysr_r2
+        # Never skip PySR -- templates may overfit via spurious variable
+        # inclusion (e.g., damped_pendulum matching delta_phi_0).
+        # PySR can discover simpler, correct alternatives.
+        skip_pysr = False
 
-        if skip_pysr:
-            logger.info(
-                "Template matched for {}: {} results (best R2={:.6f} "
-                ">= {:.4f}), skipping PySR",
-                target_var, len(results), best_r2,
-                self._template_skip_pysr_r2,
-            )
-        else:
-            logger.info(
-                "Template matched for {}: {} results (best R2={:.6f} "
-                "< {:.4f}), will also run PySR",
-                target_var, len(results), best_r2,
-                self._template_skip_pysr_r2,
-            )
+        logger.info(
+            "Template matched for {}: {} results (best R2={:.6f}), "
+            "will also run PySR (template-skip disabled)",
+            target_var, len(results), best_r2,
+        )
 
         return [expr for expr, _r2 in results], skip_pysr
 

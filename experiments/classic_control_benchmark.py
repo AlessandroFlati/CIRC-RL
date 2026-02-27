@@ -19,8 +19,11 @@ Usage::
     # Run all environments
     uv run python experiments/classic_control_benchmark.py --all
 
-    # Fast mode (fewer envs, quick SR)
+    # Fast mode (moderate SR, same envs/data)
     uv run python experiments/classic_control_benchmark.py --all --fast
+
+    # Quick mode (fewer envs, minimal SR -- for rapid iteration)
+    uv run python experiments/classic_control_benchmark.py --all --quick
 
 Requires PySR: ``uv sync --extra symbolic``
 """
@@ -132,15 +135,17 @@ def _make_env_configs() -> dict[str, EnvConfig]:
                 "gravity": (7.0, 13.0),
                 "masscart": (0.5, 2.0),
                 "length": (0.3, 0.8),
+                "masspole": (0.05, 0.2),
             },
             test_param_distributions={
                 "gravity": (6.0, 14.0),
                 "masscart": (0.3, 3.0),
                 "length": (0.2, 1.0),
+                "masspole": (0.03, 0.3),
             },
             continuous_action=False,
             max_steps=500,
-            solver="mppi",
+            solver="cem",
             sr_unary_operators=("sin", "cos", "square"),
             sr_max_complexity=30,
             reward_derived_features=[],
@@ -159,7 +164,7 @@ def _make_env_configs() -> dict[str, EnvConfig]:
             },
             continuous_action=False,
             max_steps=200,
-            solver="mppi",
+            solver="cem",
             sr_unary_operators=("cos", "square"),
             sr_max_complexity=25,
             reward_derived_features=[],
@@ -191,18 +196,24 @@ def _make_env_configs() -> dict[str, EnvConfig]:
 def _make_sr_config(
     env_cfg: EnvConfig,
     seed: int,
-    fast: bool = False,
+    speed: str = "normal",
 ) -> SymbolicRegressionConfig:
     """Create PySR configuration for the given environment.
 
     :param env_cfg: Environment configuration.
     :param seed: Random seed.
-    :param fast: If True, use reduced iterations/populations.
+    :param speed: One of "normal", "fast", "quick".
+        - normal: full SR budget (80 iters, 25 pops, 10k samples, 600s).
+        - fast: reduced SR budget (60 iters, 20 pops, 8k samples, 400s).
+        - quick: minimal SR budget (50 iters, 15 pops, 5k samples, 300s).
     :returns: A SymbolicRegressionConfig.
     """
-    n_iterations = 50 if fast else 80
-    populations = 15 if fast else 25
-    max_samples = 5000 if fast else 10000
+    sr_params = {
+        "normal": (80, 25, 10000, 600),
+        "fast": (60, 20, 8000, 400),
+        "quick": (50, 15, 5000, 300),
+    }
+    n_iterations, populations, max_samples, timeout = sr_params[speed]
 
     return SymbolicRegressionConfig(
         max_complexity=env_cfg.sr_max_complexity,
@@ -211,7 +222,7 @@ def _make_sr_config(
         binary_operators=("+", "-", "*", "/"),
         unary_operators=env_cfg.sr_unary_operators,
         parsimony=0.0005,
-        timeout_seconds=300 if fast else 600,
+        timeout_seconds=timeout,
         deterministic=True,
         random_state=seed,
         nested_constraints={
@@ -231,14 +242,14 @@ def _run_pipeline(
     train_family: EnvironmentFamily,
     n_transitions: int,
     seed: int,
-    fast: bool = False,
+    speed: str = "normal",
 ) -> dict[str, Any]:
     """Run v2 pipeline stages 1-6 on training environments.
 
     :returns: Dict with all stage outputs needed for solver construction
         and evaluation.
     """
-    sr_config = _make_sr_config(env_cfg, seed, fast)
+    sr_config = _make_sr_config(env_cfg, seed, speed)
 
     # Stage 1: Causal discovery
     print("  [1/6] Causal discovery...")
@@ -453,9 +464,20 @@ def _build_mppi_solver(
 
     # Choose reward functions based on environment
     if env_cfg.name in ("mountaincar", "mountaincar_continuous"):
-        reward_fn, batched_reward_fn = _mountaincar_reward_fns(
-            env_cfg.gym_id,
-        )
+        # Try energy-based reward from discovered dynamics
+        terrain = _extract_terrain_from_dynamics(best_dynamics)
+        goal_pos = 0.45 if "Continuous" in env_cfg.gym_id else 0.5
+        if terrain is not None:
+            c_pos, grav_coeff = terrain
+            reward_fn, batched_reward_fn = _dynamics_energy_reward_fns(
+                c_pos, grav_coeff, goal_pos,
+            )
+            print("    Reward: energy-based (from discovered dynamics)")
+        else:
+            reward_fn, batched_reward_fn = _mountaincar_reward_fns(
+                env_cfg.gym_id,
+            )
+            print("    Reward: height-based (fallback)")
     elif env_cfg.name == "cartpole":
         reward_fn, batched_reward_fn = _cartpole_reward_fns()
     else:
@@ -504,9 +526,31 @@ def _build_mppi_solver(
             min_replan_interval=2,
         )
 
+    # Base horizon for adaptive scaling
+    base_horizon = mppi_config.horizon
+
     mppi_solvers: dict[int, MPPISolver] = {}
     for env_idx in range(test_family.n_envs):
         env_params = test_family.get_env_params(env_idx)
+
+        # Per-env adaptive horizon
+        horizon = _compute_adaptive_horizon(env_params, base_horizon)
+        if horizon != base_horizon:
+            env_mppi_config = MPPIConfig(
+                horizon=horizon,
+                n_samples=mppi_config.n_samples,
+                temperature=mppi_config.temperature,
+                noise_sigma=mppi_config.noise_sigma,
+                n_iterations=mppi_config.n_iterations,
+                gamma=mppi_config.gamma,
+                max_action=mppi_config.max_action,
+                colored_noise_beta=mppi_config.colored_noise_beta,
+                replan_interval=mppi_config.replan_interval,
+                adaptive_replan_threshold=mppi_config.adaptive_replan_threshold,
+                min_replan_interval=mppi_config.min_replan_interval,
+            )
+        else:
+            env_mppi_config = mppi_config
 
         dynamics_fn = _build_dynamics_fn(
             dynamics_expressions,
@@ -531,7 +575,7 @@ def _build_mppi_solver(
         )
 
         mppi_solvers[env_idx] = MPPISolver(
-            config=mppi_config,
+            config=env_mppi_config,
             dynamics_fn=dynamics_fn,
             reward_fn=reward_fn,
             batched_dynamics_fn=batched_dyn_fn,
@@ -551,9 +595,324 @@ def _build_mppi_solver(
         action_high=max_action * np.ones(action_dim),
         obs_to_canonical_fn=obs_to_canonical_fn,
     )
-    print(f"    Solver: MPPI (horizon={mppi_config.horizon}, "
+    horizons = [mppi_solvers[i].config.horizon for i in range(test_family.n_envs)]
+    print(f"    Solver: MPPI (horizon={min(horizons)}-{max(horizons)}, "
           f"samples={mppi_config.n_samples})")
     return policy
+
+
+def _compute_adaptive_horizon(
+    env_params: dict[str, float],
+    base_horizon: int,
+    min_horizon: int = 50,
+    max_horizon: int = 200,
+) -> int:
+    """Scale planning horizon based on environment force/gravity ratio.
+
+    When gravity is large relative to actuator force, the agent needs
+    more timesteps to build momentum. This scales the horizon accordingly
+    using only parameters from the environment family (not hardcoded
+    domain knowledge).
+
+    :param env_params: Per-env parameter dict from EnvironmentFamily.
+    :param base_horizon: Default planning horizon.
+    :param min_horizon: Minimum horizon.
+    :param max_horizon: Maximum horizon.
+    :returns: Scaled horizon clamped to [min_horizon, max_horizon].
+    """
+    force_keys = {"force", "power", "force_mag"}
+    gravity_keys = {"gravity"}
+
+    forces = [v for k, v in env_params.items() if k in force_keys and v > 0]
+    gravities = [v for k, v in env_params.items() if k in gravity_keys and v > 0]
+
+    if not forces or not gravities:
+        return base_horizon
+
+    # Ratio > 1 means gravity dominates force -> need longer horizon
+    ratio = max(gravities) / min(forces)
+    scaled = int(base_horizon * np.sqrt(ratio))
+    return min(max_horizon, max(min_horizon, scaled))
+
+
+def _build_cem_solver(
+    env_cfg: EnvConfig,
+    pipeline: dict[str, Any],
+    test_family: EnvironmentFamily,
+) -> _ILQRAnalyticPolicy:
+    """Build CEM policy from pipeline output for discrete action envs.
+
+    Uses validated symbolic dynamics for forward simulation in CEM
+    sampling. Actions are sampled directly from categorical distributions
+    over the discrete action set, avoiding the continuous-to-discrete
+    mismatch inherent in MPPI-based planning.
+
+    :returns: An ``_ILQRAnalyticPolicy`` wrapping CEM solvers.
+    """
+    from circ_rl.analytic_policy.cem_solver import CEMConfig, CEMSolver
+    from circ_rl.analytic_policy.fast_dynamics import build_batched_dynamics_fn
+    from circ_rl.hypothesis.expression import SymbolicExpression
+    from circ_rl.orchestration.stages import (
+        _build_dynamics_fn,
+        _ILQRAnalyticPolicy,
+    )
+
+    hf_output = pipeline["hf_output"]
+    cd_output = pipeline["cd_output"]
+    oa_output = pipeline["oa_output"]
+    best_dynamics = pipeline["best_dynamics"]
+    state_names = pipeline["state_names"]
+
+    # Canonical space
+    obs_to_canonical_fn = None
+    angular_dims: tuple[int, ...] = ()
+    analysis_result = oa_output.get("analysis_result")
+    if analysis_result is not None:
+        obs_to_canonical_fn = analysis_result.obs_to_canonical_fn
+        angular_dims = analysis_result.angular_dims
+
+    # Parse dynamics expressions by dim index
+    state_dim = len(state_names)
+    dynamics_expressions: dict[int, SymbolicExpression] = {}
+    for target, entry in best_dynamics.items():
+        dim_name = target.removeprefix("delta_")
+        dim_idx = state_names.index(dim_name)
+        dynamics_expressions[dim_idx] = entry.expression
+
+    dynamics_state_names = hf_output.get("dynamics_state_names", state_names)
+    action_names = hf_output.get("action_names", ["action"])
+
+    # Calibration coefficients (pooled)
+    pooled_cal: dict[int, tuple[float, float]] = {}
+    for target, entry in best_dynamics.items():
+        dim_name = target.removeprefix("delta_")
+        dim_idx = state_names.index(dim_name)
+        if entry.pooled_calibration is not None:
+            pooled_cal[dim_idx] = entry.pooled_calibration
+    cal_arg = pooled_cal or None
+
+    # Determine action mapping for this environment
+    sample_env = gym.make(env_cfg.gym_id)
+    action_space = sample_env.action_space
+    sample_env.close()
+
+    if isinstance(action_space, gym.spaces.Discrete):
+        n_actions = int(action_space.n)
+        # action_values: what the dynamics model was trained on (integer indices)
+        action_values = [float(i) for i in range(n_actions)]
+        # discretization_values: what _discretize_action maps from [-1, 1]
+        if n_actions == 2:
+            # CartPole: action 0 -> -1.0, action 1 -> +1.0
+            discretization_values = [-1.0, 1.0]
+        elif n_actions == 3:
+            # MountainCar: action 0 -> -1.0, action 1 -> 0.0, action 2 -> +1.0
+            discretization_values = [-1.0, 0.0, 1.0]
+        else:
+            # General case: evenly spaced from -1 to 1
+            discretization_values = list(
+                np.linspace(-1.0, 1.0, n_actions),
+            )
+    else:
+        raise ValueError(
+            f"CEM solver requires discrete action space, "
+            f"got {type(action_space).__name__}",
+        )
+
+    # Choose reward functions based on environment
+    if env_cfg.name in ("mountaincar",):
+        # Try energy-based reward from discovered dynamics
+        terrain = _extract_terrain_from_dynamics(best_dynamics)
+        goal_pos = 0.5
+        if terrain is not None:
+            c_pos, grav_coeff = terrain
+            reward_fn, batched_reward_fn = _dynamics_energy_reward_fns(
+                c_pos, grav_coeff, goal_pos,
+            )
+            print("    Reward: energy-based (from discovered dynamics)")
+        else:
+            reward_fn, batched_reward_fn = _mountaincar_reward_fns(
+                env_cfg.gym_id,
+            )
+            print("    Reward: height-based (fallback)")
+    elif env_cfg.name == "cartpole":
+        reward_fn, batched_reward_fn = _cartpole_reward_fns()
+    else:
+        raise ValueError(f"No CEM reward function for {env_cfg.name}")
+
+    # Base CEM horizon
+    base_horizon = 50 if env_cfg.name == "mountaincar" else 30
+
+    cem_solvers: dict[int, CEMSolver] = {}
+    for env_idx in range(test_family.n_envs):
+        env_params = test_family.get_env_params(env_idx)
+
+        # Per-env adaptive horizon
+        horizon = _compute_adaptive_horizon(
+            env_params, base_horizon,
+        )
+
+        cem_config = CEMConfig(
+            horizon=horizon,
+            n_samples=256,
+            n_iterations=5,
+            n_actions=n_actions,
+            elite_fraction=0.2,
+            gamma=0.99,
+            smoothing_alpha=0.8,
+        )
+
+        dynamics_fn = _build_dynamics_fn(
+            dynamics_expressions,
+            dynamics_state_names,
+            action_names,
+            state_dim,
+            env_params,
+            obs_low=None,
+            obs_high=None,
+            angular_dims=angular_dims,
+            calibration_coefficients=cal_arg,
+        )
+
+        batched_dyn_fn = build_batched_dynamics_fn(
+            dynamics_expressions,
+            dynamics_state_names,
+            action_names,
+            state_dim,
+            env_params,
+            angular_dims=angular_dims,
+            calibration_coefficients=cal_arg,
+        )
+
+        cem_solvers[env_idx] = CEMSolver(
+            config=cem_config,
+            dynamics_fn=dynamics_fn,
+            reward_fn=reward_fn,
+            action_values=action_values,
+            discretization_values=discretization_values,
+            batched_dynamics_fn=batched_dyn_fn,
+            batched_reward_fn=batched_reward_fn,
+        )
+
+    first_entry = next(iter(best_dynamics.values()))
+
+    policy = _ILQRAnalyticPolicy(
+        dynamics_hypothesis=first_entry,
+        reward_hypothesis=None,
+        state_dim=state_dim,
+        action_dim=1,
+        n_envs=test_family.n_envs,
+        ilqr_solvers=cem_solvers,  # type: ignore[arg-type]
+        action_low=-1.0 * np.ones(1),
+        action_high=1.0 * np.ones(1),
+        obs_to_canonical_fn=obs_to_canonical_fn,
+    )
+    horizons = [cem_solvers[i].config.horizon for i in range(test_family.n_envs)]
+    print(f"    Solver: CEM (horizon={min(horizons)}-{max(horizons)}, "
+          f"samples=256, actions={n_actions})")
+    return policy
+
+
+def _extract_terrain_from_dynamics(
+    best_dynamics: dict[str, HypothesisEntry],
+) -> tuple[float, float] | None:
+    """Extract cos(c*x) terrain coefficients from discovered velocity dynamics.
+
+    Walks the sympy expression tree of the velocity dynamics (delta_s1),
+    looking for ``cos(c * s0)`` terms. Extracts ``c`` (frequency) and the
+    multiplying coefficient.
+
+    :param best_dynamics: Validated dynamics hypotheses keyed by target name.
+    :returns: ``(c_position, gravity_coeff)`` or ``None`` if no terrain term found.
+    """
+    import sympy
+
+    velocity_entry = best_dynamics.get("delta_s1")
+    if velocity_entry is None:
+        return None
+
+    expr = velocity_entry.expression.sympy_expr
+    s0 = sympy.Symbol("s0")
+
+    # Expand the expression and look for cos(c*s0) terms
+    expanded = sympy.expand(expr)
+
+    # Walk through additive terms
+    for term in sympy.Add.make_args(expanded):
+        # Check if term contains cos
+        cos_atoms = [a for a in term.atoms(sympy.cos)]
+        for cos_term in cos_atoms:
+            arg = cos_term.args[0]
+            # Check if the argument is c*s0
+            if arg.has(s0):
+                # Extract the coefficient of s0 inside cos
+                coeff_s0 = arg.coeff(s0)
+                if coeff_s0 != 0 and coeff_s0.is_number:
+                    c_position = float(abs(coeff_s0))
+                    # Extract the coefficient multiplying cos(c*s0)
+                    # This may contain symbols (ep_gravity etc.), so check
+                    coeff_expr = term.coeff(cos_term)
+                    if coeff_expr.is_number and coeff_expr != 0:
+                        gravity_coeff = float(coeff_expr)
+                    else:
+                        # Coefficient contains symbols; use sign heuristic
+                        # In MountainCar, gravity opposes motion (negative)
+                        gravity_coeff = -1.0
+                    logger.info(
+                        "Extracted terrain: cos({:.2f}*x) with coeff={:.6f}",
+                        c_position, gravity_coeff,
+                    )
+                    return (c_position, gravity_coeff)
+
+    return None
+
+
+def _dynamics_energy_reward_fns(
+    c_position: float,
+    gravity_coeff: float,
+    goal_pos: float,
+) -> tuple[Any, Any]:
+    """Build energy-based reward from discovered dynamics terrain coefficients.
+
+    Potential energy: ``PE = -gravity_coeff * sin(c*x) / c``
+    Kinetic energy: ``KE = 0.5 * v^2``
+    Total energy serves as a progress measure for hill-climbing.
+
+    :param c_position: Position frequency from ``cos(c*x)`` in dynamics.
+    :param gravity_coeff: Coefficient multiplying the terrain term.
+    :param goal_pos: Goal x-position.
+    :returns: ``(scalar_reward_fn, batched_reward_fn)``.
+    """
+    # Potential energy: integral of gravity_coeff * cos(c*x) dx
+    # = gravity_coeff * sin(c*x) / c
+    # We want higher position -> higher reward, so sign matters.
+    # In MountainCar, the gravity term is negative (opposing motion),
+    # so PE = -gravity_coeff * sin(c*x) / c gives increasing PE with height.
+    pe_scale = -gravity_coeff / c_position
+
+    def scalar_reward_fn(
+        state: np.ndarray, action: np.ndarray,
+    ) -> float:
+        x, v = state[0], state[1]
+        pe = pe_scale * np.sin(c_position * x)
+        ke = 0.5 * v**2
+        energy = pe + ke
+        goal_bonus = 10.0 if x >= goal_pos else 0.0
+        velocity_bonus = 0.1 * abs(v)
+        return float(energy + goal_bonus + velocity_bonus)
+
+    def batched_reward_fn(
+        states: np.ndarray, actions: np.ndarray,
+    ) -> np.ndarray:
+        x = states[:, 0]  # (K,)
+        v = states[:, 1]  # (K,)
+        pe = pe_scale * np.sin(c_position * x)  # (K,)
+        ke = 0.5 * v**2  # (K,)
+        energy = pe + ke  # (K,)
+        goal_bonus = np.where(x >= goal_pos, 10.0, 0.0)  # (K,)
+        velocity_bonus = 0.1 * np.abs(v)  # (K,)
+        return energy + goal_bonus + velocity_bonus  # (K,)
+
+    return scalar_reward_fn, batched_reward_fn
 
 
 def _mountaincar_reward_fns(
@@ -688,32 +1047,36 @@ def _evaluate_policy(
     For discrete-action environments, maps continuous policy output
     to discrete actions via threshold discretization.
 
+    Environments are evaluated serially because the iLQR/MPPI
+    solvers already use ThreadPoolExecutor for restart parallelism,
+    saturating available cores. Adding outer env-level threads
+    causes GIL contention and slows execution.
+
     :returns: EvalResult with aggregated statistics.
     """
     if max_steps is None:
         max_steps = env_cfg.max_steps
 
-    returns: list[float] = []
-    steps_list: list[float] = []
-    goals: list[float] = []
+    _max_steps = max_steps  # capture for closure
 
-    for env_idx in range(test_family.n_envs):
+    def _eval_single_env(
+        env_idx: int,
+    ) -> tuple[int, float, bool, float, dict[str, float]]:
         env = test_family.make_env(env_idx)
         obs, _ = env.reset(seed=42)
         policy.reset(env_idx)
 
         total_reward = 0.0
         reached_goal = False
+        n_steps = float(_max_steps)
 
-        for step in range(max_steps):
+        for step in range(_max_steps):
             action = policy.get_action(obs, env_idx)
 
             if env_cfg.continuous_action:
-                # Clip to action bounds
                 action = np.clip(action, env.action_space.low, env.action_space.high)
                 obs, reward, terminated, truncated, _ = env.step(action)
             else:
-                # Discrete: map continuous -> discrete
                 discrete_action = _discretize_action(
                     action, env_cfg.gym_id,
                 )
@@ -723,30 +1086,39 @@ def _evaluate_policy(
             if terminated:
                 if not env_cfg.goal_is_survival:
                     reached_goal = True
-                steps_list.append(float(step + 1))
+                n_steps = float(step + 1)
                 break
             if truncated:
                 if env_cfg.goal_is_survival:
                     reached_goal = True
-                steps_list.append(float(step + 1))
+                n_steps = float(step + 1)
                 break
         else:
-            steps_list.append(float(max_steps))
             if env_cfg.goal_is_survival:
                 reached_goal = True
 
-        returns.append(total_reward)
-        goals.append(1.0 if reached_goal else 0.0)
-
+        env.close()
         params = test_family.get_env_params(env_idx)
+        return env_idx, total_reward, reached_goal, n_steps, params
+
+    n_envs = test_family.n_envs
+    raw_results = [_eval_single_env(i) for i in range(n_envs)]
+
+    returns: list[float] = []
+    steps_list: list[float] = []
+    goals: list[float] = []
+
+    for env_idx, total_reward, reached_goal, n_steps, params in raw_results:
+        returns.append(total_reward)
+        steps_list.append(n_steps)
+        goals.append(1.0 if reached_goal else 0.0)
         params_str = "  ".join(f"{k}={v:.4f}" for k, v in params.items())
         goal_str = "GOAL" if reached_goal else "----"
         print(
             f"  [{env_idx:3d}] R={total_reward:8.1f} "
-            f"steps={steps_list[-1]:5.0f} "
+            f"steps={n_steps:5.0f} "
             f"{goal_str}  {params_str}"
         )
-        env.close()
 
     returns_arr = np.array(returns)
     steps_arr = np.array(steps_list)
@@ -812,27 +1184,24 @@ def _evaluate_baseline(
     if max_steps is None:
         max_steps = env_cfg.max_steps
 
-    returns: list[float] = []
-    goals: list[float] = []
-    steps_list: list[float] = []
+    _max_steps = max_steps
+    _baseline = baseline
 
-    for env_idx in range(test_family.n_envs):
+    def _eval_baseline_env(env_idx: int) -> tuple[float, float, float]:
         env = test_family.make_env(env_idx)
         obs, _ = env.reset(seed=42)
-        rng = np.random.default_rng(env_idx)
 
         total_reward = 0.0
         reached_goal = False
+        n_steps = float(_max_steps)
 
-        for step in range(max_steps):
-            if baseline == "random":
+        for step in range(_max_steps):
+            if _baseline == "random":
                 action = env.action_space.sample()
             else:
-                # Zero/no-op action
                 if isinstance(env.action_space, gym.spaces.Box):
                     action = np.zeros(env.action_space.shape)
                 else:
-                    # Discrete: middle action (noop-like)
                     action = env.action_space.n // 2
 
             obs, reward, terminated, truncated, _ = env.step(action)
@@ -840,21 +1209,26 @@ def _evaluate_baseline(
             if terminated:
                 if not env_cfg.goal_is_survival:
                     reached_goal = True
-                steps_list.append(float(step + 1))
+                n_steps = float(step + 1)
                 break
             if truncated:
                 if env_cfg.goal_is_survival:
                     reached_goal = True
-                steps_list.append(float(step + 1))
+                n_steps = float(step + 1)
                 break
         else:
-            steps_list.append(float(max_steps))
             if env_cfg.goal_is_survival:
                 reached_goal = True
 
-        returns.append(total_reward)
-        goals.append(1.0 if reached_goal else 0.0)
         env.close()
+        return total_reward, 1.0 if reached_goal else 0.0, n_steps
+
+    n_envs = test_family.n_envs
+    results = [_eval_baseline_env(i) for i in range(n_envs)]
+
+    returns = [r[0] for r in results]
+    goals = [r[1] for r in results]
+    steps_list = [r[2] for r in results]
 
     return (
         float(np.mean(returns)),
@@ -870,11 +1244,11 @@ def _evaluate_baseline(
 
 def run_benchmark(
     env_name: str,
-    n_train: int = 15,
+    n_train: int = 25,
     n_test: int = 20,
     n_transitions: int = 5000,
     seed: int = 42,
-    fast: bool = False,
+    speed: str = "normal",
 ) -> EvalResult | None:
     """Run the full CIRC-RL v2 benchmark for one environment.
 
@@ -884,7 +1258,7 @@ def run_benchmark(
     :param n_test: Number of OOD test environments.
     :param n_transitions: Transitions per training environment.
     :param seed: Random seed.
-    :param fast: If True, use reduced SR config.
+    :param speed: One of "normal", "fast", "quick" for SR budget.
     :returns: EvalResult, or None if pipeline failed.
     """
     configs = _make_env_configs()
@@ -895,7 +1269,7 @@ def run_benchmark(
     print(f"  {n_train} train envs, {n_test} OOD test envs")
     print(f"  Params: {list(env_cfg.param_distributions.keys())}")
     print(f"  Solver: {env_cfg.solver.upper()}")
-    print(f"  Fast: {fast}")
+    print(f"  Speed: {speed}")
     print(f"{'=' * 70}")
 
     # Create environment families
@@ -911,13 +1285,14 @@ def run_benchmark(
         param_distributions=env_cfg.test_param_distributions,
         n_envs=n_test,
         seed=seed + 1000,
+        max_episode_steps=env_cfg.max_steps,
     )
 
     # Run pipeline
     print("\n  Running v2 pipeline...")
     t_pipeline = time.time()
     pipeline = _run_pipeline(
-        env_cfg, train_family, n_transitions, seed, fast,
+        env_cfg, train_family, n_transitions, seed, speed,
     )
     pipeline_time = time.time() - t_pipeline
     print(f"  Pipeline time: {pipeline_time:.1f}s")
@@ -938,8 +1313,12 @@ def run_benchmark(
     t_build = time.time()
     if env_cfg.solver == "ilqr":
         policy = _build_ilqr_solver(env_cfg, pipeline, test_family)
-    else:
+    elif env_cfg.solver == "cem":
+        policy = _build_cem_solver(env_cfg, pipeline, test_family)
+    elif env_cfg.solver == "mppi":
         policy = _build_mppi_solver(env_cfg, pipeline, test_family)
+    else:
+        raise ValueError(f"Unknown solver: {env_cfg.solver}")
     build_time = time.time() - t_build
     print(f"  Build time: {build_time:.1f}s")
 
@@ -1002,8 +1381,8 @@ def _parse_args() -> argparse.Namespace:
         help="Run all environments.",
     )
     parser.add_argument(
-        "--n-train", type=int, default=15,
-        help="Number of training environments (default: 15).",
+        "--n-train", type=int, default=25,
+        help="Number of training environments (default: 25).",
     )
     parser.add_argument(
         "--n-test", type=int, default=20,
@@ -1017,9 +1396,14 @@ def _parse_args() -> argparse.Namespace:
         "--seed", type=int, default=42,
         help="Random seed (default: 42).",
     )
-    parser.add_argument(
+    speed_group = parser.add_mutually_exclusive_group()
+    speed_group.add_argument(
         "--fast", action="store_true",
-        help="Fast mode: 8 train, 10 test envs, reduced SR.",
+        help="Fast mode: moderate SR (60 iters, 20 pops, 8k samples, 400s).",
+    )
+    speed_group.add_argument(
+        "--quick", action="store_true",
+        help="Quick mode: 8 train, 10 test envs, heavily reduced SR.",
     )
     return parser.parse_args()
 
@@ -1072,11 +1456,16 @@ def main() -> None:
             print(f"  {name}")
         return
 
-    # Fast mode overrides
-    if args.fast:
+    # Speed mode overrides
+    if args.quick:
+        speed = "quick"
         args.n_train = 8
         args.n_test = 10
         args.n_transitions = 3000
+    elif args.fast:
+        speed = "fast"
+    else:
+        speed = "normal"
 
     logger.remove()
     logger.add(sys.stderr, level="INFO")
@@ -1092,7 +1481,7 @@ def main() -> None:
             n_test=args.n_test,
             n_transitions=args.n_transitions,
             seed=args.seed,
-            fast=args.fast,
+            speed=speed,
         )
         if result is not None:
             results.append(result)

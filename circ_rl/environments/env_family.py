@@ -69,6 +69,7 @@ class EnvironmentFamily:
         n_envs: int,
         seed: int = 42,
         fixed_params: dict[str, float] | None = None,
+        max_episode_steps: int | None = None,
     ) -> EnvironmentFamily:
         """Create an EnvironmentFamily from a Gymnasium environment ID.
 
@@ -83,12 +84,18 @@ class EnvironmentFamily:
         :param fixed_params: Mapping of attribute names to constant values.
             These are set on every environment but not tracked as varied
             parameters. Useful for overriding defaults (e.g., ``max_torque``).
+        :param max_episode_steps: Override the default max episode steps
+            for the environment. If None, uses the Gymnasium default.
         :returns: A new EnvironmentFamily instance.
         """
         _fixed = fixed_params or {}
+        _max_ep_steps = max_episode_steps
 
         def factory(params: dict[str, float]) -> gym.Env[Any, Any]:
-            env = gym.make(base_env)
+            kwargs: dict[str, Any] = {}
+            if _max_ep_steps is not None:
+                kwargs["max_episode_steps"] = _max_ep_steps
+            env = gym.make(base_env, **kwargs)
             unwrapped = env.unwrapped
             for attr, value in {**_fixed, **params}.items():
                 if not hasattr(unwrapped, attr):
@@ -97,6 +104,21 @@ class EnvironmentFamily:
                         f"Available: {[a for a in dir(unwrapped) if not a.startswith('_')]}"
                     )
                 setattr(unwrapped, attr, value)
+            # Recompute derived attributes that depend on modified primaries.
+            # CartPole computes total_mass and polemass_length once in __init__;
+            # they become stale when masscart, masspole, or length change.
+            if (
+                hasattr(unwrapped, "total_mass")
+                and hasattr(unwrapped, "masscart")
+                and hasattr(unwrapped, "masspole")
+            ):
+                unwrapped.total_mass = unwrapped.masspole + unwrapped.masscart
+            if (
+                hasattr(unwrapped, "polemass_length")
+                and hasattr(unwrapped, "masspole")
+                and hasattr(unwrapped, "length")
+            ):
+                unwrapped.polemass_length = unwrapped.masspole * unwrapped.length
             return env
 
         return cls(

@@ -141,6 +141,45 @@ class DataCollector:
                 f"n_transitions_per_env must be >= 1, got {n_transitions_per_env}"
             )
 
+        from concurrent.futures import ThreadPoolExecutor
+        import os
+
+        def _collect_one(
+            env_idx: int,
+        ) -> tuple[
+            int,
+            np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+            np.ndarray | None,
+        ]:
+            env = self._env_family.make_env(env_idx)
+            rng = np.random.RandomState(seed + env_idx)
+            states, actions, next_states, rewards = self._collect_from_env(
+                env, n_transitions_per_env, rng,
+            )
+            env.close()
+            param_tile: np.ndarray | None = None
+            if self._include_env_params:
+                params = self._env_family.get_env_params(env_idx)
+                param_values = np.array(
+                    [params[name] for name in self._env_family.param_names],
+                    dtype=np.float32,
+                )  # (n_env_params,)
+                param_tile = np.tile(
+                    param_values, (states.shape[0], 1),
+                )  # (n_transitions, n_env_params)
+            return env_idx, states, actions, next_states, rewards, param_tile
+
+        n_envs = self._env_family.n_envs
+        max_workers = min(8, n_envs, os.cpu_count() or 4)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [
+                pool.submit(_collect_one, i) for i in range(n_envs)
+            ]
+            raw_results = [f.result() for f in futures]
+
+        # Sort by env_idx to maintain deterministic ordering
+        raw_results.sort(key=lambda r: r[0])
+
         all_states: list[np.ndarray] = []
         all_actions: list[np.ndarray] = []
         all_next_states: list[np.ndarray] = []
@@ -148,33 +187,16 @@ class DataCollector:
         all_env_ids: list[np.ndarray] = []
         all_env_params: list[np.ndarray] = []
 
-        for env_idx in range(self._env_family.n_envs):
-            env = self._env_family.make_env(env_idx)
-            rng = np.random.RandomState(seed + env_idx)
-
-            states, actions, next_states, rewards = self._collect_from_env(
-                env, n_transitions_per_env, rng
-            )
-
+        for env_idx, states, actions, next_states, rewards, param_tile in raw_results:
             all_states.append(states)
             all_actions.append(actions)
             all_next_states.append(next_states)
             all_rewards.append(rewards)
             all_env_ids.append(
-                np.full(states.shape[0], env_idx, dtype=np.int32)
+                np.full(states.shape[0], env_idx, dtype=np.int32),
             )
-
-            if self._include_env_params:
-                params = self._env_family.get_env_params(env_idx)
-                param_values = np.array(
-                    [params[name] for name in self._env_family.param_names],
-                    dtype=np.float32,
-                )  # (n_env_params,)
-                all_env_params.append(
-                    np.tile(param_values, (states.shape[0], 1))
-                )  # (n_transitions, n_env_params)
-
-            env.close()
+            if param_tile is not None:
+                all_env_params.append(param_tile)
 
         env_params_array: np.ndarray | None = None
         if self._include_env_params and all_env_params:
