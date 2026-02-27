@@ -1,0 +1,5 @@
+complexity_weights:
+  parametric: 0.001
+  functional: 0.01
+  path: 0.005
+info_bottleneck_beta: 0.01

@@ -1,0 +1,6 @@
+hidden_dims:
+  - 256
+  - 256
+activation: relu
+use_info_bottleneck: true
+latent_dim: 32
